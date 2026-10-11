@@ -131,7 +131,7 @@ function renderToolbar() {
   const backupMenu = h('div', { id: 'backup-menu', popover: 'auto', class: 'menu' },
     button(t('Backup exportieren …'), () => { backupMenu.hidePopover(); exportDialog(); }, { disabled: !view.profiles.length }),
     button(t('Backup importieren …'), () => { backupMenu.hidePopover(); importDialog(); }));
-  const backupButton = button(t('Backup'), null, { iconName: 'archive', iconOnly: true });
+  const backupButton = button(t('Backup'), null, { iconName: 'archive', iconOnly: true, title: t('Backup exportieren oder importieren') });
   backupButton.setAttribute('popovertarget', 'backup-menu');
   backupMenu.addEventListener('toggle', (event) => {
     if (event.newState !== 'open') return;
@@ -366,9 +366,12 @@ function projectRow(binding, profile) {
   const status = binding.status;
   const keyPresent = credentialOk(profile);
   const [symbol, color] = statusAppearance(status, keyPresent);
+  const healthOk = status?.health.state === 'active' && keyPresent;
+  const statusTip = view.disabled ? t('Deaktiviert – Claude nutzt hier die normale Anmeldung.')
+    : !healthOk ? describeHealth(status?.health, keyPresent, profile.sso) : status.conflicts[0]?.message ?? t('Aktiv');
   // Hidden: three clicks on the status icon switch the Budget-Killer on or off.
-  const statusIcon = view.disabled ? h('span', { class: 'status-icon muted' }, icon('pause'))
-    : h('span', { class: `status-icon ${color}`, onclick: (e) => { if (e.detail === 3 && !profile.sso) call('toggle_pool', { bindingId: binding.id }); } }, icon(symbol));
+  const statusIcon = view.disabled ? h('span', { class: 'status-icon muted', title: statusTip }, icon('pause'))
+    : h('span', { class: `status-icon ${color}`, title: statusTip, onclick: (e) => { if (e.detail === 3 && !profile.sso) call('toggle_pool', { bindingId: binding.id }); } }, icon(symbol));
   const select = h('select', {
     'aria-label': t('Profil'), title: t('Profil für dieses Projekt wechseln'), disabled: view.disabled,
     onchange: async (e) => {
@@ -381,7 +384,6 @@ function projectRow(binding, profile) {
       t('Nur die von der App gesetzten Einträge werden aus .claude/settings.local.json entfernt. Andere Einstellungen bleiben erhalten.'),
       t('Entfernen'))) call('unbind', { bindingId: binding.id });
   };
-  const healthOk = status?.health.state === 'active' && keyPresent;
   return h('div', { class: 'project' },
     h('div', { class: 'project-main' }, statusIcon,
       h('div', { class: 'project-name' }, h('strong', null, binding.name), h('span', { class: 'mono', title: binding.path }, `\u200E${binding.displayPath}\u200E`)),
@@ -845,9 +847,51 @@ function howItWorksDialog() {
   }), { wide: true });
 }
 
+// MARK: Tooltips
+
+/** Shows `title` texts as a quick tooltip; the WebViews show native ones late or not at all. A popover, so it is above open dialogs. */
+const tooltip = h('div', { class: 'tooltip', role: 'tooltip', popover: 'manual' });
+let tipTarget = null;
+let tipTimer = null;
+
+function hideTip() {
+  clearTimeout(tipTimer);
+  tipTarget = null;
+  if (tooltip.matches(':popover-open')) tooltip.hidePopover();
+}
+
+function showTip(target) {
+  if (!target.isConnected) return;
+  tooltip.textContent = target.dataset.tip;
+  if (!tooltip.matches(':popover-open')) tooltip.showPopover();
+  const rect = target.getBoundingClientRect();
+  const { offsetWidth: width, offsetHeight: height } = tooltip;
+  const below = rect.bottom + 6 + height <= window.innerHeight;
+  tooltip.style.top = `${below ? rect.bottom + 6 : rect.top - 6 - height}px`;
+  tooltip.style.left = `${Math.max(8, Math.min(rect.left + rect.width / 2 - width / 2, window.innerWidth - width - 8))}px`;
+}
+
+document.addEventListener('mouseover', (event) => {
+  const target = event.target.closest?.('[title], [data-tip]');
+  if (target === tipTarget) return;
+  hideTip();
+  if (!target) return;
+  // Moved to data-tip so the native tooltip does not show as well.
+  if (target.hasAttribute('title')) {
+    target.dataset.tip = target.title;
+    if (target.getAttribute('aria-label') !== target.title) target.setAttribute('aria-description', target.title);
+    target.removeAttribute('title');
+  }
+  if (!target.dataset.tip) return;
+  tipTarget = target;
+  tipTimer = setTimeout(() => showTip(target), 350);
+});
+for (const type of ['mousedown', 'keydown', 'scroll']) document.addEventListener(type, hideTip, true);
+
 // MARK: Start
 
 async function start() {
+  document.body.append(tooltip);
   english = await invoke('translations');
   setView(await invoke('get_view'));
   await listen('changed', async () => setView(await invoke('get_view')));

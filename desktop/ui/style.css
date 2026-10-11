@@ -182,5 +182,11 @@ legend { font-weight: 600; padding: 0 4px; }
 .recommendations { display: grid; grid-template-columns: auto auto 1fr; gap: 4px 12px; align-items: baseline; }
 textarea.document { min-height: 300px; }
 
+.tooltip {
+  position: fixed; inset: auto; margin: 0; max-width: 300px; padding: 4px 8px; border: none; border-radius: 6px;
+  background: var(--text); color: var(--surface); font-size: 12px; line-height: 1.35; overflow-wrap: anywhere;
+  pointer-events: none; box-shadow: 0 4px 12px rgb(0 0 0 / .2);
+}
+
 .spinner { width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent, currentColor); border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
