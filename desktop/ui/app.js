@@ -65,6 +65,7 @@ const ICONS = {
   server: '<rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><path d="M7 7.5h.01M7 16.5h.01"/>',
   fileLock: '<path d="M6 2h8l4 4v16H6z"/><path d="M14 2v4h4"/><rect x="9" y="13" width="6" height="5" rx="1"/><path d="M10 13v-2a2 2 0 0 1 4 0v2"/>',
   arrow: '<path d="M5 12h14M13 6l6 6-6 6"/>',
+  sparkles: '<path d="M10 3l1.8 4.7 4.7 1.8-4.7 1.8L10 16l-1.8-4.7L3.5 9.5l4.7-1.8z"/><path d="M18 14l.9 2.1 2.1.9-2.1.9L18 20l-.9-2.1-2.1-.9 2.1-.9z"/>',
 };
 
 function icon(name, cls = '') {
@@ -380,6 +381,8 @@ function projectRow(binding, profile) {
     h('div', { class: 'project-main' }, statusIcon,
       h('div', { class: 'project-name' }, h('strong', null, binding.name), h('span', { class: 'mono', title: binding.path }, `\u200E${binding.displayPath}\u200E`)),
       select,
+      button(t('Für Agenten optimieren'), () => agentsDialog(binding, profile),
+        { iconName: 'sparkles', iconOnly: true, title: t('AGENTS.md für dieses Repository per KI-Analyse erzeugen oder verbessern'), disabled: status?.health.state === 'folderMissing' }),
       button(revealLabel(), () => call('reveal', { path: binding.path }), { iconName: 'folder', iconOnly: true }),
       button(t('Erneut anwenden'), () => call('reapply', { bindingId: binding.id }),
         { iconName: 'rotate', iconOnly: true, title: t('Einstellungen erneut schreiben'), disabled: status?.health.state === 'folderMissing' || view.disabled }),
@@ -712,6 +715,99 @@ function claudeSettingsDialog() {
       actions: [button(t('Fertig'), close, { cls: 'primary' })],
     };
   }, { live: true, wide: true });
+}
+
+const agentGoals = () => [
+  ['cost', t('Kosteneffizienz'), t('Wenig Tokens und Tool-Aufrufe, kleine Diffs, günstigstes geeignetes Modell')],
+  ['quality', t('Qualität & Korrektheit'), t('Gründlich prüfen, Tests und Builds, Diff vor Abschluss reviewen')],
+  ['speed', t('Tempo'), t('Kurze Antworten, wenig Rückfragen, unabhängige Schritte parallel')],
+  ['security', t('Sicherheit'), t('Keine Secrets, keine destruktiven Befehle ohne Rückfrage, Abhängigkeiten prüfen')],
+  ['conventions', t('Team-Konventionen'), t('Stil, Commits, Branches und Pull Requests wie im Repository')],
+];
+
+/** Scans the project, lets the gateway model assess it and propose an AGENTS.md, which is saved after review. */
+function agentsDialog(binding, profile) {
+  const tiers = [['Opus', profile.opusModel], ['Sonnet', profile.sonnetModel], ['Haiku', profile.haikuModel], [t('Standardmodell'), profile.modelAlias]]
+    .filter(([, model], i, all) => model && all.findIndex(([, m]) => m === model) === i);
+  const s = { scan: null, scanError: null, goals: new Set(['cost']), language: view.language, model: tiers[0]?.[1] ?? '', notes: '',
+    working: false, proposal: null, content: '' };
+  const generate = async () => {
+    if (!(await ensureLogin(profile.id))) return;
+    s.working = true; dlg.render();
+    const proposal = await call('generate_agents_file', { bindingId: binding.id,
+      options: { goals: [...s.goals], language: s.language, model: s.model, notes: s.notes } });
+    s.working = false;
+    if (proposal) { s.proposal = proposal; s.content = proposal.content; }
+    dlg.render();
+  };
+  const save = async (close) => {
+    if (s.scan?.hasAgentsFile && !(await confirmDialog(t('AGENTS.md ersetzen?'),
+      t('Die vorhandene AGENTS.md in „%@“ wird überschrieben.', binding.name), t('Ersetzen')))) return;
+    const result = await call('write_agents_file', { bindingId: binding.id, content: s.content });
+    if (result?.[0]) { close(); window.scrollTo(0, 0); }
+  };
+  const scanSummary = () => {
+    if (s.scanError) return h('div', { class: 'error-text' }, s.scanError);
+    if (!s.scan) return h('div', { class: 'line muted' }, h('span', { class: 'spinner' }), t('Repository wird gelesen …'));
+    const languages = s.scan.languages.slice(0, 6).map(([name, count]) => `${name} ${count}`).join(' · ');
+    return [
+      h('div', null, h('strong', null, t('%@ Dateien', s.scan.fileCount)), languages && h('span', { class: 'muted' }, ` · ${languages}`)),
+      s.scan.manifests.length > 0 && h('div', { class: 'mono muted' }, s.scan.manifests.join(', ')),
+      h('div', { class: 'finding' }, icon(s.scan.agentFiles.length ? 'check' : 'info', s.scan.agentFiles.length ? 'green' : 'muted'),
+        s.scan.agentFiles.length ? t('Vorhandene Agenten-Dateien: %@', s.scan.agentFiles.join(', ')) : t('Noch keine Agenten-Steuerdatei vorhanden.')),
+    ];
+  };
+  const options = () => [
+    h('fieldset', null, h('legend', null, t('Repository')), scanSummary()),
+    h('fieldset', { disabled: s.working }, h('legend', null, t('Optimieren für')),
+      agentGoals().map(([id, title, detail]) => h('label', { class: 'goal' },
+        h('input', { type: 'checkbox', checked: s.goals.has(id), onchange: (e) => { if (e.target.checked) s.goals.add(id); else s.goals.delete(id); dlg.render(); } }),
+        h('span', null, h('strong', null, title), h('span', { class: 'muted' }, ` – ${detail}`))))),
+    h('fieldset', { disabled: s.working },
+      field(t('Sprache der Datei'), h('select', { onchange: (e) => { s.language = e.target.value; } },
+        h('option', { value: 'de', selected: s.language === 'de' }, 'Deutsch'),
+        h('option', { value: 'en', selected: s.language !== 'de' }, 'English')), 'g-language'),
+      field(t('Analysemodell'), h('select', { onchange: (e) => { s.model = e.target.value; } },
+        tiers.map(([tier, model]) => h('option', { value: model, selected: s.model === model }, `${tier} · ${model}`)),
+        h('option', { value: '', selected: !s.model }, t('Automatisch (vom Gateway)'))), 'g-model'),
+      h('div', { class: 'field' }, h('label', { for: 'g-notes' }, t('Hinweise')),
+        h('textarea', { id: 'g-notes', value: s.notes, placeholder: t('optional, z. B. „Nur pnpm verwenden“ oder „Migrationen nie selbst ausführen“'),
+          oninput: (e) => { s.notes = e.target.value; } }))),
+    !profile.sso && !profile.hasKey && h('div', { class: 'note red' }, icon('keyOff'), t('Kein Key hinterlegt – Anfragen schlagen fehl')),
+    s.working ? h('div', { class: 'line muted', role: 'status' }, h('span', { class: 'spinner' }), t('Das Modell analysiert das Repository – das kann ein bis zwei Minuten dauern …'))
+      : h('div', { class: 'section-note' }, t('Gesendet wird eine Zusammenfassung des Repositorys (Ordnerstruktur, README, Build- und CI-Dateien, vorhandene Agenten-Dateien) über das Gateway von „%@“. Die Kosten werden auf diesen Key gebucht; geschrieben wird erst nach deiner Prüfung.', profile.name)),
+  ];
+  const review = () => {
+    const p = s.proposal;
+    return [
+      h('fieldset', null, h('legend', null, t('Bewertung')),
+        h('div', { class: 'selectable' }, p.assessment || t('Keine Bewertung geliefert.')),
+        h('div', { class: 'small muted' }, t('Analysiert mit %@ · %@ Eingabe- und %@ Ausgabe-Tokens', p.model,
+          p.inputTokens.toLocaleString(locale()), p.outputTokens.toLocaleString(locale())))),
+      p.recommendations.length > 0 && h('fieldset', null, h('legend', null, t('Modellempfehlung')),
+        h('div', { class: 'recommendations' }, p.recommendations.map((r) => [
+          h('strong', null, r.task),
+          h('span', { class: 'mono' }, r.model, ['opus', 'sonnet', 'haiku'].includes(r.tier) && !r.model.toLowerCase().includes(r.tier) ? ` (${r.tier})` : ''),
+          h('span', { class: 'muted selectable' }, r.reason)]))),
+      h('fieldset', null, h('legend', null, 'AGENTS.md'),
+        h('textarea', { id: 'g-content', class: 'document', value: s.content, spellcheck: 'false', 'aria-label': 'AGENTS.md',
+          oninput: (e) => { s.content = e.target.value; } }),
+        s.scan?.hasAgentsFile && h('div', { class: 'note orange' }, icon('warning'), t('Die vorhandene AGENTS.md wird ersetzt; ihr Inhalt ist in den Vorschlag eingeflossen.')),
+        s.scan?.agentFiles.some((f) => f !== 'AGENTS.md') && h('div', { class: 'section-note' },
+          t('Andere Agenten-Dateien (%@) bleiben unverändert. Doppelte Anweisungen dort entfernen, sonst lädt der Agent sie zweimal.', s.scan.agentFiles.filter((f) => f !== 'AGENTS.md').join(', ')))),
+    ];
+  };
+  const dlg = openDialog(t('Für Agenten optimieren'), (close) => ({
+    body: [h('h2', null, t('Für Agenten optimieren'), h('span', { class: 'muted' }, ` · ${binding.name}`)), s.proposal ? review() : options()],
+    actions: s.proposal
+      ? [button(t('Zurück'), () => { s.proposal = null; dlg.render(); }, { cls: 'left' }), button(t('Abbrechen'), close),
+        button(s.scan?.hasAgentsFile ? t('AGENTS.md ersetzen') : t('AGENTS.md speichern'), () => save(close), { cls: 'primary', disabled: !s.content.trim() })]
+      : [button(t('Abbrechen'), close, { disabled: s.working }),
+        button(t('Analysieren & erzeugen'), generate, { cls: 'primary', disabled: !s.scan || s.working || (!profile.sso && !profile.hasKey) })],
+  }), { wide: true });
+  invoke('scan_repository', { bindingId: binding.id })
+    .then((scan) => { s.scan = scan; }, (error) => { s.scanError = String(error); })
+    .finally(() => dlg.render());
 }
 
 function howItWorksDialog() {

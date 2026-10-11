@@ -5,7 +5,7 @@ mod model;
 
 use keyzapper_core::errors::Error;
 use keyzapper_core::gateway::CheckResult;
-use keyzapper_core::{backup, clipboard, gateway, l, legacy_keychain, oidc, update};
+use keyzapper_core::{agents, backup, clipboard, gateway, l, legacy_keychain, oidc, update};
 use model::{Model, ProfileInput, View};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -383,6 +383,57 @@ async fn unbind(app: AppHandle, binding_id: String) -> View {
     .await
 }
 
+// MARK: Agent instruction files
+
+#[tauri::command]
+async fn scan_repository(app: AppHandle, binding_id: String) -> Result<agents::RepoScan, String> {
+    blocking(move || {
+        let path = with_model(&app, |m| m.state.bindings.iter().find(|b| b.id == binding_id).map(|b| b.path.clone()))
+            .ok_or_else(|| l!("Unbekannte Zuordnung."))?;
+        if !std::path::Path::new(&path).is_dir() {
+            return Err(l!("Ordner nicht gefunden: %@", keyzapper_core::paths::abbreviate_home(&path)));
+        }
+        Ok(agents::scan(&path))
+    })
+    .await
+}
+
+/// Asks the profile's gateway model for an assessment, model advice and an `AGENTS.md`; nothing is written yet.
+#[tauri::command]
+async fn generate_agents_file(app: AppHandle, binding_id: String, options: agents::Options) -> Result<agents::Proposal, String> {
+    blocking(move || {
+        let (profile, path, key) = with_model(&app, |m| m.analysis_access(&binding_id))?;
+        let available = match gateway::models(&profile.endpoint, &key) {
+            Ok(models) => models,
+            Err(CheckResult::Unauthorized) if profile.is_sso() => {
+                with_model(&app, |m| m.sso_expired.insert(profile.id.clone()));
+                return Err(l!("Kein aktiver Zugang – Sitzung abgelaufen, bitte neu anmelden."));
+            }
+            Err(failure @ (CheckResult::Unauthorized | CheckResult::BudgetExceeded | CheckResult::Unreachable(_))) => return Err(failure.message()),
+            // Some gateways do not list models; the analysis call can still work.
+            Err(_) => vec![],
+        };
+        let model = agents::analysis_model(&options.model, &profile, &available)
+            .ok_or_else(|| l!("Kein Modell für die Analyse gefunden. Bitte im Profil Modelle eintragen."))?;
+        let prompt = agents::prompt(&agents::context(&agents::scan(&path)), &options, &profile, &available);
+        let reply = gateway::complete(&profile.endpoint, &key, &model, agents::SYSTEM_PROMPT, &prompt, 16_000, Duration::from_secs(300));
+        refresh_budgets(&app, Some(&profile.id));
+        let reply = reply?;
+        let proposal = agents::parse_reply(&reply.text).ok_or_else(|| l!("Die Antwort des Modells enthielt keine AGENTS.md. Bitte erneut versuchen."))?;
+        Ok(agents::Proposal { model, input_tokens: reply.input_tokens, output_tokens: reply.output_tokens, ..proposal })
+    })
+    .await
+}
+
+#[tauri::command]
+async fn write_agents_file(app: AppHandle, binding_id: String, content: String) -> (bool, View) {
+    blocking(move || {
+        let ok = with_model(&app, |m| m.write_agents_file(&binding_id, &content));
+        (ok, view(&app))
+    })
+    .await
+}
+
 #[tauri::command]
 async fn set_global_profile(app: AppHandle, profile_id: Option<String>) -> View {
     act(app, move |m| m.set_global_profile(profile_id)).await
@@ -571,6 +622,9 @@ fn main() {
             reapply,
             toggle_pool,
             unbind,
+            scan_repository,
+            generate_agents_file,
+            write_agents_file,
             set_global_profile,
             repair_user_settings,
             set_disabled,

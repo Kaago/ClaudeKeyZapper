@@ -13,7 +13,7 @@ use keyzapper_core::paths::{abbreviate_home, folder_name};
 use keyzapper_core::settings::{self, BindingHealth, BindingStatus, SettingsBinder};
 use keyzapper_core::update::ReleaseInfo;
 use keyzapper_core::tokens::TokenStore;
-use keyzapper_core::{cli, helper, l, legacy_keychain, oidc};
+use keyzapper_core::{agents, cli, helper, l, legacy_keychain, oidc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -457,6 +457,40 @@ impl Model {
             }
             Err(e) => {
                 self.error = Some(e.to_string());
+                false
+            }
+        }
+    }
+
+    // MARK: Agent instruction files
+
+    /// Profile, folder and credential for the repository analysis of an assigned project.
+    pub fn analysis_access(&mut self, binding_id: &str) -> Result<(Profile, String, String), String> {
+        let binding = self.binding(binding_id).ok_or_else(|| l!("Unbekannte Zuordnung."))?;
+        let profile = self.profile(&binding.profile_id).ok_or_else(|| l!("Unbekanntes Profil: %@", binding.profile_id))?;
+        if !self.config.is_endpoint_allowed(&profile.endpoint) {
+            return Err(self.not_allowed_message(&profile.endpoint));
+        }
+        let key = if profile.is_sso() { self.sso_token(&profile)? } else { self.keys.read(&profile.id).map_err(|e| e.to_string())? };
+        Ok((profile, binding.path, key))
+    }
+
+    /// Writes the reviewed `AGENTS.md` into the assigned folder.
+    pub fn write_agents_file(&mut self, binding_id: &str, content: &str) -> bool {
+        let Some(binding) = self.binding(binding_id) else { return false };
+        if !Path::new(&binding.path).is_dir() {
+            self.error = Some(l!("Ordner nicht gefunden: %@", abbreviate_home(&binding.path)));
+            return false;
+        }
+        let target = Path::new(&binding.path).join(agents::FILE_NAME);
+        let shown = abbreviate_home(&target.to_string_lossy());
+        match keyzapper_core::paths::write_atomic(&target, format!("{}\n", content.trim_end()).as_bytes(), false) {
+            Ok(()) => {
+                self.notice = Some(l!("%@ gespeichert. Neue Agenten-Sitzungen im Projekt nutzen die Datei.", shown));
+                true
+            }
+            Err(e) => {
+                self.error = Some(l!("%@ konnte nicht gespeichert werden: %@", shown, e));
                 false
             }
         }

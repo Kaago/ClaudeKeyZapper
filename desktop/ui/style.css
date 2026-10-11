@@ -177,6 +177,10 @@ legend { font-weight: 600; padding: 0 4px; }
 .step { display: flex; gap: 10px; align-items: baseline; }
 .step-number { flex: none; width: 20px; height: 20px; border-radius: 50%; background: var(--accent); color: #fff; font-size: 11px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
 .finding { display: flex; gap: 6px; align-items: baseline; }
+.goal { display: flex; gap: 8px; align-items: baseline; cursor: pointer; }
+.goal input { margin: 0; flex: none; }
+.recommendations { display: grid; grid-template-columns: auto auto 1fr; gap: 4px 12px; align-items: baseline; }
+textarea.document { min-height: 300px; }
 
 .spinner { width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent, currentColor); border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }

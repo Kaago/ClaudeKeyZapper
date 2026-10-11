@@ -1,4 +1,5 @@
-//! LiteLLM checks: `GET /v1/models` (models the key may use) and `GET /key/info` (budget of the calling key).
+//! LiteLLM checks: `GET /v1/models` (models the key may use) and `GET /key/info` (budget of the calling key),
+//! plus single `POST /v1/messages` calls for the repository analysis.
 //! TLS uses the system trust store (native-tls), so company CAs installed by IT are trusted like in the browser.
 
 use crate::l;
@@ -78,15 +79,73 @@ fn get(path: &str, endpoint: &str, key: &str, timeout: Duration) -> Result<Strin
     let mut response = response.map_err(|e| CheckResult::Unreachable(e.to_string()))?;
     let status = response.status().as_u16();
     let body = response.body_mut().read_to_string().unwrap_or_default();
-    let lower = body.to_lowercase();
     match status {
         200 => Ok(body),
-        401 | 403 => Err(CheckResult::Unauthorized),
-        429 if lower.contains("budget") => Err(CheckResult::BudgetExceeded),
-        429 => Err(CheckResult::RateLimited),
-        400 if lower.contains("budget") => Err(CheckResult::BudgetExceeded),
-        other => Err(CheckResult::HttpError(other)),
+        other => Err(failure(other, &body)),
     }
+}
+
+fn failure(status: u16, body: &str) -> CheckResult {
+    let lower = body.to_lowercase();
+    match status {
+        401 | 403 => CheckResult::Unauthorized,
+        429 | 400 if lower.contains("budget") => CheckResult::BudgetExceeded,
+        429 => CheckResult::RateLimited,
+        other => CheckResult::HttpError(other),
+    }
+}
+
+/// Text and token usage of a Messages API reply.
+pub struct Completion {
+    pub text: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// One `POST /v1/messages` call in Anthropic format (as Claude Code talks to LiteLLM), billed to `key`.
+pub fn complete(endpoint: &str, key: &str, model: &str, system: &str, prompt: &str, max_tokens: u32, timeout: Duration) -> Result<Completion, String> {
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{ "role": "user", "content": prompt }],
+    });
+    let response = agent(timeout)
+        .post(&join_url(endpoint, "v1/messages"))
+        .header("Authorization", &format!("Bearer {key}"))
+        .header("x-api-key", key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .send(body.to_string());
+    let mut response = response.map_err(|e| CheckResult::Unreachable(e.to_string()).message())?;
+    let status = response.status().as_u16();
+    let text = response.body_mut().read_to_string().unwrap_or_default();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    if status != 200 {
+        return Err(match (failure(status, &text), value["error"]["message"].as_str()) {
+            (CheckResult::HttpError(code), Some(message)) => {
+                l!("Das Gateway hat die Anfrage abgelehnt (HTTP %@): %@", code, message.chars().take(400).collect::<String>())
+            }
+            (other, _) => other.message(),
+        });
+    }
+    match value["stop_reason"].as_str() {
+        Some("refusal") => return Err(l!("Das Modell hat die Anfrage abgelehnt.")),
+        Some("max_tokens") => return Err(l!("Die Antwort des Modells wurde abgeschnitten (max_tokens).")),
+        _ => {}
+    }
+    let text: String = value["content"]
+        .as_array()
+        .map(|blocks| blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect())
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err(l!("Das Gateway hat eine leere Antwort geliefert."));
+    }
+    Ok(Completion {
+        text,
+        input_tokens: value["usage"]["input_tokens"].as_u64().unwrap_or(0),
+        output_tokens: value["usage"]["output_tokens"].as_u64().unwrap_or(0),
+    })
 }
 
 /// Model IDs available to the key, sorted.

@@ -3,6 +3,7 @@
 
 pub mod i18n;
 
+pub mod agents;
 pub mod audit;
 pub mod backup;
 pub mod backup_store;
