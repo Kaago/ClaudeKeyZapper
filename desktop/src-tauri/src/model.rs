@@ -6,7 +6,7 @@ use keyzapper_core::backup::BackupPayload;
 use keyzapper_core::backup_store::BackupStore;
 use keyzapper_core::gateway::KeyBudget;
 use keyzapper_core::keys::{masked_hint, KeyStore};
-use keyzapper_core::managed::{host_of, ManagedConfig};
+use keyzapper_core::managed::{host_of, is_secure_endpoint, ManagedConfig};
 use keyzapper_core::metadata::MetadataStore;
 use keyzapper_core::models::{new_id, parse_id, AppState, AuthType, OidcTokenType, Profile, WorkspaceBinding};
 use keyzapper_core::paths::{abbreviate_home, folder_name};
@@ -78,15 +78,10 @@ fn non_empty(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// http(s) URL with a host, as typed (trimmed).
+/// https URL with a host (http only for loopback), as typed (trimmed).
 pub fn valid_endpoint(text: &str) -> Option<String> {
     let trimmed = text.trim();
-    let url = url_scheme(trimmed)?;
-    (["http", "https"].contains(&url.as_str()) && host_of(trimmed).is_some()).then(|| trimmed.to_string())
-}
-
-fn url_scheme(text: &str) -> Option<String> {
-    text.split_once("://").map(|(scheme, _)| scheme.to_lowercase())
+    is_secure_endpoint(trimmed).then(|| trimmed.to_string())
 }
 
 impl Model {
@@ -170,6 +165,9 @@ impl Model {
     }
 
     fn not_allowed_message(&self, endpoint: &str) -> String {
+        if !is_secure_endpoint(endpoint) {
+            return l!("Der Endpunkt %@ verwendet kein https. Keys werden nur verschlüsselt übertragen (http nur für localhost).", endpoint);
+        }
         l!(
             "Der Endpunkt %@ ist laut Firmenrichtlinie nicht freigegeben. Erlaubt: %@",
             host_of(endpoint).unwrap_or_default(),
@@ -230,7 +228,7 @@ impl Model {
 
     pub fn save_profile_input(&mut self, input: ProfileInput) -> bool {
         let Some(endpoint) = valid_endpoint(&input.endpoint) else {
-            self.error = Some(l!("Bitte eine vollständige http(s)-URL angeben."));
+            self.error = Some(l!("Bitte eine vollständige https-URL angeben (http nur für localhost)."));
             return false;
         };
         let (environment, invalid) = Profile::parse_environment(&input.environment_text);

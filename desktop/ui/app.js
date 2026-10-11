@@ -476,7 +476,8 @@ function invalidEnvironmentLines(text) {
 function endpointHost(text) {
   try {
     const url = new URL(text.trim());
-    return ['http:', 'https:'].includes(url.protocol) && url.hostname ? url.hostname.toLowerCase() : null;
+    const loopback = ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
+    return (url.protocol === 'https:' || (url.protocol === 'http:' && loopback)) && url.hostname ? url.hostname.toLowerCase() : null;
   } catch { return null; }
 }
 
@@ -528,7 +529,7 @@ function profileEditor(existing) {
         h('fieldset', { disabled: managed },
           field(t('Name'), input({ value: s.name, placeholder: t('z. B. Projekt Alpha') }, update('name')), 'p-name'),
           field(t('LiteLLM-Endpunkt'), input({ value: s.endpoint, placeholder: 'https://litellm.firma.intern' }, update('endpoint')), 'p-endpoint'),
-          s.endpoint && !host && h('div', { class: 'field-note error-text' }, t('Bitte eine vollständige http(s)-URL angeben.')),
+          s.endpoint && !host && h('div', { class: 'field-note error-text' }, t('Bitte eine vollständige https-URL angeben (http nur für localhost).')),
           host && !allowed && h('div', { class: 'field-note error-text' }, t('Host nicht freigegeben. Erlaubt: %@', view.allowedHosts.join(', ')))),
         managed && h('div', { class: 'section-note' }, sso ? t('Von der IT vorgegeben – nur die Anmeldung ist möglich.') : t('Von der IT vorgegeben – nur der Key kann geändert werden.')),
         h('fieldset', { disabled: !!existing },
