@@ -30,7 +30,7 @@ in, so the costs land on the right project without anyone switching keys by hand
 
 ## Features
 
-* Profiles with name, LiteLLM endpoint, optional model alias and key. The key is stored exclusively in the local key file `keys.json` in the app data folder (no Keychain or credential-manager prompts).
+* Profiles with name, LiteLLM endpoint (https; plain http only for a gateway on localhost), optional model alias and key. The key is stored exclusively in the local key file `keys.json` in the app data folder (no Keychain or credential-manager prompts).
 * Assign project folders to a profile. The app only adds to `.claude/settings.local.json` and excludes the file from Git via `.git/info/exclude`.
 * Status per project: active, differing, folder missing, key missing, conflicts with other settings.
 * Test connection against LiteLLM (invalid or blocked key, rate limit, budget, gateway unreachable).
@@ -137,7 +137,7 @@ never via arguments or logs.
 | 67 | session expired (SSO only; sign in again) |
 | 70 | internal |
 | 77 | key store (`keys.json`) unreadable or not writable |
-| 78 | metadata corrupt or endpoint not in `AllowedGatewayHosts` |
+| 78 | metadata corrupt, endpoint not https (http only for localhost) or not in `AllowedGatewayHosts` |
 
 Metadata without keys is stored in `state.json` in the app data folder, the keys in `keys.json` next to it: `~/Library/Application Support/KeyZapper` on macOS (owner-only), `%LOCALAPPDATA%\KeyZapper` on Windows (user profile folder). Keys from the former Keychain-based version are offered for a one-time move on macOS (macOS may ask for permission once per key).
 
@@ -230,7 +230,10 @@ this backup is created manually and on demand.
 
 On startup the app checks the latest [GitHub release](https://github.com/bl0rb/ClaudeKeyZapper/releases); you can also check manually via
 *KeyZapper › Check for Updates…* or the version line at the bottom of the app. If a newer version is available, “Install”
-downloads the installer (`.pkg` on macOS, `.msi` on Windows), verifies the SHA-256 checksum published by GitHub (without a published checksum the update is refused) and opens the system installer.
+downloads the installer (`.pkg` on macOS, `.msi` on Windows), verifies the SHA-256 checksum published by GitHub and the release's
+minisign signature (`<installer>.minisig`) against the public key built into the app ([desktop/update-key.pub](desktop/update-key.pub)),
+then opens the system installer. Without a checksum or a valid signature the update is refused; the signed file name must match, so an
+older signed package cannot pass as a newer one.
 Administrator rights are required. Packages are only downloaded from `github.com`. The installed version is shown at the bottom of the
 app and under *KeyZapper › About KeyZapper*.
 
@@ -278,7 +281,9 @@ cd desktop && VERSION=1.0.0 scripts/build-msi.sh
 ## Release
 
 A tag in the format `X.Y.Z` starts [.github/workflows/release.yml](.github/workflows/release.yml). The workflow runs the
-tests, builds `KeyZapper-X.Y.Z.pkg` (macOS) and `KeyZapper-X.Y.Z.msi` (Windows) and publishes both in one GitHub release.
+tests, builds `KeyZapper-X.Y.Z.pkg` (macOS) and `KeyZapper-X.Y.Z.msi` (Windows), signs both with minisign and publishes them with
+their `.minisig` files in one GitHub release. Signing needs the repository secret `MINISIGN_SECRET_KEY` (the secret key matching
+`desktop/update-key.pub`); without it the workflow stops instead of publishing unsigned installers.
 A tag like `X.Y.Z-beta.N` creates a pre-release, which is only offered to installed betas and via “Check for beta”.
 
 ```bash
