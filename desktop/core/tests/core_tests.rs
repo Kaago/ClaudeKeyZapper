@@ -508,3 +508,122 @@ fn backup_keeps_sso_metadata_but_never_tokens() {
     assert_eq!((restored.auth_type, restored.oidc_issuer.as_deref(), restored.oidc_client_id.as_deref()), (AuthType::Oidc, Some("http://127.0.0.1:1"), Some("client")));
     assert!(!opened.keys.contains_key(BETA));
 }
+
+// MARK: Agent instruction files
+
+#[test]
+fn agents_scan_counts_languages_and_skips_dependencies() {
+    use keyzapper_core::agents;
+    let root = temp_dir("repo");
+    for (file, text) in [
+        ("src/main.rs", "fn main() {}"),
+        ("src/lib.rs", ""),
+        ("ui/app.ts", ""),
+        ("Cargo.toml", "[package]\nname = \"demo\""),
+        ("README.md", "# Demo\nA demo project."),
+        ("CLAUDE.md", "Run cargo test."),
+        ("node_modules/left-pad/index.js", ""),
+        ("target/debug/build.rs", ""),
+    ] {
+        let path = Path::new(&root).join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let scan = agents::scan(&root);
+    assert!(!scan.git);
+    assert_eq!(scan.file_count, 6);
+    assert_eq!(scan.languages, vec![("Rust".to_string(), 2), ("TypeScript".to_string(), 1)]);
+    assert_eq!(scan.manifests, vec!["Cargo.toml"]);
+    assert_eq!(scan.agent_files, vec!["CLAUDE.md"]);
+    assert!(!scan.has_agents_file);
+
+    let context = agents::context(&scan);
+    assert!(context.contains("src/ (2 files)"));
+    assert!(context.contains("=== Cargo.toml ===\n[package]"));
+    assert!(context.contains("=== Existing CLAUDE.md ===\nRun cargo test."));
+    assert!(!context.contains("node_modules"));
+}
+
+#[test]
+fn agents_reply_is_parsed_into_proposal() {
+    use keyzapper_core::agents;
+    let reply = "<assessment>\nA Rust CLI.\n</assessment>\n<recommendations>\ntask | model | tier | reason\n|---|---|---|---|\n\
+- Default | `team-sonnet` | Sonnet | Everyday work\n| Search | team-haiku | haiku | Cheap |\nnot a row\n</recommendations>\n\
+<agents_md>\n```markdown\n# AGENTS.md\n\n- Run `cargo test`.\n```\n</agents_md>";
+    let proposal = agents::parse_reply(reply).unwrap();
+    assert_eq!(proposal.assessment, "A Rust CLI.");
+    assert_eq!(proposal.content, "# AGENTS.md\n\n- Run `cargo test`.");
+    let rows: Vec<(&str, &str, &str)> = proposal.recommendations.iter().map(|r| (r.task.as_str(), r.model.as_str(), r.tier.as_str())).collect();
+    assert_eq!(rows, vec![("Default", "team-sonnet", "sonnet"), ("Search", "team-haiku", "haiku")]);
+    assert_eq!(agents::parse_reply("<assessment>No file</assessment>"), None);
+}
+
+#[test]
+fn agents_analysis_model_prefers_choice_then_profile_then_gateway() {
+    use keyzapper_core::agents::analysis_model;
+    let profile = sample();
+    assert_eq!(analysis_model(" chosen ", &profile, &[]).as_deref(), Some("chosen"));
+    assert_eq!(analysis_model("", &profile, &[]).as_deref(), Some("team-opus"));
+    let bare = other();
+    let available = vec!["claude-haiku-5-5".to_string(), "claude-sonnet-5-5".to_string()];
+    assert_eq!(analysis_model("", &bare, &available).as_deref(), Some("claude-sonnet-5-5"));
+    assert_eq!(analysis_model("", &bare, &[]), None);
+}
+
+#[test]
+fn agents_prompt_lists_goals_and_models() {
+    use keyzapper_core::agents::{prompt, Goal, Options};
+    let options = Options { goals: vec![Goal::Cost, Goal::Security], language: "de".into(), model: String::new(), notes: "Use pnpm.".into() };
+    let text = prompt("CONTEXT", &options, &sample(), &["team-opus".to_string(), "team-haiku".to_string()]);
+    assert!(text.contains("<repository>\nCONTEXT\n</repository>"));
+    assert!(text.contains("- Cost efficiency:") && text.contains("- Security:") && !text.contains("- Speed:"));
+    assert!(text.contains("- opus: team-opus\n- default (ANTHROPIC_MODEL): claude-alpha"));
+    assert!(text.contains("on the gateway: team-haiku\n"));
+    assert!(text.contains("Use pnpm.") && text.contains("AGENTS.md in German"));
+}
+
+/// Answers one HTTP request with `status` and `body`; returns the endpoint and the raw request it received.
+fn one_shot_server(status: &str, body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let status = status.to_string();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..n]);
+            let text = String::from_utf8_lossy(&request);
+            if let Some(end) = text.find("\r\n\r\n") {
+                let length = text.lines().find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+        String::from_utf8_lossy(&request).into_owned()
+    });
+    (endpoint, handle)
+}
+
+#[test]
+fn gateway_complete_posts_messages_and_reads_text() {
+    use keyzapper_core::gateway::complete;
+    use std::time::Duration;
+    let (endpoint, server) = one_shot_server("200 OK",
+        r#"{"content":[{"type":"thinking","thinking":""},{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":12,"output_tokens":3}}"#);
+    let reply = complete(&format!("{endpoint}/"), "sk-test", "team-opus", "SYSTEM", "PROMPT", 100, Duration::from_secs(5)).unwrap();
+    assert_eq!((reply.text.as_str(), reply.input_tokens, reply.output_tokens), ("Hello", 12, 3));
+    let request = server.join().unwrap().to_lowercase();
+    assert!(request.starts_with("post /v1/messages http/1.1"));
+    assert!(request.contains("x-api-key: sk-test") && request.contains("authorization: bearer sk-test") && request.contains("anthropic-version: 2023-06-01"));
+    assert!(request.contains(r#""model":"team-opus""#) && request.contains(r#""system":"system""#));
+
+    let (endpoint, server) = one_shot_server("400 Bad Request", r#"{"error":{"message":"Invalid model name"}}"#);
+    let error = complete(&endpoint, "sk-test", "nope", "S", "P", 100, Duration::from_secs(5)).err().unwrap();
+    server.join().unwrap();
+    assert!(error.contains("400") && error.contains("Invalid model name"), "{error}");
+}
