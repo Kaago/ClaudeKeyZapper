@@ -106,6 +106,9 @@ impl ManagedConfig {
     }
 
     pub fn is_endpoint_allowed(&self, endpoint: &str) -> bool {
+        if !is_secure_endpoint(endpoint) {
+            return false;
+        }
         if self.allowed_gateway_hosts.is_empty() {
             return true;
         }
@@ -118,6 +121,17 @@ impl ManagedConfig {
 
     pub fn is_managed(&self, id: &str) -> bool {
         self.profiles.iter().any(|p| p.id == id)
+    }
+}
+
+/// The key travels in the request headers, so it may only go over https; plain http is left for a
+/// gateway on this machine (loopback).
+pub fn is_secure_endpoint(endpoint: &str) -> bool {
+    let Ok(url) = url::Url::parse(endpoint.trim()) else { return false };
+    match url.scheme() {
+        "https" => url.host_str().is_some_and(|h| !h.is_empty()),
+        "http" => matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")),
+        _ => false,
     }
 }
 
@@ -289,6 +303,20 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn only_https_or_loopback_http_is_secure() {
+        assert!(is_secure_endpoint("https://litellm.firma.example"));
+        assert!(is_secure_endpoint(" http://127.0.0.1:4000 "));
+        assert!(is_secure_endpoint("http://localhost:4000/v1"));
+        assert!(is_secure_endpoint("http://[::1]:4000"));
+        assert!(!is_secure_endpoint("http://litellm.firma.example"));
+        assert!(!is_secure_endpoint("http://localhost.evil.example"));
+        assert!(!is_secure_endpoint("ftp://litellm.firma.example"));
+        assert!(!is_secure_endpoint("litellm.firma.example"));
+        assert!(ManagedConfig::default().is_endpoint_allowed("https://any.example"));
+        assert!(!ManagedConfig::default().is_endpoint_allowed("http://any.example"));
+    }
+
+    #[test]
     fn parses_profiles_hosts_and_flags() {
         let values = json!({
             "ManagedProfiles": [{"Name": "Projekt Alpha", "Endpoint": "https://litellm.firma.example", "OpusModel": "o",
@@ -316,6 +344,7 @@ mod tests {
         assert!(config.is_endpoint_allowed("https://litellm.firma.example/v1"));
         assert!(config.is_endpoint_allowed("https://eu.litellm.firma.example"));
         assert!(!config.is_endpoint_allowed("https://evil.example"));
+        assert!(!config.is_endpoint_allowed("http://litellm.firma.example/v1"));
         assert!(!config.allow_key_export && config.update_check_enabled);
         assert!(ManagedConfig::default().allow_key_export);
     }
