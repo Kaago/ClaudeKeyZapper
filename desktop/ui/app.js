@@ -228,8 +228,8 @@ function renderMain() {
       h('h2', null, t('Noch keine Profile')),
       h('p', null, t('Lege ein Profil mit LiteLLM-Endpunkt, Modellalias und deinem freigegebenen Key an.')),
       button(t('Profil anlegen'), () => profileEditor(null), { cls: 'primary' }),
-      button(t('Backup importieren …'), importDialog, { cls: 'link' }),
-      button(t('So funktioniert’s'), howItWorksDialog, { cls: 'link' })));
+      button(t('Backup importieren …'), importDialog, { cls: 'link' })),
+      footer());
     return;
   }
   main.replaceChildren(
@@ -240,11 +240,16 @@ function renderMain() {
 }
 
 function footer() {
+  // The result shows as a banner at the top, out of sight when the footer was clicked at the bottom.
+  const checkUpdates = async (beta) => {
+    await call('check_for_updates', { beta });
+    window.scrollTo(0, 0);
+  };
   return h('div', { class: 'footer' },
     view.appVersion ? `KeyZapper ${view.appVersion}` : t('KeyZapper Entwicklungsversion'),
     view.updateCheckEnabled
-      ? [button(t('Nach Updates suchen'), () => call('check_for_updates', { beta: false }), { cls: 'link' }),
-        button(t('Beta-Version suchen'), () => call('check_for_updates', { beta: true }), { cls: 'link' })]
+      ? [button(t('Nach Updates suchen'), () => checkUpdates(false), { cls: 'link' }),
+        button(t('Beta-Version suchen'), () => checkUpdates(true), { cls: 'link' })]
       : h('span', null, t('Updates über die IT')),
     button(t('So funktioniert’s'), howItWorksDialog, { cls: 'link' }),
     button(t('Projektseite'), () => call('open_url', { url: view.projectUrl }), { cls: 'link' }));
@@ -474,7 +479,8 @@ function invalidEnvironmentLines(text) {
 function endpointHost(text) {
   try {
     const url = new URL(text.trim());
-    return ['http:', 'https:'].includes(url.protocol) && url.hostname ? url.hostname.toLowerCase() : null;
+    const loopback = ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
+    return (url.protocol === 'https:' || (url.protocol === 'http:' && loopback)) && url.hostname ? url.hostname.toLowerCase() : null;
   } catch { return null; }
 }
 
@@ -526,7 +532,7 @@ function profileEditor(existing) {
         h('fieldset', { disabled: managed },
           field(t('Name'), input({ value: s.name, placeholder: t('z. B. Projekt Alpha') }, update('name')), 'p-name'),
           field(t('LiteLLM-Endpunkt'), input({ value: s.endpoint, placeholder: 'https://litellm.firma.intern' }, update('endpoint')), 'p-endpoint'),
-          s.endpoint && !host && h('div', { class: 'field-note error-text' }, t('Bitte eine vollständige http(s)-URL angeben.')),
+          s.endpoint && !host && h('div', { class: 'field-note error-text' }, t('Bitte eine vollständige https-URL angeben (http nur für localhost).')),
           host && !allowed && h('div', { class: 'field-note error-text' }, t('Host nicht freigegeben. Erlaubt: %@', view.allowedHosts.join(', ')))),
         managed && h('div', { class: 'section-note' }, sso ? t('Von der IT vorgegeben – nur die Anmeldung ist möglich.') : t('Von der IT vorgegeben – nur der Key kann geändert werden.')),
         h('fieldset', { disabled: !!existing },

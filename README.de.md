@@ -31,7 +31,7 @@ richtigen Projekt.
 
 ## Funktionen
 
-* Profile mit Name, LiteLLM-Endpunkt, optionalem Modellalias und Key. Der Key liegt ausschließlich in der lokalen Key-Datei `keys.json` im App-Datenordner (keine Schlüsselbund- oder Anmeldeinformationsverwaltungs-Abfragen).
+* Profile mit Name, LiteLLM-Endpunkt (https; einfaches http nur für ein Gateway auf localhost), optionalem Modellalias und Key. Der Key liegt ausschließlich in der lokalen Key-Datei `keys.json` im App-Datenordner (keine Schlüsselbund- oder Anmeldeinformationsverwaltungs-Abfragen).
 * Projektordner einem Profil zuordnen. Die App ergänzt nur `.claude/settings.local.json` und schließt die Datei per `.git/info/exclude` von Git aus.
 * Status je Projekt: aktiv, abweichend, Ordner fehlt, Key fehlt, Konflikte mit anderen Einstellungen.
 * Verbindungstest gegen LiteLLM (ungültiger oder gesperrter Key, Rate-Limit, Budget, Gateway nicht erreichbar).
@@ -138,7 +138,7 @@ nie über Argumente oder Logs.
 | 67 | Sitzung abgelaufen (nur SSO; neu anmelden) |
 | 70 | intern |
 | 77 | Key-Speicher (`keys.json`) nicht lesbar oder nicht beschreibbar |
-| 78 | Metadaten defekt oder Endpunkt nicht in `AllowedGatewayHosts` |
+| 78 | Metadaten defekt, Endpunkt nicht https (http nur für localhost) oder nicht in `AllowedGatewayHosts` |
 
 Metadaten ohne Keys liegen in `state.json` im App-Datenordner, die Keys daneben in `keys.json`: `~/Library/Application Support/KeyZapper` unter macOS (nur für den Besitzer), `%LOCALAPPDATA%\KeyZapper` unter Windows (Benutzerprofil-Ordner). Keys aus der früheren Schlüsselbund-Version bietet die App unter macOS einmalig zur Übernahme an (macOS fragt dabei ggf. je Key um Erlaubnis).
 
@@ -232,7 +232,10 @@ OneDrive-Backup (nie Keys) entsteht dieses Backup manuell und bei Bedarf.
 
 Beim Start prüft die App das neueste [GitHub-Release](https://github.com/bl0rb/ClaudeKeyZapper/releases); manuell geht es über
 *KeyZapper › Nach Updates suchen …* oder die Versionszeile unten in der App. Ist eine neuere Version verfügbar, lädt
-„Installieren“ den Installer (`.pkg` unter macOS, `.msi` unter Windows) herunter, prüft die von GitHub veröffentlichte SHA-256-Prüfsumme (ohne veröffentlichte Prüfsumme wird das Update abgelehnt) und öffnet den System-Installer.
+„Installieren“ den Installer (`.pkg` unter macOS, `.msi` unter Windows) herunter, prüft die von GitHub veröffentlichte SHA-256-Prüfsumme und die minisign-Signatur des Releases (`<Installer>.minisig`) gegen den
+in die App eingebauten öffentlichen Schlüssel ([desktop/update-key.pub](desktop/update-key.pub)) und öffnet dann den System-Installer.
+Ohne Prüfsumme oder gültige Signatur wird das Update abgelehnt; der signierte Dateiname muss passen, damit ein älteres signiertes Paket
+nicht als neueres durchgeht.
 Dafür sind Administratorrechte nötig. Pakete werden nur von `github.com` geladen. Die installierte Version steht unten in der
 App und unter *KeyZapper › Über KeyZapper*.
 
@@ -280,7 +283,9 @@ cd desktop && VERSION=1.0.0 scripts/build-msi.sh
 ## Release
 
 Ein Tag im Format `X.Y.Z` startet [.github/workflows/release.yml](.github/workflows/release.yml). Der Workflow führt die
-Tests aus, baut `KeyZapper-X.Y.Z.pkg` (macOS) und `KeyZapper-X.Y.Z.msi` (Windows) und veröffentlicht beide in einem GitHub-Release.
+Tests aus, baut `KeyZapper-X.Y.Z.pkg` (macOS) und `KeyZapper-X.Y.Z.msi` (Windows), signiert beide mit minisign und veröffentlicht sie
+mit ihren `.minisig`-Dateien in einem GitHub-Release. Zum Signieren braucht es das Repository-Secret `MINISIGN_SECRET_KEY` (der geheime
+Schlüssel zu `desktop/update-key.pub`); ohne Secret bricht der Workflow ab, statt unsignierte Installer zu veröffentlichen.
 Ein Tag wie `X.Y.Z-beta.N` erzeugt ein Pre-Release, das nur installierten Betas und über „Beta-Version suchen“ angeboten wird.
 
 ```bash

@@ -20,7 +20,7 @@
 
 use crate::errors::Error;
 use crate::keys::KeyStore;
-use crate::managed::{host_of, ManagedConfig};
+use crate::managed::{host_of, is_secure_endpoint, ManagedConfig};
 use crate::oidc;
 use crate::metadata::MetadataStore;
 use crate::models::{parse_id, AppState, Profile};
@@ -79,6 +79,9 @@ impl HelperCommand {
             }
             return fail(ExitCode::UnknownProfile, l!("Unbekanntes Profil: %@", id));
         };
+        if ["credential", "pool", "store"].contains(&args[0].as_str()) && !is_secure_endpoint(&profile.endpoint) {
+            return fail(ExitCode::ConfigError, l!("Der Endpunkt %@ verwendet kein https. Keys werden nur verschlüsselt übertragen (http nur für localhost).", profile.endpoint));
+        }
         if ["credential", "pool", "store"].contains(&args[0].as_str()) && !self.config.is_endpoint_allowed(&profile.endpoint) {
             let host = host_of(&profile.endpoint).unwrap_or_else(|| "?".into());
             return fail(ExitCode::ConfigError, l!("Endpunkt %@ ist laut Firmenrichtlinie (AllowedGatewayHosts) nicht freigegeben.", host));

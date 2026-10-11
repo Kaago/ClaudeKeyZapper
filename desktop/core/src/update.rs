@@ -1,7 +1,11 @@
 //! Checks the public GitHub releases of KeyZapper and downloads the installer of a newer release
-//! (`.pkg` on macOS, `.msi` on Windows), verified against the SHA-256 digest GitHub publishes.
+//! (`.pkg` on macOS, `.msi` on Windows), verified against the SHA-256 digest GitHub publishes and
+//! against the release's minisign signature (`<package>.minisig`), made in CI with a key whose public
+//! half is built into the app (`desktop/update-key.pub`). The hash alone only proves the download is
+//! what GitHub serves; the signature proves the release was built by our pipeline.
 
 use crate::{gateway, l};
+use minisign_verify::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::io::Read;
@@ -10,6 +14,9 @@ use std::time::Duration;
 
 pub const REPOSITORY: &str = "bl0rb/ClaudeKeyZapper";
 pub const INSTALLER_EXTENSION: &str = if cfg!(windows) { ".msi" } else { ".pkg" };
+const SIGNATURE_EXTENSION: &str = ".minisig";
+/// minisign public key of the release pipeline (the file `minisign -G` writes).
+const UPDATE_PUBLIC_KEY: &str = include_str!("../../update-key.pub");
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReleaseInfo {
@@ -20,6 +27,8 @@ pub struct ReleaseInfo {
     pub package_url: Option<String>,
     /// Hex SHA-256 of the package as published by GitHub (`digest` of the release asset), if available.
     pub package_sha256: Option<String>,
+    /// `<package>.minisig` of the same release, if published.
+    pub signature_url: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -29,6 +38,8 @@ pub enum UpdateError {
     NoPackage,
     ChecksumMismatch,
     MissingChecksum,
+    MissingSignature,
+    InvalidSignature,
 }
 
 impl std::fmt::Display for UpdateError {
@@ -41,6 +52,10 @@ impl std::fmt::Display for UpdateError {
             UpdateError::MissingChecksum => {
                 l!("Für das Paket ist keine Prüfsumme veröffentlicht. Bitte manuell von der Release-Seite installieren.")
             }
+            UpdateError::MissingSignature => {
+                l!("Für das Paket ist keine Signatur veröffentlicht. Bitte manuell von der Release-Seite installieren.")
+            }
+            UpdateError::InvalidSignature => l!("Die Signatur des Pakets ist ungültig. Installation abgebrochen."),
         })
     }
 }
@@ -84,9 +99,14 @@ pub fn newest(body: &str) -> Option<ReleaseInfo> {
 
 fn release_info(release: &serde_json::Value) -> Option<ReleaseInfo> {
     // Only accept packages served by GitHub itself.
-    let asset = release["assets"].as_array()?.iter().find(|a| {
-        a["name"].as_str().is_some_and(|n| n.ends_with(INSTALLER_EXTENSION))
-            && a["browser_download_url"].as_str().and_then(|u| url::Url::parse(u).ok()).is_some_and(|u| u.host_str() == Some("github.com"))
+    let assets = release["assets"].as_array()?;
+    let from_github = |a: &&serde_json::Value| {
+        a["browser_download_url"].as_str().and_then(|u| url::Url::parse(u).ok()).is_some_and(|u| u.host_str() == Some("github.com"))
+    };
+    let asset = assets.iter().filter(from_github).find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(INSTALLER_EXTENSION)));
+    let signature = asset.and_then(|a| a["name"].as_str()).and_then(|package| {
+        let name = format!("{package}{SIGNATURE_EXTENSION}");
+        assets.iter().filter(from_github).find(|a| a["name"].as_str() == Some(name.as_str()))
     });
     Some(ReleaseInfo {
         version: normalized(release["tag_name"].as_str()?),
@@ -97,6 +117,7 @@ fn release_info(release: &serde_json::Value) -> Option<ReleaseInfo> {
             .and_then(|a| a["digest"].as_str())
             .and_then(|d| d.strip_prefix("sha256:"))
             .map(str::to_lowercase),
+        signature_url: signature.and_then(|a| a["browser_download_url"].as_str()).map(String::from),
     })
 }
 
@@ -156,12 +177,29 @@ pub fn is_newer(candidate: &str, installed: &str) -> bool {
     is_older(&normalized(installed), &normalized(candidate))
 }
 
-/// Downloads the package into a temporary folder and verifies its SHA-256 (refuses without a published checksum).
+/// Downloads the package into a temporary folder and verifies its SHA-256 and its minisign signature
+/// (refuses without a published checksum or signature).
 pub fn download_package(release: &ReleaseInfo) -> Result<PathBuf, UpdateError> {
     let package_url = release.package_url.as_ref().ok_or(UpdateError::NoPackage)?;
     let expected = release.package_sha256.as_ref().ok_or(UpdateError::MissingChecksum)?;
+    let signature_url = release.signature_url.as_ref().ok_or(UpdateError::MissingSignature)?;
+    let data = download(package_url, 512 * 1024 * 1024)?;
+    if hex_sha256(&data) != *expected {
+        return Err(UpdateError::ChecksumMismatch);
+    }
+    let name = package_url.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("KeyZapper-Update");
+    let signature = String::from_utf8(download(signature_url, 16 * 1024)?).map_err(|_| UpdateError::InvalidSignature)?;
+    verify_signature(UPDATE_PUBLIC_KEY, &data, &signature, name)?;
+    let dir = std::env::temp_dir().join(format!("KeyZapper-Update-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).map_err(|e| UpdateError::Network(e.to_string()))?;
+    let target = dir.join(name);
+    std::fs::write(&target, &data).map_err(|e| UpdateError::Network(e.to_string()))?;
+    Ok(target)
+}
+
+fn download(url: &str, limit: u64) -> Result<Vec<u8>, UpdateError> {
     let mut response = gateway::agent(Duration::from_secs(300))
-        .get(package_url)
+        .get(url)
         .header("User-Agent", "KeyZapper")
         .call()
         .map_err(|e| UpdateError::Network(e.to_string()))?;
@@ -169,22 +207,20 @@ pub fn download_package(release: &ReleaseInfo) -> Result<PathBuf, UpdateError> {
         return Err(UpdateError::Unavailable(response.status().as_u16()));
     }
     let mut data = Vec::new();
-    response
-        .body_mut()
-        .with_config()
-        .limit(512 * 1024 * 1024)
-        .reader()
-        .read_to_end(&mut data)
-        .map_err(|e| UpdateError::Network(e.to_string()))?;
-    if hex_sha256(&data) != *expected {
-        return Err(UpdateError::ChecksumMismatch);
+    response.body_mut().with_config().limit(limit).reader().read_to_end(&mut data).map_err(|e| UpdateError::Network(e.to_string()))?;
+    Ok(data)
+}
+
+/// Checks `data` against a minisign signature by `public_key`. The trusted comment (signed too) must
+/// name the package file, so a signature of an older release cannot be passed off for a newer one.
+pub fn verify_signature(public_key: &str, data: &[u8], signature: &str, package_name: &str) -> Result<(), UpdateError> {
+    let key = PublicKey::decode(public_key.trim()).map_err(|_| UpdateError::InvalidSignature)?;
+    let signature = Signature::decode(signature.trim()).map_err(|_| UpdateError::InvalidSignature)?;
+    key.verify(data, &signature, false).map_err(|_| UpdateError::InvalidSignature)?;
+    if signature.trusted_comment().trim() != package_name {
+        return Err(UpdateError::InvalidSignature);
     }
-    let name = package_url.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("KeyZapper-Update");
-    let dir = std::env::temp_dir().join(format!("KeyZapper-Update-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).map_err(|e| UpdateError::Network(e.to_string()))?;
-    let target = dir.join(name);
-    std::fs::write(&target, &data).map_err(|e| UpdateError::Network(e.to_string()))?;
-    Ok(target)
+    Ok(())
 }
 
 pub fn hex_sha256(data: &[u8]) -> String {
@@ -216,6 +252,41 @@ mod tests {
         assert!(!release.prerelease);
         assert_eq!(release.package_sha256.as_deref(), Some("abc"));
         assert!(release.package_url.unwrap().starts_with("https://github.com/"));
+        assert_eq!(release.signature_url, None);
+    }
+
+    #[test]
+    fn finds_the_signature_of_the_package() {
+        let body = format!(
+            r#"{{"tag_name":"1.2.0","html_url":"https://github.com/x/y/releases/1.2.0","assets":[
+              {{"name":"KeyZapper-1.2.0{ext}.minisig","browser_download_url":"https://evil.example/s.minisig"}},
+              {{"name":"KeyZapper-1.2.0{ext}","browser_download_url":"https://github.com/x/y/KeyZapper-1.2.0{ext}","digest":"sha256:ABC"}},
+              {{"name":"KeyZapper-1.2.0{ext}.minisig","browser_download_url":"https://github.com/x/y/KeyZapper-1.2.0{ext}.minisig"}}]}}"#,
+            ext = INSTALLER_EXTENSION
+        );
+        let release = parse(&body).unwrap();
+        assert!(release.signature_url.unwrap().starts_with("https://github.com/x/y/"));
+    }
+
+    // Throwaway key pair made with `minisign -G -W` for this test only.
+    const TEST_KEY: &str = "untrusted comment: minisign public key 5E3DB03C39D0F256\nRWRW8tA5PLA9Xj3/OVZXGzEPv3l9N93BJ/HpxOz55CQlKq3CcEXmTH/u\n";
+    const TEST_SIGNATURE: &str = "untrusted comment: signature from minisign secret key
+RURW8tA5PLA9XuoEKLOOQvJmARLNH2zMIUo9LGr70Vlo6yUgLSG0WBcuyF/f4mo1EBuBb5DPCK1eR58h53bKF6wOw8ikrzI8BQE=
+trusted comment: KeyZapper-1.2.0.pkg
+LjyFp1v74V8PJ2nql9KXVirepzkrfrlmzLlriBmaIfwv5B8dSA5dQqYfwQf53ToI95gIhvxWrZmB1VFJU49BBw==
+";
+
+    #[test]
+    fn verifies_signature_and_package_name() {
+        assert_eq!(verify_signature(TEST_KEY, b"hello\n", TEST_SIGNATURE, "KeyZapper-1.2.0.pkg"), Ok(()));
+        assert_eq!(verify_signature(TEST_KEY, b"tampered\n", TEST_SIGNATURE, "KeyZapper-1.2.0.pkg"), Err(UpdateError::InvalidSignature));
+        assert_eq!(verify_signature(TEST_KEY, b"hello\n", TEST_SIGNATURE, "KeyZapper-1.3.0.pkg"), Err(UpdateError::InvalidSignature));
+        assert_eq!(verify_signature(TEST_KEY, b"hello\n", "garbage", "KeyZapper-1.2.0.pkg"), Err(UpdateError::InvalidSignature));
+    }
+
+    #[test]
+    fn built_in_update_key_is_valid() {
+        assert!(PublicKey::decode(UPDATE_PUBLIC_KEY.trim()).is_ok());
     }
 
     #[test]

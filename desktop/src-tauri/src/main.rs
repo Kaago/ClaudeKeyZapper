@@ -253,7 +253,7 @@ async fn test_connection(app: AppHandle, profile_id: String) -> Result<CheckOutc
 #[tauri::command]
 async fn available_models(app: AppHandle, endpoint: String, typed_key: String, profile_id: Option<String>) -> Result<Vec<String>, String> {
     blocking(move || {
-        let endpoint = model::valid_endpoint(&endpoint).ok_or_else(|| l!("Bitte eine vollständige http(s)-URL angeben."))?;
+        let endpoint = model::valid_endpoint(&endpoint).ok_or_else(|| l!("Bitte eine vollständige https-URL angeben (http nur für localhost)."))?;
         let sso = with_model(&app, |m| profile_id.as_deref().and_then(|id| m.state.profile(id)).is_some_and(|p| p.is_sso()));
         let key = with_model(&app, |m| {
             if !m.config.is_endpoint_allowed(&endpoint) {
