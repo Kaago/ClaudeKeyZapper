@@ -6,6 +6,7 @@ license = "MIT"
 
 [dependencies]
 aes-gcm = "0.10"
+minisign-verify = "0.3"
 base64 = "0.22"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 serde = { version = "1", features = ["derive"] }
