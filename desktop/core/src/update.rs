@@ -40,6 +40,9 @@ pub enum UpdateError {
     MissingChecksum,
     MissingSignature,
     InvalidSignature,
+    /// The administrator prompt was cancelled.
+    Cancelled,
+    InstallFailed(String),
 }
 
 impl std::fmt::Display for UpdateError {
@@ -56,6 +59,8 @@ impl std::fmt::Display for UpdateError {
                 l!("Für das Paket ist keine Signatur veröffentlicht. Bitte manuell von der Release-Seite installieren.")
             }
             UpdateError::InvalidSignature => l!("Die Signatur des Pakets ist ungültig. Installation abgebrochen."),
+            UpdateError::Cancelled => l!("Installation abgebrochen."),
+            UpdateError::InstallFailed(reason) => l!("Installation fehlgeschlagen: %@", reason),
         })
     }
 }
@@ -209,6 +214,47 @@ fn download(url: &str, limit: u64) -> Result<Vec<u8>, UpdateError> {
     let mut data = Vec::new();
     response.body_mut().with_config().limit(limit).reader().read_to_end(&mut data).map_err(|e| UpdateError::Network(e.to_string()))?;
     Ok(data)
+}
+
+/// Installs a downloaded package, then the caller restarts the app.
+/// macOS: `installer` behind the system administrator prompt; returns when the installation is done.
+#[cfg(target_os = "macos")]
+pub fn install(package: &std::path::Path, version: &str) -> Result<(), UpdateError> {
+    let script = [
+        "on run argv",
+        "do shell script \"/usr/sbin/installer -pkg \" & quoted form of item 1 of argv & \" -target /\" with prompt (item 2 of argv) with administrator privileges",
+        "end run",
+    ];
+    let output = std::process::Command::new("/usr/bin/osascript")
+        .args(script.into_iter().flat_map(|line| ["-e", line]))
+        .arg(package)
+        .arg(l!("KeyZapper möchte das Update auf Version %@ installieren.", version))
+        .output()
+        .map_err(|e| UpdateError::InstallFailed(e.to_string()))?;
+    let error = String::from_utf8_lossy(&output.stderr);
+    match output.status.success() {
+        true => Ok(()),
+        false if error.contains("(-128)") => Err(UpdateError::Cancelled),
+        false => Err(UpdateError::InstallFailed(error.trim().to_string())),
+    }
+}
+
+/// Windows: starts the Windows Installer (progress bar, UAC prompt) and returns at once; the app must exit
+/// so its files are not in use. `AUTOLAUNCHAPP` makes Tauri's MSI start the new version afterwards.
+#[cfg(windows)]
+pub fn install(package: &std::path::Path, _version: &str) -> Result<(), UpdateError> {
+    crate::git::command("msiexec")
+        .arg("/i")
+        .arg(package)
+        .args(["/passive", "/norestart", "AUTOLAUNCHAPP=True"])
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| UpdateError::InstallFailed(e.to_string()))
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn install(_package: &std::path::Path, _version: &str) -> Result<(), UpdateError> {
+    Err(UpdateError::InstallFailed("unsupported platform".into()))
 }
 
 /// Checks `data` against a minisign signature by `public_key`. The trusted comment (signed too) must

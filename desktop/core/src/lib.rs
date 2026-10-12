@@ -25,3 +25,4 @@ pub mod settings;
 pub mod time;
 pub mod tokens;
 pub mod update;
+pub mod whats_new;

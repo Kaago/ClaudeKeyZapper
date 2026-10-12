@@ -627,3 +627,18 @@ fn gateway_complete_posts_messages_and_reads_text() {
     server.join().unwrap();
     assert!(error.contains("400") && error.contains("Invalid model name"), "{error}");
 }
+
+#[test]
+fn whats_new_lists_releases_since_the_previous_version() {
+    use keyzapper_core::whats_new::since;
+    let versions = |previous: Option<&str>, current: &str| since(previous, current).into_iter().map(|r| r.version).collect::<Vec<_>>();
+    assert_eq!(versions(Some("1.3.0"), "1.4.0"), vec!["1.4.0"]);
+    assert_eq!(versions(Some("1.2.0"), "1.4.0"), vec!["1.4.0", "1.3.0"]);
+    assert_eq!(versions(None, "1.4.0"), vec!["1.4.0", "1.3.0"]);
+    assert_eq!(versions(Some("1.3.0"), "1.4.0-beta.1"), vec!["1.4.0"]);
+    // Betas of one release share its notes: nothing new between them or from the last beta to the release.
+    assert!(versions(Some("1.4.0-beta.1"), "1.4.0-beta.2").is_empty());
+    assert!(versions(Some("1.4.0-beta.2"), "1.4.0").is_empty());
+    assert!(versions(Some("1.4.0"), "1.4.1").is_empty());
+    assert!(since(Some("1.3.0"), "1.4.0")[0].items.iter().all(|i| !i.is_empty()));
+}

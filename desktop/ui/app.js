@@ -9,6 +9,7 @@ const checks = new Map();
 /** Open dialogs that re-render when the view changes. */
 const liveDialogs = new Set();
 let alertOpen = false;
+let whatsNewShown = false;
 
 // MARK: Helpers
 
@@ -120,6 +121,7 @@ function setView(next) {
   renderMain();
   for (const render of liveDialogs) render();
   if (view.error && !alertOpen) showAlert(view.error, () => call('dismiss_error'));
+  if (view.whatsNew.length && !whatsNewShown) whatsNewDialog();
 }
 
 let toolbarSignature = '';
@@ -211,9 +213,9 @@ function renderBanners() {
     items.push(banner('info',
       prerelease ? t('Beta: KeyZapper %@ ist verfügbar (installiert: %@)', version, view.appVersion ?? '?')
         : t('KeyZapper %@ ist verfügbar (installiert: %@)', version, view.appVersion ?? '?'),
-      view.installingUpdate ? t('Paket wird geladen und geprüft …')
-        : prerelease ? t('Beta-Versionen sind zum Testen gedacht. Die Installation benötigt Administratorrechte.')
-          : t('Die Installation benötigt Administratorrechte.'),
+      view.installingUpdate ? t('Update wird geladen, geprüft und installiert – KeyZapper startet danach neu …')
+        : prerelease ? t('Beta-Versionen sind zum Testen gedacht. Die Installation benötigt Administratorrechte, danach startet KeyZapper neu.')
+          : t('Die Installation benötigt Administratorrechte, danach startet KeyZapper neu.'),
       [[t('Installieren'), () => call('install_update')], [t('Versionshinweise'), () => call('open_url', { url: view.availableUpdate.pageUrl })]]));
   }
   if (view.notice) items.push(banner('info', view.notice, null, [], () => call('dismiss_notice')));
@@ -816,6 +818,24 @@ function agentsDialog(binding, profile) {
   invoke('scan_repository', { bindingId: binding.id })
     .then((scan) => { s.scan = scan; }, (error) => { s.scanError = String(error); })
     .finally(() => dlg.render());
+}
+
+/** Once after an update: the highlights of the releases since the version last seen. */
+function whatsNewDialog() {
+  whatsNewShown = true;
+  const releases = view.whatsNew;
+  const { dialog } = openDialog(t('Neu in KeyZapper %@', view.appVersion), (close) => ({
+    body: [
+      h('h2', null, t('Neu in KeyZapper %@', view.appVersion)),
+      releases.map((r) => h('fieldset', null, releases.length > 1 && h('legend', null, `KeyZapper ${r.version}`),
+        h('ul', { class: 'whats-new' }, r.items.map((item) => h('li', null, item))))),
+    ],
+    actions: [
+      button(t('Versionshinweise'), () => call('open_url', { url: `${view.projectUrl}/releases/tag/${view.appVersion}` }), { cls: 'left' }),
+      button(t('Weiter'), close, { cls: 'primary' }),
+    ],
+  }), { wide: true });
+  dialog.addEventListener('close', () => call('dismiss_whats_new'));
 }
 
 function howItWorksDialog() {

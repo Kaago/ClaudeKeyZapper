@@ -13,7 +13,7 @@ use keyzapper_core::paths::{abbreviate_home, folder_name};
 use keyzapper_core::settings::{self, BindingHealth, BindingStatus, SettingsBinder};
 use keyzapper_core::update::ReleaseInfo;
 use keyzapper_core::tokens::TokenStore;
-use keyzapper_core::{agents, cli, helper, l, legacy_keychain, oidc};
+use keyzapper_core::{agents, cli, helper, l, legacy_keychain, oidc, update, whats_new};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,6 +23,8 @@ pub struct Model {
     pub budgets: HashMap<String, KeyBudget>,
     pub available_update: Option<ReleaseInfo>,
     pub installing_update: bool,
+    /// Highlights of the releases since the version last seen, shown once after an update.
+    pub whats_new: Vec<whats_new::Release>,
     /// Findings of the logical check of `~/.claude/settings.json`.
     pub global_findings: Vec<Finding>,
     /// State of the default profile in `~/.claude/settings.json`, None if none is set.
@@ -94,6 +96,7 @@ impl Model {
             budgets: HashMap::new(),
             available_update: None,
             installing_update: false,
+            whats_new: vec![],
             global_findings: vec![],
             global_health: None,
             statuses: HashMap::new(),
@@ -122,6 +125,7 @@ impl Model {
                 model.error = Some(e.to_string());
             }
         }
+        model.load_whats_new();
         if model.config.one_drive_backup || model.config.backup_directory.is_some() {
             match &model.backup_dir {
                 Some(dir) => {
@@ -146,6 +150,28 @@ impl Model {
         model.sync_managed_profiles();
         model.migrate_helper_path();
         model
+    }
+
+    /// After an update: the highlights since the version last seen. Existing users updating from a release before this
+    /// dialog have no seen version; a fresh install (no profiles yet) shows nothing.
+    fn load_whats_new(&mut self) {
+        let Some(current) = self.app_version.clone() else { return };
+        let seen = whats_new::seen_version();
+        self.whats_new = match &seen {
+            Some(seen) if update::is_newer(&current, seen) => whats_new::since(Some(seen), &current),
+            None if !self.state.profiles.is_empty() => whats_new::since(None, &current),
+            _ => vec![],
+        };
+        if self.whats_new.is_empty() && seen.as_deref() != Some(current.as_str()) {
+            let _ = whats_new::mark_seen(&current);
+        }
+    }
+
+    pub fn dismiss_whats_new(&mut self) {
+        if let Some(current) = &self.app_version {
+            let _ = whats_new::mark_seen(current);
+        }
+        self.whats_new.clear();
     }
 
     pub fn is_disabled(&self) -> bool {
@@ -891,6 +917,7 @@ impl Model {
                 page_url: u.page_url.clone(),
             }),
             installing_update: self.installing_update,
+            whats_new: self.whats_new.clone(),
             keychain_keys: self.keychain_profiles.len(),
             notice: self.notice.clone(),
             error: self.error.clone(),
@@ -959,6 +986,7 @@ pub struct View {
     minimum_cli_version: String,
     available_update: Option<UpdateView>,
     installing_update: bool,
+    whats_new: Vec<whats_new::Release>,
     keychain_keys: usize,
     notice: Option<String>,
     error: Option<String>,
