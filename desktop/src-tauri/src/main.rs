@@ -548,7 +548,8 @@ async fn check_for_updates(app: AppHandle, beta: bool) -> View {
     .await
 }
 
-/// Downloads and verifies the installer, then opens it (macOS Installer / Windows Installer).
+/// Downloads and verifies the installer and installs it; KeyZapper then starts again as the new version.
+/// If installing in place fails, the package is opened in the system installer instead.
 #[tauri::command]
 async fn install_update(app: AppHandle) -> View {
     blocking(move || {
@@ -562,22 +563,42 @@ async fn install_update(app: AppHandle) -> View {
             return view(&app);
         };
         changed(&app);
-        let result = update::download_package(&release)
-            .map_err(|e| e.to_string())
-            .and_then(|path| app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(|e| e.to_string()));
-        with_model(&app, |m| {
-            m.installing_update = false;
-            match result {
-                Ok(()) => {
-                    m.notice = Some(l!("Installer für KeyZapper %@ geöffnet. Nach der Installation KeyZapper neu starten.", release.version));
-                    m.available_update = None;
-                }
-                Err(e) => m.error = Some(l!("Update konnte nicht geladen werden: %@", e)),
+        let path = match update::download_package(&release) {
+            Ok(path) => path,
+            Err(e) => {
+                with_model(&app, |m| {
+                    m.installing_update = false;
+                    m.error = Some(l!("Update konnte nicht geladen werden: %@", e));
+                });
+                return view(&app);
             }
-        });
+        };
+        match update::install(&path, &release.version) {
+            // Windows: the installer runs on and starts the new version itself; the app must not hold its files.
+            Ok(()) if cfg!(windows) => app.exit(0),
+            Ok(()) => app.restart(),
+            Err(update::UpdateError::Cancelled) => with_model(&app, |m| m.notice = Some(update::UpdateError::Cancelled.to_string())),
+            Err(e) => {
+                let opened = app.opener().open_path(path.to_string_lossy(), None::<&str>);
+                with_model(&app, |m| match opened {
+                    Ok(()) => {
+                        m.notice = Some(l!("Installer für KeyZapper %@ geöffnet. Nach der Installation KeyZapper neu starten.", release.version));
+                        m.available_update = None;
+                    }
+                    Err(_) => m.error = Some(e.to_string()),
+                });
+            }
+        }
+        with_model(&app, |m| m.installing_update = false);
         view(&app)
     })
     .await
+}
+
+#[tauri::command]
+fn dismiss_whats_new(app: AppHandle) -> View {
+    with_model(&app, |m| m.dismiss_whats_new());
+    view(&app)
 }
 
 #[tauri::command]
@@ -636,6 +657,7 @@ fn main() {
             import_backup,
             check_for_updates,
             install_update,
+            dismiss_whats_new,
             reveal,
             open_url,
         ])
