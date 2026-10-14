@@ -215,6 +215,141 @@ pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
+/// How Claude Code reaches an MCP server: a local process (stdio) or a remote endpoint (http, sse).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    Http,
+    Sse,
+}
+
+/// An MCP server, written as one `mcpServers` entry into the `.mcp.json` of the projects that use it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServer {
+    pub id: String,
+    /// Key in `mcpServers`, e.g. `github`; Claude Code names the tools `mcp__<name>__…`.
+    pub name: String,
+    #[serde(default)]
+    pub transport: McpTransport,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// OAuth for remote servers (e.g. Weave-MCP via Entra ID or Keycloak): pre-registered public client ID.
+    /// Claude Code runs the browser login itself (`/mcp`) and keeps the tokens.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub oauth_client_id: String,
+    /// Fixed callback port, so `http://localhost:<port>/callback` can be registered at the identity provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_callback_port: Option<u16>,
+    /// Space-separated scopes to request, e.g. `mcp.read` or `api://<id>/mcp.read`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub oauth_scopes: String,
+}
+
+impl McpServer {
+    pub fn new(id: String, name: String) -> Self {
+        Self { id, name, transport: McpTransport::Stdio, command: String::new(), args: vec![], env: BTreeMap::new(), url: String::new(), headers: BTreeMap::new(),
+               oauth_client_id: String::new(), oauth_callback_port: None, oauth_scopes: String::new() }
+    }
+
+    pub fn is_valid_name(name: &str) -> bool {
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    }
+
+    /// The `.mcp.json` entry, e.g. `{"type": "stdio", "command": "npx", "args": […], "env": {…}}` or `{"type": "http", "url": …, "headers": {…}}`.
+    pub fn definition(&self) -> serde_json::Value {
+        let mut entry = serde_json::Map::new();
+        let map = |m: &BTreeMap<String, String>| serde_json::to_value(m).unwrap_or_default();
+        match self.transport {
+            McpTransport::Stdio => {
+                entry.insert("type".into(), "stdio".into());
+                entry.insert("command".into(), self.command.clone().into());
+                if !self.args.is_empty() {
+                    entry.insert("args".into(), self.args.clone().into());
+                }
+                if !self.env.is_empty() {
+                    entry.insert("env".into(), map(&self.env));
+                }
+            }
+            transport => {
+                entry.insert("type".into(), if transport == McpTransport::Http { "http" } else { "sse" }.into());
+                entry.insert("url".into(), self.url.clone().into());
+                if !self.headers.is_empty() {
+                    entry.insert("headers".into(), map(&self.headers));
+                }
+                let mut oauth = serde_json::Map::new();
+                if !self.oauth_client_id.is_empty() {
+                    oauth.insert("clientId".into(), self.oauth_client_id.clone().into());
+                }
+                if let Some(port) = self.oauth_callback_port {
+                    oauth.insert("callbackPort".into(), port.into());
+                }
+                if !self.oauth_scopes.is_empty() {
+                    oauth.insert("scopes".into(), self.oauth_scopes.clone().into());
+                }
+                if !oauth.is_empty() {
+                    entry.insert("oauth".into(), serde_json::Value::Object(oauth));
+                }
+            }
+        }
+        serde_json::Value::Object(entry)
+    }
+
+    /// One argument per line; blank lines are skipped.
+    pub fn parse_args(text: &str) -> Vec<String> {
+        text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect()
+    }
+
+    /// `NAME=value` lines (environment) or `Name: value` lines (headers); returns the entries and the rejected lines.
+    pub fn parse_pairs(text: &str, separator: char) -> (BTreeMap<String, String>, Vec<String>) {
+        let mut values = BTreeMap::new();
+        let mut invalid = Vec::new();
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            match line.split_once(separator) {
+                Some((name, value)) if Self::is_valid_pair_name(name.trim(), separator) => {
+                    values.insert(name.trim().to_string(), value.trim().to_string());
+                }
+                _ => invalid.push(line.to_string()),
+            }
+        }
+        (values, invalid)
+    }
+
+    fn is_valid_pair_name(name: &str, separator: char) -> bool {
+        let mut chars = name.chars();
+        if separator == '=' {
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        } else {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        }
+    }
+
+    pub fn format_pairs(values: &BTreeMap<String, String>, separator: &str) -> String {
+        values.iter().map(|(k, v)| format!("{k}{separator}{v}")).collect::<Vec<_>>().join("\n")
+    }
+
+    fn normalized(mut self) -> Self {
+        if let Some(id) = parse_id(&self.id) {
+            self.id = id;
+        }
+        self
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceBinding {
@@ -234,11 +369,20 @@ pub struct WorkspaceBinding {
     /// Hidden pool mode: once the profile's budget is used up, the helper hands out other keys on the same endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pooled: Option<bool>,
+    /// MCP servers (IDs) this project uses; written to `<root>/.mcp.json`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_server_ids: Vec<String>,
+    /// Exactly the `mcpServers` entries the app wrote, so only those are reverted.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp_managed: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_git_exclude_entry: Option<String>,
 }
 
 impl WorkspaceBinding {
     pub fn new(path: String, profile_id: String) -> Self {
-        Self { id: new_id(), path, profile_id, managed_values: BTreeMap::new(), git_exclude_entry: None, pooled: None }
+        Self { id: new_id(), path, profile_id, managed_values: BTreeMap::new(), git_exclude_entry: None, pooled: None,
+               mcp_server_ids: vec![], mcp_managed: BTreeMap::new(), mcp_git_exclude_entry: None }
     }
 
     pub fn is_pooled(&self) -> bool {
@@ -246,7 +390,7 @@ impl WorkspaceBinding {
     }
 
     fn normalized(mut self) -> Self {
-        for id in [&mut self.id, &mut self.profile_id] {
+        for id in std::iter::once(&mut self.id).chain(std::iter::once(&mut self.profile_id)).chain(self.mcp_server_ids.iter_mut()) {
             if let Some(n) = parse_id(id) {
                 *id = n;
             }
@@ -269,11 +413,14 @@ pub struct AppState {
     /// True while KeyZapper is deactivated: assignments stay saved, their settings are removed from the files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
+    /// MCP servers that can be assigned to projects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServer>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
-        Self { schema_version: Self::CURRENT_SCHEMA_VERSION, profiles: vec![], bindings: vec![], global_binding: None, disabled: None }
+        Self { schema_version: Self::CURRENT_SCHEMA_VERSION, profiles: vec![], bindings: vec![], global_binding: None, disabled: None, mcp_servers: vec![] }
     }
 }
 
@@ -288,10 +435,15 @@ impl AppState {
         self.disabled == Some(true)
     }
 
+    pub fn mcp_server(&self, id: &str) -> Option<&McpServer> {
+        self.mcp_servers.iter().find(|s| s.id == id)
+    }
+
     pub fn normalized(mut self) -> Self {
         self.profiles = self.profiles.into_iter().map(Profile::normalized).collect();
         self.bindings = self.bindings.into_iter().map(WorkspaceBinding::normalized).collect();
         self.global_binding = self.global_binding.map(WorkspaceBinding::normalized);
+        self.mcp_servers = self.mcp_servers.into_iter().map(McpServer::normalized).collect();
         self
     }
 }

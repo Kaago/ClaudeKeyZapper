@@ -8,12 +8,12 @@ use keyzapper_core::gateway::KeyBudget;
 use keyzapper_core::keys::{masked_hint, KeyStore};
 use keyzapper_core::managed::{host_of, is_secure_endpoint, ManagedConfig};
 use keyzapper_core::metadata::MetadataStore;
-use keyzapper_core::models::{new_id, parse_id, AppState, AuthType, OidcTokenType, Profile, WorkspaceBinding};
+use keyzapper_core::models::{new_id, parse_id, AppState, AuthType, McpServer, McpTransport, OidcTokenType, Profile, WorkspaceBinding};
 use keyzapper_core::paths::{abbreviate_home, folder_name};
 use keyzapper_core::settings::{self, BindingHealth, BindingStatus, SettingsBinder};
 use keyzapper_core::update::ReleaseInfo;
 use keyzapper_core::tokens::TokenStore;
-use keyzapper_core::{agents, cli, helper, l, legacy_keychain, oidc, update, whats_new};
+use keyzapper_core::{agents, cli, helper, l, legacy_keychain, mcp, oidc, update, whats_new};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -30,6 +30,8 @@ pub struct Model {
     /// State of the default profile in `~/.claude/settings.json`, None if none is set.
     pub global_health: Option<BindingHealth>,
     pub statuses: HashMap<String, BindingStatus>,
+    /// Per binding: whether its `.mcp.json` entries are still as written.
+    pub mcp_active: HashMap<String, bool>,
     pub outdated_clis: Vec<String>,
     /// Unrestored OneDrive backup found on a fresh install; while set, the backup is not overwritten.
     pub available_backup: Option<AppState>,
@@ -75,6 +77,29 @@ pub struct ProfileInput {
     pub oidc_token_type: OidcTokenType,
 }
 
+/// Editor input for a new or changed MCP server.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerInput {
+    pub id: Option<String>,
+    pub name: String,
+    pub transport: McpTransport,
+    pub command: String,
+    /// One argument per line.
+    pub args_text: String,
+    /// `NAME=value` lines.
+    pub env_text: String,
+    pub url: String,
+    /// `Name: value` lines.
+    pub headers_text: String,
+    #[serde(default)]
+    pub oauth_client_id: String,
+    #[serde(default)]
+    pub oauth_callback_port: String,
+    #[serde(default)]
+    pub oauth_scopes: String,
+}
+
 fn non_empty(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -100,6 +125,7 @@ impl Model {
             global_findings: vec![],
             global_health: None,
             statuses: HashMap::new(),
+            mcp_active: HashMap::new(),
             outdated_clis: vec![],
             available_backup: None,
             backup_problem: None,
@@ -467,8 +493,16 @@ impl Model {
     pub fn unbind(&mut self, binding_id: &str) -> bool {
         let Some(binding) = self.binding(binding_id) else { return false };
         let Some(binder) = self.binder.clone() else { return false };
+        let mcp_kept = match mcp::revert(&binding.path, &binding.mcp_managed, binding.mcp_git_exclude_entry.as_deref()) {
+            Ok(kept) => kept,
+            Err(e) => {
+                self.error = Some(e.to_string());
+                return false;
+            }
+        };
         match binder.revert(&binding) {
-            Ok(kept) => {
+            Ok(mut kept) => {
+                kept.extend(mcp_kept.into_iter().map(|n| format!("mcpServers.{n}")));
                 self.state.bindings.retain(|b| b.id != binding.id);
                 self.statuses.remove(&binding.id);
                 self.persist();
@@ -529,11 +563,16 @@ impl Model {
         let pooled = pooled.unwrap_or_else(|| previous.is_some_and(|p| p.is_pooled()));
         match binder.apply(profile, folder, previous, pooled) {
             Ok(result) => {
+                let binding_id = result.binding.id.clone();
+                let has_mcp = !result.binding.mcp_server_ids.is_empty() || !result.binding.mcp_managed.is_empty();
                 match self.state.bindings.iter_mut().find(|b| b.id == result.binding.id) {
                     Some(existing) => *existing = result.binding,
                     None => self.state.bindings.push(result.binding),
                 }
                 self.persist();
+                if has_mcp {
+                    self.apply_mcp(&binding_id, true);
+                }
                 self.notice = Some(if result.changed {
                     l!("„%@“ verwendet jetzt Profil „%@“. Laufende Claude-Sitzungen in diesem Projekt bitte neu starten.", folder_name(folder), profile.name)
                 } else {
@@ -561,6 +600,155 @@ impl Model {
         true
     }
 
+    // MARK: MCP servers
+
+    fn mcp_server(&self, id: &str) -> Option<McpServer> {
+        self.state.mcp_server(id).cloned()
+    }
+
+    pub fn save_mcp_server(&mut self, input: McpServerInput) -> bool {
+        let name = input.name.trim().to_string();
+        let existing = input.id.as_deref().and_then(parse_id).and_then(|id| self.mcp_server(&id));
+        if !McpServer::is_valid_name(&name) {
+            self.error = Some(l!("Der Servername darf nur Buchstaben, Ziffern, „-“, „_“ und „.“ enthalten."));
+            return false;
+        }
+        if self.state.mcp_servers.iter().any(|s| s.name == name && existing.as_ref().is_none_or(|e| e.id != s.id)) {
+            self.error = Some(l!("Es gibt bereits einen MCP-Server namens „%@“.", name));
+            return false;
+        }
+        let (env, invalid_env) = McpServer::parse_pairs(&input.env_text, '=');
+        let (headers, invalid_headers) = McpServer::parse_pairs(&input.headers_text, ':');
+        if !invalid_env.is_empty() || !invalid_headers.is_empty() {
+            return false;
+        }
+        let mut server = existing.unwrap_or_else(|| McpServer::new(new_id(), name.clone()));
+        server.name = name;
+        server.transport = input.transport;
+        server.command = String::new();
+        server.args = vec![];
+        server.env = BTreeMap::new();
+        server.url = String::new();
+        server.headers = BTreeMap::new();
+        server.oauth_client_id = String::new();
+        server.oauth_callback_port = None;
+        server.oauth_scopes = String::new();
+        match input.transport {
+            McpTransport::Stdio => {
+                let command = input.command.trim().to_string();
+                if command.is_empty() {
+                    return false;
+                }
+                server.command = command;
+                server.args = McpServer::parse_args(&input.args_text);
+                server.env = env;
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                let Some(url) = valid_endpoint(&input.url) else {
+                    self.error = Some(l!("Bitte eine vollständige https-URL angeben (http nur für localhost)."));
+                    return false;
+                };
+                server.url = url;
+                server.headers = headers;
+                server.oauth_client_id = input.oauth_client_id.trim().to_string();
+                server.oauth_scopes = input.oauth_scopes.split_whitespace().collect::<Vec<_>>().join(" ");
+                let port = input.oauth_callback_port.trim();
+                if !port.is_empty() {
+                    match port.parse::<u16>() {
+                        Ok(port) if port > 0 => server.oauth_callback_port = Some(port),
+                        _ => {
+                            self.error = Some(l!("Der Callback-Port muss eine Zahl zwischen 1 und 65535 sein."));
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        let old = self.mcp_server(&server.id);
+        match self.state.mcp_servers.iter_mut().find(|s| s.id == server.id) {
+            Some(existing) => *existing = server.clone(),
+            None => self.state.mcp_servers.push(server.clone()),
+        }
+        if !self.persist() {
+            return false;
+        }
+        self.notice = Some(l!("MCP-Server „%@“ gespeichert.", server.name));
+        if old.is_some_and(|o| o != server) {
+            for binding in self.state.bindings.clone().iter().filter(|b| b.mcp_server_ids.contains(&server.id)) {
+                self.apply_mcp(&binding.id, false);
+            }
+        }
+        true
+    }
+
+    pub fn delete_mcp_server(&mut self, id: &str) {
+        let Some(server) = self.mcp_server(id) else { return };
+        for binding in self.state.bindings.clone().iter().filter(|b| b.mcp_server_ids.contains(&server.id)) {
+            let ids = binding.mcp_server_ids.iter().filter(|i| **i != server.id).cloned().collect();
+            if !self.set_project_mcp_servers(&binding.id, ids) {
+                return;
+            }
+        }
+        self.state.mcp_servers.retain(|s| s.id != server.id);
+        self.persist();
+        self.notice = Some(l!("MCP-Server „%@“ gelöscht.", server.name));
+    }
+
+    /// Chooses the servers a project uses and writes them; on failure the previous choice is kept.
+    pub fn set_project_mcp_servers(&mut self, binding_id: &str, ids: Vec<String>) -> bool {
+        let ids: Vec<String> = ids.into_iter().filter(|id| self.state.mcp_server(id).is_some()).collect();
+        let Some(binding) = self.state.bindings.iter_mut().find(|b| b.id == binding_id) else { return false };
+        let previous = std::mem::replace(&mut binding.mcp_server_ids, ids);
+        if self.apply_mcp(binding_id, false) {
+            return true;
+        }
+        if let Some(binding) = self.state.bindings.iter_mut().find(|b| b.id == binding_id) {
+            binding.mcp_server_ids = previous;
+        }
+        false
+    }
+
+    /// Writes the project's MCP servers into its `.mcp.json`; `quiet` keeps the current notice.
+    fn apply_mcp(&mut self, binding_id: &str, quiet: bool) -> bool {
+        let Some(binding) = self.binding(binding_id) else { return false };
+        let servers: Vec<McpServer> = binding.mcp_server_ids.iter().filter_map(|id| self.mcp_server(id)).collect();
+        match mcp::apply(&binding.path, &servers, &binding.mcp_managed, binding.mcp_git_exclude_entry.as_deref()) {
+            Ok(result) => {
+                let names: Vec<String> = result.managed.keys().cloned().collect();
+                if let Some(b) = self.state.bindings.iter_mut().find(|b| b.id == binding_id) {
+                    b.mcp_managed = result.managed;
+                    b.mcp_git_exclude_entry = result.git_exclude_entry;
+                }
+                self.persist();
+                if !quiet {
+                    let folder = folder_name(&binding.path);
+                    self.notice = Some(if names.is_empty() {
+                        l!("MCP-Server für „%@“ entfernt. Laufende Claude-Sitzungen dort bitte neu starten.", folder)
+                    } else if result.changed {
+                        l!("„%@“ nutzt jetzt die MCP-Server %@. Laufende Claude-Sitzungen dort bitte neu starten.", folder, names.join(", "))
+                    } else {
+                        l!("MCP-Server für „%@“ sind bereits eingerichtet – keine Änderungen.", folder)
+                    });
+                }
+                true
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+                false
+            }
+        }
+    }
+
+    /// Takes over MCP servers from a backup (new ones added, known ones updated).
+    fn merge_mcp_servers(&mut self, servers: &[McpServer]) {
+        for server in servers {
+            match self.state.mcp_servers.iter_mut().find(|s| s.id == server.id) {
+                Some(existing) => *existing = server.clone(),
+                None => self.state.mcp_servers.push(server.clone()),
+            }
+        }
+    }
+
     // MARK: OneDrive backup (profiles and bindings only, never keys)
 
     fn write_backup(&mut self) {
@@ -581,6 +769,7 @@ impl Model {
                 self.state.profiles.push(profile.clone());
             }
         }
+        self.merge_mcp_servers(&backup.mcp_servers);
         if !self.persist() {
             return;
         }
@@ -647,6 +836,7 @@ impl Model {
                 None => self.state.profiles.push(profile.clone()),
             }
         }
+        self.merge_mcp_servers(&payload.state.mcp_servers);
         if !self.persist() {
             return false;
         }
@@ -895,10 +1085,32 @@ impl Model {
                     name: folder_name(&b.path),
                     profile_id: b.profile_id.clone(),
                     pooled: b.is_pooled(),
+                    mcp_server_ids: b.mcp_server_ids.clone(),
+                    mcp_names: b.mcp_server_ids.iter().filter_map(|id| self.state.mcp_server(id)).map(|s| s.name.clone()).collect(),
+                    mcp_active: self.mcp_active.get(&b.id).copied().unwrap_or(true),
                     status: self.statuses.get(&b.id).map(|s| StatusView {
                         health: HealthView::from(&s.health),
                         conflicts: s.conflicts.iter().map(|c| ConflictView { blocking: c.blocking, message: c.message.clone() }).collect(),
                     }),
+                })
+                .collect(),
+            mcp_servers: self
+                .state
+                .mcp_servers
+                .iter()
+                .map(|s| McpServerView {
+                    id: s.id.clone(),
+                    name: s.name.clone(),
+                    transport: s.transport,
+                    command: s.command.clone(),
+                    args_text: s.args.join("\n"),
+                    env_text: McpServer::format_pairs(&s.env, "="),
+                    url: s.url.clone(),
+                    headers_text: McpServer::format_pairs(&s.headers, ": "),
+                    oauth_client_id: s.oauth_client_id.clone(),
+                    oauth_callback_port: s.oauth_callback_port.map(|p| p.to_string()).unwrap_or_default(),
+                    oauth_scopes: s.oauth_scopes.clone(),
+                    used_by: self.state.bindings.iter().filter(|b| b.mcp_server_ids.contains(&s.id)).map(|b| folder_name(&b.path)).collect(),
                 })
                 .collect(),
             global_profile_id: self.state.global_binding.as_ref().map(|g| g.profile_id.clone()),
@@ -945,10 +1157,14 @@ pub fn helper_path() -> Option<PathBuf> {
 }
 
 /// Project status, the default profile and the settings check; computed outside the lock.
-pub fn status_snapshot(state: &AppState, binder: &SettingsBinder) -> (HashMap<String, BindingStatus>, Option<BindingHealth>, Vec<Finding>) {
+pub fn status_snapshot(state: &AppState, binder: &SettingsBinder) -> (HashMap<String, BindingStatus>, HashMap<String, bool>, Option<BindingHealth>, Vec<Finding>) {
     let global_values = state.global_binding.as_ref().map(|g| g.managed_values.clone()).unwrap_or_default();
     let mut statuses = HashMap::new();
+    let mut mcp_active = HashMap::new();
     let mut global_health = None;
+    for binding in &state.bindings {
+        mcp_active.insert(binding.id.clone(), mcp::is_active(&binding.path, &binding.mcp_managed));
+    }
     if !state.is_disabled() {
         for binding in &state.bindings {
             if let Some(profile) = state.profile(&binding.profile_id) {
@@ -962,7 +1178,7 @@ pub fn status_snapshot(state: &AppState, binder: &SettingsBinder) -> (HashMap<St
         }
     }
     let findings = keyzapper_core::audit::check(&binder.user_settings_path, &global_values);
-    (statuses, global_health, findings)
+    (statuses, mcp_active, global_health, findings)
 }
 
 #[derive(Serialize)]
@@ -974,6 +1190,7 @@ pub struct View {
     disabled: bool,
     profiles: Vec<ProfileView>,
     bindings: Vec<BindingView>,
+    mcp_servers: Vec<McpServerView>,
     global_profile_id: Option<String>,
     global_health: Option<HealthView>,
     global_findings: Vec<Finding>,
@@ -1044,7 +1261,29 @@ struct BindingView {
     name: String,
     profile_id: String,
     pooled: bool,
+    mcp_server_ids: Vec<String>,
+    mcp_names: Vec<String>,
+    /// False if `.mcp.json` no longer contains what the app wrote.
+    mcp_active: bool,
     status: Option<StatusView>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpServerView {
+    id: String,
+    name: String,
+    transport: McpTransport,
+    command: String,
+    args_text: String,
+    env_text: String,
+    url: String,
+    headers_text: String,
+    oauth_client_id: String,
+    oauth_callback_port: String,
+    oauth_scopes: String,
+    /// Names of the projects using this server.
+    used_by: Vec<String>,
 }
 
 #[derive(Serialize)]

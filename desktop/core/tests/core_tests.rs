@@ -642,3 +642,88 @@ fn whats_new_lists_releases_since_the_previous_version() {
     assert!(versions(Some("1.4.0"), "1.4.1").is_empty());
     assert!(since(Some("1.3.0"), "1.4.0")[0].items.iter().all(|i| !i.is_empty()));
 }
+
+fn mcp_file(root: &str) -> String {
+    format!("{root}/.mcp.json")
+}
+
+#[test]
+fn mcp_servers_are_written_enabled_and_reverted_without_touching_foreign_entries() {
+    use keyzapper_core::mcp;
+    use keyzapper_core::models::{McpServer, McpTransport};
+    let repo = temp_dir("repo");
+    git_init(&repo);
+    write(&mcp_file(&repo), json!({"mcpServers": {"team": {"type": "http", "url": "https://team.example.test/mcp"}}}));
+    write(&local(&repo), json!({"enabledMcpjsonServers": ["team"]}));
+    let mut github = McpServer::new(ALPHA.into(), "github".into());
+    github.command = "npx".into();
+    github.args = vec!["-y".into(), "server-github".into()];
+    github.env = BTreeMap::from([("GITHUB_TOKEN".to_string(), "${GITHUB_TOKEN}".to_string())]);
+    let mut docs = McpServer::new(BETA.into(), "docs".into());
+    docs.transport = McpTransport::Http;
+    docs.url = "https://docs.example.test/mcp".into();
+    docs.headers = BTreeMap::from([("Authorization".to_string(), "Bearer ${DOCS_TOKEN}".to_string())]);
+    docs.oauth_client_id = "weave-claude".into();
+    docs.oauth_callback_port = Some(8976);
+    docs.oauth_scopes = "mcp.read".into();
+
+    let first = mcp::apply(&repo, &[github.clone(), docs.clone()], &BTreeMap::new(), None).unwrap();
+    assert!(first.changed);
+    assert_eq!(first.git_exclude_entry.as_deref(), Some(mcp::GIT_EXCLUDE_LINE));
+    let file = read(&mcp_file(&repo));
+    assert_eq!(file["mcpServers"]["github"], json!({"type": "stdio", "command": "npx", "args": ["-y", "server-github"], "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}}));
+    assert_eq!(file["mcpServers"]["docs"], json!({"type": "http", "url": "https://docs.example.test/mcp", "headers": {"Authorization": "Bearer ${DOCS_TOKEN}"},
+        "oauth": {"clientId": "weave-claude", "callbackPort": 8976, "scopes": "mcp.read"}}));
+    assert_eq!(file["mcpServers"]["team"]["url"], "https://team.example.test/mcp");
+    assert_eq!(read(&local(&repo))["enabledMcpjsonServers"], json!(["team", "docs", "github"]));
+    assert!(git(&repo, &["check-ignore", "-q", ".mcp.json"]).is_some());
+    assert!(!git(&repo, &["status", "--porcelain"]).unwrap().contains(".mcp.json"));
+    assert!(mcp::is_active(&repo, &first.managed));
+
+    let second = mcp::apply(&repo, &[github.clone(), docs.clone()], &first.managed, first.git_exclude_entry.as_deref()).unwrap();
+    assert!(!second.changed);
+    assert_eq!(second.managed, first.managed);
+
+    // Deselecting a server removes only its entry.
+    let third = mcp::apply(&repo, &[github.clone()], &second.managed, second.git_exclude_entry.as_deref()).unwrap();
+    assert!(third.changed);
+    let file = read(&mcp_file(&repo));
+    assert!(file["mcpServers"].get("docs").is_none() && file["mcpServers"].get("team").is_some());
+    assert_eq!(read(&local(&repo))["enabledMcpjsonServers"], json!(["team", "github"]));
+
+    // A foreign definition under the same name blocks; revert keeps it and reports it.
+    write(&mcp_file(&repo), json!({"mcpServers": {"github": {"type": "http", "url": "https://other.example.test"}}}));
+    assert!(matches!(mcp::apply(&repo, &[github.clone()], &BTreeMap::new(), None), Err(Error::SettingsConflicts(_))));
+    assert!(!mcp::is_active(&repo, &third.managed));
+    let kept = mcp::revert(&repo, &third.managed, third.git_exclude_entry.as_deref()).unwrap();
+    assert_eq!(kept, vec!["github".to_string()]);
+    assert_eq!(read(&mcp_file(&repo))["mcpServers"]["github"]["url"], "https://other.example.test");
+    assert_eq!(read(&local(&repo))["enabledMcpjsonServers"], json!(["team"]));
+    assert!(!std::fs::read_to_string(format!("{repo}/.git/info/exclude")).unwrap().contains(mcp::GIT_EXCLUDE_LINE));
+
+    // State round trip keeps servers and assignments.
+    let mut binding = WorkspaceBinding::new(repo.clone(), ALPHA.into());
+    binding.mcp_server_ids = vec![github.id.clone()];
+    binding.mcp_managed = third.managed.clone();
+    let state = AppState { profiles: vec![sample()], bindings: vec![binding], mcp_servers: vec![github, docs], ..AppState::default() };
+    assert_eq!(MetadataStore::decode(&serde_json::to_vec(&state).unwrap()).unwrap(), state);
+}
+
+#[test]
+fn mcp_files_created_for_servers_vanish_on_revert_and_tracked_mcp_json_blocks() {
+    use keyzapper_core::mcp;
+    use keyzapper_core::models::McpServer;
+    let repo = temp_dir("repo");
+    git_init(&repo);
+    let mut server = McpServer::new(ALPHA.into(), "fs".into());
+    server.command = "mcp-fs".into();
+    let first = mcp::apply(&repo, &[server.clone()], &BTreeMap::new(), None).unwrap();
+    assert!(Path::new(&mcp_file(&repo)).exists() && Path::new(&local(&repo)).exists());
+    assert!(mcp::revert(&repo, &first.managed, first.git_exclude_entry.as_deref()).unwrap().is_empty());
+    assert!(!Path::new(&mcp_file(&repo)).exists() && !Path::new(&local(&repo)).exists());
+    assert!(Path::new(&repo).is_dir());
+
+    write(&mcp_file(&repo), json!({"mcpServers": {}}));
+    assert!(git(&repo, &["add", ".mcp.json"]).is_some() && git(&repo, &["commit", "-qm", "mcp"]).is_some());
+    assert!(matches!(mcp::apply(&repo, &[server], &BTreeMap::new(), None), Err(Error::SettingsConflicts(_))));
+}

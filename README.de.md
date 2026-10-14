@@ -34,6 +34,7 @@ richtigen Projekt.
 * Profile mit Name, LiteLLM-Endpunkt (https; einfaches http nur für ein Gateway auf localhost), optionalem Modellalias und Key. Der Key liegt ausschließlich in der lokalen Key-Datei `keys.json` im App-Datenordner (keine Schlüsselbund- oder Anmeldeinformationsverwaltungs-Abfragen).
 * Projektordner einem Profil zuordnen. Die App ergänzt nur `.claude/settings.local.json` und schließt die Datei per `.git/info/exclude` von Git aus.
 * Status je Projekt: aktiv, abweichend, Ordner fehlt, Key fehlt, Konflikte mit anderen Einstellungen.
+* MCP-Server (stdio, HTTP oder SSE) einmal definieren und je Projekt auswählen. Die App schreibt sie in die `.mcp.json` des Repositorys (von Git ausgeschlossen) und schaltet sie in `.claude/settings.local.json` frei, damit Claude Code sie dort automatisch lädt. Remote-Server mit OAuth (z. B. Weave-MCP über Entra ID oder Keycloak) bekommen Client-ID, Callback-Port und Scopes; den Browser-Login übernimmt Claude Code.
 * Verbindungstest gegen LiteLLM (ungültiger oder gesperrter Key, Rate-Limit, Budget, Gateway nicht erreichbar).
 * Verbleibendes Budget je Key laut LiteLLM (`/key/info`): Rest vom Limit und nächster Reset, bei Keys ohne Limit die bisherigen Ausgaben.
 * Rücknahme entfernt nur die Einträge, die die App selbst gesetzt hat.

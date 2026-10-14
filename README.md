@@ -33,6 +33,7 @@ in, so the costs land on the right project without anyone switching keys by hand
 * Profiles with name, LiteLLM endpoint (https; plain http only for a gateway on localhost), optional model alias and key. The key is stored exclusively in the local key file `keys.json` in the app data folder (no Keychain or credential-manager prompts).
 * Assign project folders to a profile. The app only adds to `.claude/settings.local.json` and excludes the file from Git via `.git/info/exclude`.
 * Status per project: active, differing, folder missing, key missing, conflicts with other settings.
+* MCP servers (stdio, HTTP or SSE) defined once and selected per project. The app writes them into the repository's `.mcp.json` (excluded from Git) and approves them in `.claude/settings.local.json`, so Claude Code loads them there automatically. Remote servers with OAuth (e.g. Weave-MCP via Entra ID or Keycloak) take a client ID, callback port and scopes; Claude Code handles the browser sign-in.
 * Test connection against LiteLLM (invalid or blocked key, rate limit, budget, gateway unreachable).
 * Remaining budget per key, as reported by LiteLLM (`/key/info`): amount left of the limit and next reset, or the spend for keys without a limit.
 * Removing an assignment only removes the entries the app set itself.

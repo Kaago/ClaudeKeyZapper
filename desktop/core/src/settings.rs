@@ -123,7 +123,7 @@ fn parse(data: &[u8]) -> Result<Object> {
 }
 
 /// Serialises settings changes across KeyZapper processes.
-fn with_lock<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
+pub(crate) fn with_lock<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
     let lock_path = std::env::temp_dir().join("KeyZapper-settings.lock");
     let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lock_path);
     match file {
@@ -198,7 +198,7 @@ impl SettingsBinder {
                 Ok(())
             })
         })?;
-        let exclude = ensure_git_excluded(&root)?.or_else(|| previous.and_then(|p| p.git_exclude_entry.clone()));
+        let exclude = ensure_git_excluded(&root, LOCAL_SETTINGS_PATH, GIT_EXCLUDE_LINE)?.or_else(|| previous.and_then(|p| p.git_exclude_entry.clone()));
         let binding = WorkspaceBinding {
             id: previous.map(|p| p.id.clone()).unwrap_or_else(crate::models::new_id),
             path: root,
@@ -206,6 +206,9 @@ impl SettingsBinder {
             managed_values: desired,
             git_exclude_entry: exclude,
             pooled: pooled.then_some(true),
+            mcp_server_ids: previous.map(|p| p.mcp_server_ids.clone()).unwrap_or_default(),
+            mcp_managed: previous.map(|p| p.mcp_managed.clone()).unwrap_or_default(),
+            mcp_git_exclude_entry: previous.and_then(|p| p.mcp_git_exclude_entry.clone()),
         };
         Ok(ApplyResult { binding, changed, warnings: outer })
     }
@@ -473,7 +476,7 @@ fn local_conflicts(settings: &Object, desired: &BTreeMap<String, String>, previo
 
 /// Read-modify-write with optimistic concurrency: the file is replaced atomically (rename) only if it
 /// is still byte-identical to what was read. Returns false when nothing had to change (idempotent).
-fn mutate_settings(file: &Path, transform: impl FnMut(&mut Object) -> Result<()>) -> Result<bool> {
+pub(crate) fn mutate_settings(file: &Path, transform: impl FnMut(&mut Object) -> Result<()>) -> Result<bool> {
     let mut transform = transform;
     let path = file.to_string_lossy().into_owned();
     let read = || -> Result<Option<Vec<u8>>> {
@@ -502,7 +505,7 @@ fn mutate_settings(file: &Path, transform: impl FnMut(&mut Object) -> Result<()>
                 continue;
             }
             let _ = std::fs::remove_file(file);
-            if let Some(dir) = file.parent() {
+            if let Some(dir) = file.parent().filter(|d| d.file_name().is_some_and(|n| n == ".claude")) {
                 if std::fs::read_dir(dir).map(|mut d| d.next().is_none()).unwrap_or(false) {
                     let _ = std::fs::remove_dir(dir);
                 }
@@ -512,7 +515,7 @@ fn mutate_settings(file: &Path, transform: impl FnMut(&mut Object) -> Result<()>
         let dir = file.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(dir)?;
         let text = json::to_pretty_sorted(&serde_json::Value::Object(settings));
-        let tmp = dir.join(format!(".settings.local.json.keyzapper-{}", uuid::Uuid::new_v4()));
+        let tmp = dir.join(format!(".{}.keyzapper-{}", file.file_name().unwrap_or_default().to_string_lossy(), uuid::Uuid::new_v4()));
         std::fs::write(&tmp, text.as_bytes())?;
         #[cfg(unix)]
         if let Ok(meta) = std::fs::metadata(file) {
@@ -537,11 +540,11 @@ fn exclude_file(root: &str) -> Option<PathBuf> {
     git::run(&["rev-parse", "--path-format=absolute", "--git-common-dir"], root).map(|c| PathBuf::from(c).join("info").join("exclude"))
 }
 
-/// Ensures the local settings file is git-ignored via `<git-common-dir>/info/exclude` (shared by all
-/// worktrees). Returns the line added, or None if nothing was added.
-fn ensure_git_excluded(root: &str) -> Result<Option<String>> {
+/// Ensures `relative` (e.g. the local settings file) is git-ignored via `<git-common-dir>/info/exclude` (shared
+/// by all worktrees). Returns the line added, or None if nothing was added.
+pub(crate) fn ensure_git_excluded(root: &str, relative: &str, line: &str) -> Result<Option<String>> {
     let Some(exclude) = exclude_file(root) else { return Ok(None) };
-    if git::status(&["check-ignore", "-q", LOCAL_SETTINGS_PATH], root) == 0 {
+    if git::status(&["check-ignore", "-q", relative], root) == 0 {
         return Ok(None);
     }
     if let Some(dir) = exclude.parent() {
@@ -551,12 +554,12 @@ fn ensure_git_excluded(root: &str) -> Result<Option<String>> {
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(&format!("{GIT_EXCLUDE_COMMENT}\n{GIT_EXCLUDE_LINE}\n"));
+    text.push_str(&format!("{GIT_EXCLUDE_COMMENT}\n{line}\n"));
     paths::write_atomic(&exclude, text.as_bytes(), false)?;
-    Ok(Some(GIT_EXCLUDE_LINE.to_string()))
+    Ok(Some(line.to_string()))
 }
 
-fn remove_git_exclude(root: &str, line: &str) -> Result<()> {
+pub(crate) fn remove_git_exclude(root: &str, line: &str) -> Result<()> {
     let Some(exclude) = exclude_file(root) else { return Ok(()) };
     let Ok(text) = std::fs::read_to_string(&exclude) else { return Ok(()) };
     let mut lines: Vec<&str> = text.split('\n').collect();
