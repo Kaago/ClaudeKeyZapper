@@ -67,6 +67,7 @@ const ICONS = {
   fileLock: '<path d="M6 2h8l4 4v16H6z"/><path d="M14 2v4h4"/><rect x="9" y="13" width="6" height="5" rx="1"/><path d="M10 13v-2a2 2 0 0 1 4 0v2"/>',
   arrow: '<path d="M5 12h14M13 6l6 6-6 6"/>',
   sparkles: '<path d="M10 3l1.8 4.7 4.7 1.8-4.7 1.8L10 16l-1.8-4.7L3.5 9.5l4.7-1.8z"/><path d="M18 14l.9 2.1 2.1.9-2.1.9L18 20l-.9-2.1-2.1-.9 2.1-.9z"/>',
+  plug: '<path d="M9 3v5M15 3v5M6 8h12v3a6 6 0 0 1-12 0z"/><path d="M12 17v4"/>',
 };
 
 function icon(name, cls = '') {
@@ -161,6 +162,7 @@ function renderToolbar() {
     button(t('Status aktualisieren'), () => call('refresh_all'), { iconName: 'refresh', iconOnly: true }),
     button(t('Claude-Einstellungen prüfen'), () => { call('refresh_all'); claudeSettingsDialog(); },
       { iconName: 'shield', iconOnly: true, title: t('~/.claude/settings.json prüfen, reparieren und Standardprofil setzen') }),
+    button(t('MCP-Server'), mcpServersDialog, { iconName: 'plug', iconOnly: true, title: t('MCP-Server einrichten, die Projekte automatisch nutzen') }),
     backupButton,
     backupMenu,
     h('label', { class: 'switch', title: t('KeyZapper vorübergehend deaktivieren: Projekte nutzen dann die normale Claude-Anmeldung') },
@@ -392,10 +394,14 @@ function projectRow(binding, profile) {
       select,
       button(t('Für Agenten optimieren'), () => agentsDialog(binding, profile),
         { iconName: 'sparkles', iconOnly: true, title: t('AGENTS.md für dieses Repository per KI-Analyse erzeugen oder verbessern'), disabled: status?.health.state === 'folderMissing' }),
+      button(t('MCP-Server'), () => projectMcpDialog(binding),
+        { iconName: 'plug', iconOnly: true, title: t('MCP-Server für dieses Projekt auswählen'), disabled: status?.health.state === 'folderMissing' }),
       button(revealLabel(), () => call('reveal', { path: binding.path }), { iconName: 'folder', iconOnly: true }),
       button(t('Erneut anwenden'), () => call('reapply', { bindingId: binding.id }),
         { iconName: 'rotate', iconOnly: true, title: t('Einstellungen erneut schreiben'), disabled: status?.health.state === 'folderMissing' || view.disabled }),
       button(t('Entfernen'), confirmUnbind, { iconName: 'trash', iconOnly: true, title: t('Zuordnung entfernen'), cls: 'danger' })),
+    binding.mcpNames.length > 0 && h('div', { class: `note ${binding.mcpActive ? 'muted' : 'orange'}` }, icon(binding.mcpActive ? 'plug' : 'warning'),
+      binding.mcpActive ? t('MCP: %@', binding.mcpNames.join(', ')) : t('MCP: %@ – .mcp.json weicht ab, „Erneut anwenden“ wählen.', binding.mcpNames.join(', '))),
     binding.pooled && !view.disabled && h('div', { class: 'note red' }, icon('flame'),
       t('Budget-Killer: Nach dem Budget dieses Keys werden die Keys der anderen Profile am selben Gateway verbrannt.')),
     view.disabled ? h('div', { class: 'note muted' }, t('Deaktiviert – Claude nutzt hier die normale Anmeldung.'))
@@ -820,6 +826,127 @@ function agentsDialog(binding, profile) {
     .finally(() => dlg.render());
 }
 
+// MARK: MCP servers
+
+const MCP_TRANSPORTS = () => [['stdio', t('Lokaler Prozess (stdio)')], ['http', 'HTTP'], ['sse', t('SSE (veraltet)')]];
+/** One-line summary of how a server is started or reached. */
+const mcpSummary = (s) => (s.transport === 'stdio' ? [s.command, ...s.argsText.split('\n')].filter(Boolean).join(' ') : s.url);
+
+function mcpServersDialog() {
+  const remove = async (server) => {
+    const message = server.usedBy.length ? t('Der Server wird aus %@ Projekt(en) entfernt.', server.usedBy.length) : t('Der Server wird gelöscht.');
+    if (await confirmDialog(t('MCP-Server „%@“ löschen?', server.name), message, t('Löschen'))) call('delete_mcp_server', { serverId: server.id });
+  };
+  openDialog(t('MCP-Server'), (close) => ({
+    body: [
+      h('h2', null, t('MCP-Server')),
+      h('div', { class: 'section-note' },
+        t('MCP-Server geben Claude Code zusätzliche Werkzeuge, z. B. GitHub, Datenbanken oder einen Browser. Am Projekt (🔌) wählst du aus, welche Server dort gelten; KeyZapper schreibt sie in die .mcp.json des Repositorys und schaltet sie frei, damit Claude Code sie ohne Rückfrage lädt.')),
+      !view.mcpServers.length ? h('div', { class: 'muted' }, t('Noch keine MCP-Server eingerichtet.'))
+        : h('div', { class: 'project-list' }, view.mcpServers.map((s) => h('div', { class: 'project' },
+          h('div', { class: 'project-main' },
+            h('div', { class: 'project-name' },
+              h('strong', null, s.name, ' ', h('span', { class: 'badge' }, s.transport)),
+              h('span', { class: 'mono', title: mcpSummary(s) }, `‎${mcpSummary(s)}‎`)),
+            button(t('Bearbeiten'), () => mcpServerEditor(s), { iconName: 'pencil', iconOnly: true }),
+            button(t('Löschen'), () => remove(s), { iconName: 'trash', iconOnly: true, cls: 'danger' })),
+          s.usedBy.length > 0 && h('div', { class: 'note muted' }, t('Genutzt von: %@', s.usedBy.join(', ')))))),
+    ],
+    actions: [button(t('Neuer Server'), () => mcpServerEditor(null), { iconName: 'plus', cls: 'left' }), button(t('Fertig'), close, { cls: 'primary' })],
+  }), { live: true, wide: true });
+}
+
+/** Lines that are not `NAME=value` (environment) or `Name: value` (headers). */
+function invalidPairLines(text, separator) {
+  const name = separator === '=' ? /^[A-Za-z_][A-Za-z0-9_]*$/ : /^[A-Za-z0-9-]+$/;
+  return text.split(/\r?\n/).map((l) => l.trim()).filter((line) => {
+    if (!line || line.startsWith('#')) return false;
+    const i = line.indexOf(separator);
+    return i < 0 || !name.test(line.slice(0, i).trim());
+  });
+}
+
+function mcpServerEditor(existing) {
+  const s = { name: existing?.name ?? '', transport: existing?.transport ?? 'stdio', command: existing?.command ?? '', argsText: existing?.argsText ?? '',
+    envText: existing?.envText ?? '', url: existing?.url ?? '', headersText: existing?.headersText ?? '', oauthClientId: existing?.oauthClientId ?? '',
+    oauthCallbackPort: existing?.oauthCallbackPort ?? '', oauthScopes: existing?.oauthScopes ?? '', saving: false };
+  const dlg = openDialog(existing ? t('Bearbeiten') : t('Neuer Server'), (close) => {
+    const update = (key) => (value) => { s[key] = value; dlg.render(); };
+    const nameOk = /^[A-Za-z0-9_.-]+$/.test(s.name.trim());
+    const duplicate = view.mcpServers.some((o) => o.name === s.name.trim() && o.id !== existing?.id);
+    const stdio = s.transport === 'stdio';
+    const invalid = stdio ? invalidPairLines(s.envText, '=') : invalidPairLines(s.headersText, ':');
+    const portOk = !s.oauthCallbackPort.trim() || /^[1-9][0-9]{0,4}$/.test(s.oauthCallbackPort.trim()) && Number(s.oauthCallbackPort) <= 65535;
+    const valid = nameOk && !duplicate && (stdio ? s.command.trim() : endpointHost(s.url) && portOk) && !invalid.length;
+    const save = async () => {
+      s.saving = true; dlg.render();
+      const result = await call('save_mcp_server', { input: { id: existing?.id ?? null, ...s } });
+      s.saving = false;
+      if (result?.[0]) close(); else dlg.render();
+    };
+    return {
+      body: [
+        h('h2', null, existing ? existing.name : t('Neuer Server')),
+        h('fieldset', null,
+          field(t('Name'), input({ value: s.name, placeholder: 'github' }, update('name')), 'm-name'),
+          s.name.trim() && !nameOk && h('div', { class: 'field-note error-text' }, t('Nur Buchstaben, Ziffern, „-“, „_“ und „.“')),
+          duplicate && h('div', { class: 'field-note error-text' }, t('Es gibt bereits einen MCP-Server namens „%@“.', s.name.trim())),
+          field(t('Art'), h('select', { onchange: (e) => { s.transport = e.target.value; dlg.render(); } },
+            MCP_TRANSPORTS().map(([value, label]) => h('option', { value, selected: value === s.transport }, label))), 'm-transport')),
+        stdio ? h('fieldset', null,
+          field(t('Befehl'), input({ value: s.command, placeholder: 'npx' }, update('command')), 'm-command'),
+          h('div', { class: 'field' }, h('label', { for: 'm-args' }, t('Argumente')),
+            h('textarea', { id: 'm-args', value: s.argsText, spellcheck: 'false', placeholder: '-y\n@modelcontextprotocol/server-github', oninput: (e) => { s.argsText = e.target.value; dlg.render(); } })),
+          h('div', { class: 'field-note section-note' }, t('Eins pro Zeile.')),
+          h('div', { class: 'field' }, h('label', { for: 'm-env' }, t('Umgebungsvariablen')),
+            h('textarea', { id: 'm-env', value: s.envText, spellcheck: 'false', placeholder: 'GITHUB_TOKEN=${GITHUB_TOKEN}', oninput: (e) => { s.envText = e.target.value; dlg.render(); } })),
+          invalid.map((line) => h('div', { class: 'field-note error-text' }, t('Ungültig oder nicht erlaubt: %@', line))),
+          h('div', { class: 'field-note section-note' }, t('Eine pro Zeile im Format NAME=Wert.')))
+        : h('fieldset', null,
+          field('URL', input({ value: s.url, placeholder: 'https://mcp.example.com/mcp' }, update('url')), 'm-url'),
+          s.url.trim() && !endpointHost(s.url) && h('div', { class: 'field-note error-text' }, t('Bitte eine vollständige https-URL angeben (http nur für localhost).')),
+          h('div', { class: 'field' }, h('label', { for: 'm-headers' }, t('Header')),
+            h('textarea', { id: 'm-headers', value: s.headersText, spellcheck: 'false', placeholder: 'Authorization: Bearer ${API_TOKEN}', oninput: (e) => { s.headersText = e.target.value; dlg.render(); } })),
+          invalid.map((line) => h('div', { class: 'field-note error-text' }, t('Ungültig oder nicht erlaubt: %@', line))),
+          h('div', { class: 'field-note section-note' }, t('Eine pro Zeile im Format Name: Wert.'))),
+        !stdio && h('fieldset', null, h('legend', null, t('Anmeldung per OAuth / SSO')),
+          field(t('Client-ID'), input({ value: s.oauthClientId, placeholder: t('öffentlicher OAuth-Client, kein Secret') }, update('oauthClientId')), 'm-client'),
+          field(t('Callback-Port'), input({ value: s.oauthCallbackPort, placeholder: '8976', inputmode: 'numeric' }, update('oauthCallbackPort')), 'm-port'),
+          s.oauthCallbackPort.trim() && !portOk && h('div', { class: 'field-note error-text' }, t('Der Callback-Port muss eine Zahl zwischen 1 und 65535 sein.')),
+          s.oauthCallbackPort.trim() && portOk && h('div', { class: 'field-note section-note mono' }, `http://localhost:${s.oauthCallbackPort.trim()}/callback`),
+          field(t('Scopes'), input({ value: s.oauthScopes, placeholder: 'mcp.read' }, update('oauthScopes')), 'm-scopes'),
+          h('div', { class: 'section-note' }, t('Für Server, die OAuth nach MCP-Spezifikation anbieten (z. B. Weave-MCP über Entra ID oder Keycloak). Claude Code findet den Identity Provider über den Server, öffnet beim ersten Aufruf von „/mcp“ den Browser-Login (PKCE) und bewahrt die Tokens selbst auf. Beim Provider muss die Redirect-URI http://localhost:<Port>/callback für den Client erlaubt sein; für Entra die Scopes als api://<API-Client-ID>/mcp.read angeben.'))),
+        h('div', { class: 'section-note' }, t('Secrets als ${NAME} eintragen – Claude Code setzt sie beim Start aus der Umgebung ein. Die .mcp.json wird nicht eingecheckt, liegt aber im Projektordner.')),
+      ],
+      actions: [button(t('Abbrechen'), close), button(existing ? t('Sichern') : t('Anlegen'), save, { cls: 'primary', disabled: !valid || s.saving })],
+    };
+  }, { wide: true });
+  restoreCaret(dlg);
+  document.getElementById('m-name')?.focus();
+}
+
+/** Chooses which of the configured servers a project uses. */
+function projectMcpDialog(binding) {
+  const selected = new Set(binding.mcpServerIds);
+  const dlg = openDialog(t('MCP-Server für „%@“', binding.name), (close) => {
+    const current = view.bindings.find((b) => b.id === binding.id)?.mcpServerIds ?? [];
+    const unchanged = current.length === selected.size && current.every((id) => selected.has(id));
+    return {
+      body: [
+        h('h2', null, t('MCP-Server für „%@“', binding.name)),
+        !view.mcpServers.length ? h('div', { class: 'muted' }, t('Noch keine MCP-Server eingerichtet.'))
+          : h('fieldset', null, h('legend', null, t('Server auswählen')), view.mcpServers.map((s) => h('label', { class: 'check' },
+            h('input', { type: 'checkbox', checked: selected.has(s.id), onchange: (e) => { if (e.target.checked) selected.add(s.id); else selected.delete(s.id); dlg.render(); } }),
+            h('span', null, h('strong', null, s.name), ' ', h('span', { class: 'mono muted small' }, mcpSummary(s)))))),
+        h('div', { class: 'section-note' },
+          t('KeyZapper schreibt die gewählten Server in die .mcp.json des Repositorys (nicht eingecheckt) und schaltet sie in .claude/settings.local.json frei. Claude Code lädt sie in diesem Repository dann automatisch.')),
+      ],
+      actions: [button(t('MCP-Server verwalten …'), mcpServersDialog, { cls: 'left' }), button(t('Abbrechen'), close),
+        button(t('Übernehmen'), () => { close(); call('set_project_mcp_servers', { bindingId: binding.id, serverIds: [...selected] }); }, { cls: 'primary', disabled: unchanged })],
+    };
+  }, { live: true });
+}
+
 /** Once after an update: the highlights of the releases since the version last seen. */
 function whatsNewDialog() {
   whatsNewShown = true;
@@ -861,7 +988,8 @@ function howItWorksDialog() {
         hint('rotate', t('Nach dem Zuordnen oder einem Profilwechsel die Claude-Sitzung im Projekt einmal neu starten.')),
         hint('key', t('Neuer Key? Einmal „Ändern“ – alle zugeordneten Projekte nutzen ihn automatisch. Neue Sitzungen sofort, laufende nach spätestens 5 Minuten.')),
         hint('folder', t('Die Zuordnung gilt für das ganze Repository samt Unterordnern und Worktrees. Außerhalb zugeordneter Ordner nutzt Claude die normale Anmeldung.')),
-        hint('shield', t('Fehlt ein Key, schlagen Anfragen fehl. Es wird nie ein anderer Key verwendet.'))),
+        hint('shield', t('Fehlt ein Key, schlagen Anfragen fehl. Es wird nie ein anderer Key verwendet.')),
+        hint('plug', t('MCP-Server einmal einrichten (🔌 in der Leiste) und je Projekt auswählen – Claude Code lädt sie dort automatisch.'))),
     ],
     actions: [button(t('Verstanden'), close, { cls: 'primary' })],
   }), { wide: true });

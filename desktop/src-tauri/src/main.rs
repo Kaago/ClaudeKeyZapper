@@ -6,7 +6,7 @@ mod model;
 use keyzapper_core::errors::Error;
 use keyzapper_core::gateway::CheckResult;
 use keyzapper_core::{agents, backup, clipboard, gateway, l, legacy_keychain, oidc, update};
-use model::{Model, ProfileInput, View};
+use model::{McpServerInput, Model, ProfileInput, View};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -48,10 +48,11 @@ fn refresh(app: &AppHandle) {
     };
     let app = app.clone();
     std::thread::spawn(move || {
-        let (statuses, global_health, findings) = model::status_snapshot(&state, &binder);
+        let (statuses, mcp_active, global_health, findings) = model::status_snapshot(&state, &binder);
         with_model(&app, |m| {
             if m.refresh_generation == generation {
                 m.statuses = statuses;
+                m.mcp_active = mcp_active;
                 m.global_health = global_health;
                 m.global_findings = findings;
             }
@@ -434,6 +435,31 @@ async fn write_agents_file(app: AppHandle, binding_id: String, content: String) 
     .await
 }
 
+// MARK: MCP servers
+
+#[tauri::command]
+async fn save_mcp_server(app: AppHandle, input: McpServerInput) -> (bool, View) {
+    blocking(move || {
+        let ok = with_model(&app, |m| m.save_mcp_server(input));
+        refresh(&app);
+        (ok, view(&app))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn delete_mcp_server(app: AppHandle, server_id: String) -> View {
+    act(app, move |m| m.delete_mcp_server(&server_id)).await
+}
+
+#[tauri::command]
+async fn set_project_mcp_servers(app: AppHandle, binding_id: String, server_ids: Vec<String>) -> View {
+    act(app, move |m| {
+        m.set_project_mcp_servers(&binding_id, server_ids);
+    })
+    .await
+}
+
 #[tauri::command]
 async fn set_global_profile(app: AppHandle, profile_id: Option<String>) -> View {
     act(app, move |m| m.set_global_profile(profile_id)).await
@@ -646,6 +672,9 @@ fn main() {
             scan_repository,
             generate_agents_file,
             write_agents_file,
+            save_mcp_server,
+            delete_mcp_server,
+            set_project_mcp_servers,
             set_global_profile,
             repair_user_settings,
             set_disabled,

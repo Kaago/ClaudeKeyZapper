@@ -17,6 +17,7 @@ pub mod json;
 pub mod keys;
 pub mod legacy_keychain;
 pub mod managed;
+pub mod mcp;
 pub mod metadata;
 pub mod models;
 pub mod oidc;

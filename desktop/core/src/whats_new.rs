@@ -19,6 +19,7 @@ fn notes() -> Vec<(&'static str, Vec<String>)> {
         (
             "1.4.0",
             vec![
+                l!("MCP-Server einrichten und je Projekt auswählen: KeyZapper schreibt sie in die .mcp.json des Repositorys und schaltet sie frei, Claude Code lädt sie dort automatisch."),
                 l!("Updates installieren sich nach Bestätigung mit Administratorrechten selbst, danach startet KeyZapper automatisch neu."),
                 l!("Nach einem Update zeigt KeyZapper einmal, was neu ist."),
             ],

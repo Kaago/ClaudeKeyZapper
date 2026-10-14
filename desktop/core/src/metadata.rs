@@ -92,5 +92,15 @@ pub fn restoring_dropped_fields(state: AppState, mirror: &AppState) -> AppState 
     if result.disabled.is_none() {
         result.disabled = mirror.disabled;
     }
+    if result.mcp_servers.is_empty() {
+        result.mcp_servers = mirror.mcp_servers.clone();
+        for binding in result.bindings.iter_mut().filter(|b| b.mcp_server_ids.is_empty()) {
+            if let Some(saved) = mirror.bindings.iter().find(|s| s.path == binding.path) {
+                binding.mcp_server_ids = saved.mcp_server_ids.clone();
+                binding.mcp_managed = saved.mcp_managed.clone();
+                binding.mcp_git_exclude_entry = saved.mcp_git_exclude_entry.clone();
+            }
+        }
+    }
     result
 }
