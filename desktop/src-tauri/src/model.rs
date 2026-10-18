@@ -51,6 +51,8 @@ pub struct Model {
     pub sso_logging_in: HashSet<String>,
     pub binder: Option<SettingsBinder>,
     pub refresh_generation: u64,
+    /// True if the window got the system's translucent material (macOS vibrancy, Windows 11 Mica).
+    pub vibrancy: bool,
     backup_dir: Option<PathBuf>,
     metadata: MetadataStore,
     /// Set when metadata could not be read (e.g. newer schema); saving is blocked to avoid data loss.
@@ -140,6 +142,7 @@ impl Model {
             sso_logging_in: HashSet::new(),
             binder: None,
             refresh_generation: 0,
+            vibrancy: false,
             backup_dir,
             metadata,
             metadata_unreadable: false,
@@ -455,6 +458,59 @@ impl Model {
         let Some(binding) = self.binding(binding_id) else { return };
         let Some(profile) = self.profile(&binding.profile_id) else { return };
         self.apply(&profile, &binding.path, Some(&binding), None);
+    }
+
+    /// "Alle reparieren": writes the settings of several projects again, with one notice for all.
+    pub fn reapply_many(&mut self, binding_ids: &[String]) {
+        let mut repaired = 0;
+        for id in binding_ids {
+            let Some(binding) = self.binding(id) else { continue };
+            let Some(profile) = self.profile(&binding.profile_id) else { continue };
+            if self.apply(&profile, &binding.path, Some(&binding), None) {
+                repaired += 1;
+            }
+        }
+        if repaired > 0 {
+            self.notice = Some(l!("%@ Projekt(e) erneut angewendet. Laufende Claude-Sitzungen dort bitte neu starten.", repaired));
+        }
+    }
+
+    /// What the tray menu shows; compared as a whole to skip rebuilding an unchanged menu.
+    pub fn tray_info(&self) -> TrayInfo {
+        let keys = self.keys.all().unwrap_or_default();
+        let tokens = self.tokens.all().unwrap_or_default();
+        let usable = |p: &Profile| {
+            if p.is_sso() {
+                !self.sso_expired.contains(&p.id) && tokens.get(&p.id).is_some_and(|t| !t.refresh_token.is_empty())
+            } else {
+                keys.get(&p.id).is_some_and(|k| !k.is_empty())
+            }
+        };
+        TrayInfo {
+            disabled: self.is_disabled(),
+            profiles: self
+                .state
+                .profiles
+                .iter()
+                .map(|p| TrayProfile {
+                    id: p.id.clone(),
+                    name: p.name.clone(),
+                    usable: usable(p),
+                    budget: self.budgets.get(&p.id).map(|b| (b.spend, b.max_budget)),
+                })
+                .collect(),
+            projects: self
+                .state
+                .bindings
+                .iter()
+                .map(|b| TrayProject {
+                    id: b.id.clone(),
+                    name: folder_name(&b.path),
+                    profile_id: b.profile_id.clone(),
+                    healthy: self.statuses.get(&b.id).is_some_and(|s| s.health == BindingHealth::Active && !s.conflicts.iter().any(|c| c.blocking)),
+                })
+                .collect(),
+        }
     }
 
     /// Projects whose Budget-Killer may burn this profile's key: pooled bindings of other profiles on the same endpoint.
@@ -1140,6 +1196,7 @@ impl Model {
             default_model_alias: self.config.default_model_alias.clone(),
             project_url: format!("https://github.com/{}", keyzapper_core::update::REPOSITORY),
             minimum_password_length: keyzapper_core::backup::MINIMUM_PASSWORD_LENGTH,
+            vibrancy: self.vibrancy,
         }
     }
 }
@@ -1214,6 +1271,32 @@ pub struct View {
     default_model_alias: Option<String>,
     project_url: String,
     minimum_password_length: usize,
+    vibrancy: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct TrayInfo {
+    pub disabled: bool,
+    pub profiles: Vec<TrayProfile>,
+    pub projects: Vec<TrayProject>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct TrayProfile {
+    pub id: String,
+    pub name: String,
+    /// Key stored or signed in.
+    pub usable: bool,
+    /// Spend and limit, if the gateway reported them.
+    pub budget: Option<(f64, Option<f64>)>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct TrayProject {
+    pub id: String,
+    pub name: String,
+    pub profile_id: String,
+    pub healthy: bool,
 }
 
 #[derive(Serialize)]

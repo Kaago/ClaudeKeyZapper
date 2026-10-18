@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod model;
+mod tray;
 
 use keyzapper_core::errors::Error;
 use keyzapper_core::gateway::CheckResult;
@@ -23,12 +24,35 @@ fn with_model<T>(app: &AppHandle, f: impl FnOnce(&mut Model) -> T) -> T {
 }
 
 fn view(app: &AppHandle) -> View {
-    with_model(app, |m| m.view())
+    let view = with_model(app, |m| m.view());
+    tray::update(app);
+    view
 }
 
 /// Tells the window to fetch a new view.
 fn changed(app: &AppHandle) {
     let _ = app.emit("changed", ());
+    tray::update(app);
+}
+
+/// Brings the main window back, e.g. from the tray or the Dock.
+fn show_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// Puts the system's translucent material behind the window: vibrancy on macOS, Mica on Windows 11.
+/// False where it is not available (Windows 10, Linux); the page then paints its own background.
+fn apply_window_material(window: &tauri::WebviewWindow) -> bool {
+    use window_vibrancy::{NSVisualEffectMaterial, NSVisualEffectState};
+    if cfg!(windows) {
+        window_vibrancy::apply_mica(window, None).is_ok()
+    } else {
+        window_vibrancy::apply_vibrancy(window, NSVisualEffectMaterial::Sidebar, Some(NSVisualEffectState::FollowsWindowActiveState), None).is_ok()
+    }
 }
 
 /// Runs blocking work (files, git, network, dialogs) off the main thread.
@@ -105,10 +129,19 @@ fn check_updates(app: &AppHandle, user_initiated: bool, beta: bool) {
     changed(app);
 }
 
+/// How often budgets and project status are reloaded while KeyZapper runs (e.g. only in the tray).
+const BACKGROUND_REFRESH: Duration = Duration::from_secs(10 * 60);
+
 /// Start-up work that may take a while: status, budgets, updates, CLI versions, keys left in the keychain.
 fn start_background(app: &AppHandle) {
     refresh(app);
     refresh_budgets(app, None);
+    let handle = app.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(BACKGROUND_REFRESH);
+        refresh(&handle);
+        refresh_budgets(&handle, None);
+    });
     let handle = app.clone();
     std::thread::spawn(move || check_updates(&handle, false, false));
     let handle = app.clone();
@@ -349,14 +382,29 @@ struct PickedFolder {
     existing_profile_id: Option<String>,
 }
 
+fn picked_folder(app: &AppHandle, folder: &str) -> PickedFolder {
+    let root = keyzapper_core::settings::settings_root(folder);
+    let existing_profile_id = with_model(app, |m| m.state.bindings.iter().find(|b| b.path == root).map(|b| b.profile_id.clone()));
+    PickedFolder { folder: keyzapper_core::paths::canonical_path(folder), root, existing_profile_id }
+}
+
 #[tauri::command]
 async fn pick_project_folder(app: AppHandle) -> Option<PickedFolder> {
     blocking(move || {
         let folder = app.dialog().file().set_title(l!("Projektordner")).blocking_pick_folder()?.into_path().ok()?;
-        let folder = folder.to_string_lossy().into_owned();
-        let root = keyzapper_core::settings::settings_root(&folder);
-        let existing_profile_id = with_model(&app, |m| m.state.bindings.iter().find(|b| b.path == root).map(|b| b.profile_id.clone()));
-        Some(PickedFolder { folder: keyzapper_core::paths::canonical_path(&folder), root, existing_profile_id })
+        Some(picked_folder(&app, &folder.to_string_lossy()))
+    })
+    .await
+}
+
+/// A folder dragged onto the window.
+#[tauri::command]
+async fn inspect_folder(app: AppHandle, path: String) -> Result<PickedFolder, String> {
+    blocking(move || {
+        if !std::path::Path::new(&path).is_dir() {
+            return Err(l!("Bitte einen Ordner hineinziehen, keine Datei."));
+        }
+        Ok(picked_folder(&app, &path))
     })
     .await
 }
@@ -369,6 +417,11 @@ async fn bind(app: AppHandle, folder: String, profile_id: String) -> View {
 #[tauri::command]
 async fn reapply(app: AppHandle, binding_id: String) -> View {
     act(app, move |m| m.reapply(&binding_id)).await
+}
+
+#[tauri::command]
+async fn reapply_many(app: AppHandle, binding_ids: Vec<String>) -> View {
+    act(app, move |m| m.reapply_many(&binding_ids)).await
 }
 
 #[tauri::command]
@@ -640,14 +693,32 @@ fn open_url(app: AppHandle, url: String) {
 }
 
 fn main() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Starting KeyZapper again while it runs in the tray shows the existing window (macOS does this by itself).
+    #[cfg(windows)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)));
+    let app = builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let version = (!cfg!(debug_assertions)).then(|| app.package_info().version.to_string());
-            app.manage(Shared(Mutex::new(Model::load(version))));
+            let mut model = Model::load(version);
+            model.vibrancy = app.get_webview_window("main").is_some_and(|w| apply_window_material(&w));
+            app.manage(Shared(Mutex::new(model)));
+            if let Err(e) = tray::create(app.handle()) {
+                eprintln!("KeyZapper: tray icon unavailable: {e}");
+            }
             start_background(app.handle());
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Closing only hides the window while the tray icon can bring it back.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if tray::exists(window.app_handle()) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             translations,
@@ -665,8 +736,10 @@ fn main() {
             available_models,
             suggest_models,
             pick_project_folder,
+            inspect_folder,
             bind,
             reapply,
+            reapply_many,
             toggle_pool,
             unbind,
             scan_repository,
@@ -690,6 +763,13 @@ fn main() {
             reveal,
             open_url,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running KeyZapper");
+    app.run(|_app, _event| {
+        // Clicking the Dock icon shows the hidden window again.
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = _event {
+            show_window(_app);
+        }
+    });
 }

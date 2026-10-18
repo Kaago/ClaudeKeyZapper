@@ -33,12 +33,14 @@ richtigen Projekt.
 
 * Profile mit Name, LiteLLM-Endpunkt (https; einfaches http nur für ein Gateway auf localhost), optionalem Modellalias und Key. Der Key liegt ausschließlich in der lokalen Key-Datei `keys.json` im App-Datenordner (keine Schlüsselbund- oder Anmeldeinformationsverwaltungs-Abfragen).
 * Projektordner einem Profil zuordnen. Die App ergänzt nur `.claude/settings.local.json` und schließt die Datei per `.git/info/exclude` von Git aus.
-* Status je Projekt: aktiv, abweichend, Ordner fehlt, Key fehlt, Konflikte mit anderen Einstellungen.
-* MCP-Server (stdio, HTTP oder SSE) einmal definieren und je Projekt auswählen. Die App schreibt sie in die `.mcp.json` des Repositorys (von Git ausgeschlossen) und schaltet sie in `.claude/settings.local.json` frei, damit Claude Code sie dort automatisch lädt. Remote-Server mit OAuth (z. B. Weave-MCP über Entra ID oder Keycloak) bekommen Client-ID, Callback-Port und Scopes; den Browser-Login übernimmt Claude Code.
+* Status je Projekt: aktiv, abweichend, Ordner fehlt, Key fehlt, Konflikte mit anderen Einstellungen. Eine Zusammenfassung zeigt, was Aufmerksamkeit braucht; *Alle reparieren* schreibt die Einstellungen aller betroffenen Projekte neu.
+* Projektordner aus Finder oder Explorer auf ein Profil ziehen, um sie zuzuordnen.
+* MCP-Server (stdio, HTTP oder SSE) einmal definieren – oder aus Vorlagen wie GitHub, Notion oder Sentry – und je Projekt einschalten. Die App schreibt sie in die `.mcp.json` des Repositorys (von Git ausgeschlossen) und schaltet sie in `.claude/settings.local.json` frei, damit Claude Code sie dort automatisch lädt. Remote-Server mit OAuth (z. B. Weave-MCP über Entra ID oder Keycloak) bekommen Client-ID, Callback-Port und Scopes; den Browser-Login übernimmt Claude Code.
 * Verbindungstest gegen LiteLLM (ungültiger oder gesperrter Key, Rate-Limit, Budget, Gateway nicht erreichbar).
-* Verbleibendes Budget je Key laut LiteLLM (`/key/info`): Rest vom Limit und nächster Reset, bei Keys ohne Limit die bisherigen Ausgaben.
+* Verbleibendes Budget je Key laut LiteLLM (`/key/info`): ein Balken, der ab 70 % Verbrauch orange und ab 90 % rot wird, Rest vom Limit und nächster Reset, bei Keys ohne Limit die bisherigen Ausgaben.
+* Symbol in der Menüleiste (macOS) bzw. im Infobereich (Windows): Budgets im Blick und das Profil eines Projekts wechseln, ohne das Fenster zu öffnen. Nach dem Schließen des Fensters läuft KeyZapper dort weiter.
 * Rücknahme entfernt nur die Einträge, die die App selbst gesetzt hat.
-* Übersicht mit allen Profilen, maskierten Keys und zugeordneten Projekten. Alles lässt sich direkt ändern; Keys lassen sich kopieren und ersetzen.
+* Seitenleiste mit Profilen, Projekten, MCP-Servern, Claude-Einstellungen und Backup. Alles lässt sich direkt ändern – über das ⋯-Menü oder per Rechtsklick; Keys lassen sich kopieren und ersetzen.
 * Update-Prüfung gegen die GitHub-Releases mit Installation per Klick; die Version steht in der App und unter „Über KeyZapper“.
 * Oberfläche auf Deutsch und Englisch (folgt der Systemsprache).
 * Verschlüsseltes Backup und Wiederherstellen von Profilen, Zuordnungen und Keys (`.kzbackup`, passwortgeschützt).
@@ -200,7 +202,7 @@ trägt man neu ein. Solange ein gefundenes Backup nicht wiederhergestellt oder v
 
 ## Prüfung der Claude-Einstellungen und Standardprofil
 
-*Claude-Einstellungen prüfen* (Schild-Symbol in der Symbolleiste) prüft `~/.claude/settings.json` auf Probleme, die Claude
+Die Seite *Claude-Einstellungen* in der Seitenleiste prüft `~/.claude/settings.json` auf Probleme, die Claude
 Code stillschweigend hinnimmt: ungültiges JSON (geprüft mit demselben strengen `JSON.parse` wie Claude Code, z. B. Kommas
 nach dem letzten Eintrag), Klartext-Keys, einen Endpunkt ohne Key, Nicht-Text-Werte in `env`, Provider-Schalter an
 LiteLLM vorbei, Modell-Variablen und feste Modell-IDs statt Alias. Probleme zeigt jederzeit ein Banner an.
@@ -212,13 +214,13 @@ LiteLLM vorbei, Modell-Variablen und feste Modell-IDs statt Alias. Probleme zeig
 
 ## KeyZapper deaktivieren
 
-Der Schalter in der Symbolleiste deaktiviert KeyZapper: Die App entfernt ihre Einträge aus allen Projekten und aus
+Der Schalter unten in der Seitenleiste deaktiviert KeyZapper: Die App entfernt ihre Einträge aus allen Projekten und aus
 `~/.claude/settings.json`, Claude Code nutzt dann überall die normale Anmeldung. Die Zuordnungen bleiben gespeichert und
 werden beim Aktivieren wieder geschrieben.
 
 ## Verschlüsseltes Backup und Wiederherstellen
 
-*Backup › Backup exportieren …* (Symbolleiste oder Menü *Ablage*) schreibt Profile, Projektzuordnungen und Keys in eine
+*Backup exportieren …* auf der Seite *Backup* schreibt Profile, Projektzuordnungen und Keys in eine
 `.kzbackup`-Datei, verschlüsselt mit einem Passwort von mindestens 12 Zeichen. *Backup importieren …* stellt sie auf
 demselben oder einem anderen Rechner wieder her: Profile und Keys mit gleicher ID werden überschrieben, Projekte werden
 zugeordnet, sofern ihr Ordner existiert. Das Passwort wird nirgends gespeichert; ohne Passwort ist das Backup nicht
