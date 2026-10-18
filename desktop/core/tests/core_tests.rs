@@ -671,7 +671,14 @@ fn mcp_servers_are_written_enabled_and_reverted_without_touching_foreign_entries
     assert!(first.changed);
     assert_eq!(first.git_exclude_entry.as_deref(), Some(mcp::GIT_EXCLUDE_LINE));
     let file = read(&mcp_file(&repo));
-    assert_eq!(file["mcpServers"]["github"], json!({"type": "stdio", "command": "npx", "args": ["-y", "server-github"], "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}}));
+    assert_eq!(file["mcpServers"]["github"], github.definition());
+    assert_eq!(github.definition_for(false), json!({"type": "stdio", "command": "npx", "args": ["-y", "server-github"], "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}}));
+    assert_eq!(github.definition_for(true), json!({"type": "stdio", "command": "cmd", "args": ["/c", "npx", "-y", "server-github"], "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}}));
+    let mut native = github.clone();
+    for (command, wrapped) in [("NPX.CMD", true), (r"C:\tools\run.bat", true), ("uvx", false), ("node.exe", false), ("cmd", false)] {
+        native.command = command.into();
+        assert_eq!(native.definition_for(true)["args"][0] == "/c", wrapped, "{command}");
+    }
     assert_eq!(file["mcpServers"]["docs"], json!({"type": "http", "url": "https://docs.example.test/mcp", "headers": {"Authorization": "Bearer ${DOCS_TOKEN}"},
         "oauth": {"clientId": "weave-claude", "callbackPort": 8976, "scopes": "mcp.read"}}));
     assert_eq!(file["mcpServers"]["team"]["url"], "https://team.example.test/mcp");
