@@ -9,14 +9,18 @@
   },
   "app": {
     "withGlobalTauri": true,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
         "title": "KeyZapper",
-        "width": 940,
-        "height": 720,
-        "minWidth": 780,
-        "minHeight": 500
+        "width": 1040,
+        "height": 740,
+        "minWidth": 860,
+        "minHeight": 520,
+        "transparent": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {

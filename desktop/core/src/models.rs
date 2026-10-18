@@ -268,14 +268,25 @@ impl McpServer {
 
     /// The `.mcp.json` entry, e.g. `{"type": "stdio", "command": "npx", "args": […], "env": {…}}` or `{"type": "http", "url": …, "headers": {…}}`.
     pub fn definition(&self) -> serde_json::Value {
+        self.definition_for(cfg!(windows))
+    }
+
+    /// Like `definition`; on Windows, npm launchers (`npx`, `npm`, … or `*.cmd`/`*.bat`) run via `cmd /c`, since
+    /// Claude Code starts the command without a shell there.
+    pub fn definition_for(&self, windows: bool) -> serde_json::Value {
         let mut entry = serde_json::Map::new();
         let map = |m: &BTreeMap<String, String>| serde_json::to_value(m).unwrap_or_default();
         match self.transport {
             McpTransport::Stdio => {
+                let (command, args) = if windows && Self::needs_cmd_wrapper(&self.command) {
+                    ("cmd".to_string(), ["/c".to_string(), self.command.clone()].into_iter().chain(self.args.clone()).collect())
+                } else {
+                    (self.command.clone(), self.args.clone())
+                };
                 entry.insert("type".into(), "stdio".into());
-                entry.insert("command".into(), self.command.clone().into());
-                if !self.args.is_empty() {
-                    entry.insert("args".into(), self.args.clone().into());
+                entry.insert("command".into(), command.into());
+                if !args.is_empty() {
+                    entry.insert("args".into(), args.into());
                 }
                 if !self.env.is_empty() {
                     entry.insert("env".into(), map(&self.env));
@@ -303,6 +314,15 @@ impl McpServer {
             }
         }
         serde_json::Value::Object(entry)
+    }
+
+    /// True for commands that are `.cmd`/`.bat` scripts on Windows and cannot be started without a shell.
+    fn needs_cmd_wrapper(command: &str) -> bool {
+        let file = command.rsplit(['/', '\\']).next().unwrap_or(command).to_ascii_lowercase();
+        match file.rsplit_once('.') {
+            Some((_, ext)) => matches!(ext, "cmd" | "bat"),
+            None => matches!(file.as_str(), "npx" | "npm" | "pnpm" | "pnpx" | "yarn"),
+        }
     }
 
     /// One argument per line; blank lines are skipped.

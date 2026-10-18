@@ -32,12 +32,14 @@ in, so the costs land on the right project without anyone switching keys by hand
 
 * Profiles with name, LiteLLM endpoint (https; plain http only for a gateway on localhost), optional model alias and key. The key is stored exclusively in the local key file `keys.json` in the app data folder (no Keychain or credential-manager prompts).
 * Assign project folders to a profile. The app only adds to `.claude/settings.local.json` and excludes the file from Git via `.git/info/exclude`.
-* Status per project: active, differing, folder missing, key missing, conflicts with other settings.
-* MCP servers (stdio, HTTP or SSE) defined once and selected per project. The app writes them into the repository's `.mcp.json` (excluded from Git) and approves them in `.claude/settings.local.json`, so Claude Code loads them there automatically. Remote servers with OAuth (e.g. Weave-MCP via Entra ID or Keycloak) take a client ID, callback port and scopes; Claude Code handles the browser sign-in.
+* Status per project: active, differing, folder missing, key missing, conflicts with other settings. A summary shows what needs attention; *Repair all* writes the settings of every affected project again.
+* Drag project folders from Finder or Explorer onto a profile to assign them.
+* MCP servers (stdio, HTTP or SSE) defined once – or from templates such as GitHub, Notion or Sentry – and switched on per project. The app writes them into the repository's `.mcp.json` (excluded from Git) and approves them in `.claude/settings.local.json`, so Claude Code loads them there automatically. Remote servers with OAuth (e.g. Weave-MCP via Entra ID or Keycloak) take a client ID, callback port and scopes; Claude Code handles the browser sign-in.
 * Test connection against LiteLLM (invalid or blocked key, rate limit, budget, gateway unreachable).
-* Remaining budget per key, as reported by LiteLLM (`/key/info`): amount left of the limit and next reset, or the spend for keys without a limit.
+* Remaining budget per key, as reported by LiteLLM (`/key/info`): a bar that turns orange from 70 % and red from 90 % used, amount left of the limit and next reset, or the spend for keys without a limit.
+* Menu bar (macOS) or notification area (Windows) icon: budgets at a glance and a project's profile switched without opening the window. Closing the window keeps KeyZapper running there.
 * Removing an assignment only removes the entries the app set itself.
-* Overview with all profiles, masked keys and assigned projects. Everything can be changed directly; keys can be copied and replaced.
+* Sidebar with profiles, projects, MCP servers, Claude settings and backup. Everything can be changed directly – via the ⋯ menu or a right-click; keys can be copied and replaced.
 * Update check against the GitHub releases with one-click installation; the version is shown in the app and under “About KeyZapper”.
 * UI in English and German (follows the system language).
 * Encrypted backup and restore of profiles, assignments and keys (`.kzbackup`, password-protected).
@@ -199,7 +201,7 @@ have to be entered again. As long as a found backup has been neither restored no
 
 ## Claude settings check and default profile
 
-*Check Claude settings* (shield icon in the toolbar) checks `~/.claude/settings.json` for problems Claude Code accepts
+The *Claude settings* page in the sidebar checks `~/.claude/settings.json` for problems Claude Code accepts
 silently: invalid JSON (validated with the same strict `JSON.parse` as Claude Code, e.g. trailing commas), plaintext keys,
 an endpoint without a key, non-text values in `env`, provider switches that bypass LiteLLM, model variables and fixed
 model IDs instead of an alias. A banner shows problems at any time.
@@ -211,13 +213,13 @@ model IDs instead of an alias. A banner shows problems at any time.
 
 ## Deactivating KeyZapper
 
-The switch in the toolbar deactivates KeyZapper: it removes its entries from all projects and from
+The switch at the bottom of the sidebar deactivates KeyZapper: it removes its entries from all projects and from
 `~/.claude/settings.json`, so Claude Code uses its normal login everywhere. The assignments stay saved and are written
 again when activating.
 
 ## Encrypted backup and restore
 
-*Backup › Export Backup…* (toolbar or *File* menu) writes profiles, project assignments and keys into a `.kzbackup` file,
+*Export Backup…* on the *Backup* page writes profiles, project assignments and keys into a `.kzbackup` file,
 encrypted with a password of at least 12 characters. *Import Backup…* restores them on the same or another computer:
 profiles and keys with the same ID are overwritten, and projects are assigned if their folder exists. The password is
 stored nowhere – without it the backup cannot be restored.

@@ -8,8 +8,12 @@
   <script src="app.js" type="module"></script>
 </head>
 <body>
-  <header class="toolbar" id="toolbar"></header>
-  <div id="banners"></div>
-  <main id="main"></main>
+  <nav class="sidebar" id="sidebar" data-tauri-drag-region></nav>
+  <div class="content">
+    <div class="drag-strip" data-tauri-drag-region></div>
+    <div id="banners"></div>
+    <main id="main"></main>
+  </div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
 </body>
 </html>

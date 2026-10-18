@@ -68,6 +68,11 @@ const ICONS = {
   arrow: '<path d="M5 12h14M13 6l6 6-6 6"/>',
   sparkles: '<path d="M10 3l1.8 4.7 4.7 1.8-4.7 1.8L10 16l-1.8-4.7L3.5 9.5l4.7-1.8z"/><path d="M18 14l.9 2.1 2.1.9-2.1.9L18 20l-.9-2.1-2.1-.9 2.1-.9z"/>',
   plug: '<path d="M9 3v5M15 3v5M6 8h12v3a6 6 0 0 1-12 0z"/><path d="M12 17v4"/>',
+  more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
+  activity: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+  upload: '<path d="M12 15V3M7 8l5-5 5 5"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>',
+  download: '<path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>',
+  blank: '',
 };
 
 function icon(name, cls = '') {
@@ -116,34 +121,60 @@ const locale = () => (navigator.language?.toLowerCase().startsWith(view.language
 
 function setView(next) {
   view = next;
-  document.documentElement.lang = view.language;
-  renderToolbar();
+  const root = document.documentElement;
+  root.lang = view.language;
+  root.classList.toggle('vibrancy', !!view.vibrancy);
+  root.classList.toggle('mac', isMac());
+  assignColors();
+  renderSidebar();
   renderBanners();
   renderMain();
+  renderToast();
   for (const render of liveDialogs) render();
   if (view.error && !alertOpen) showAlert(view.error, () => call('dismiss_error'));
   if (view.whatsNew.length && !whatsNewShown) whatsNewDialog();
 }
 
-let toolbarSignature = '';
+// MARK: Navigation
 
-function renderToolbar() {
-  const signature = [view.language, view.profiles.length > 0, view.disabled, view.platform].join('|');
-  if (signature === toolbarSignature) return;
-  toolbarSignature = signature;
-  const backupMenu = h('div', { id: 'backup-menu', popover: 'auto', class: 'menu' },
-    button(t('Backup exportieren …'), () => { backupMenu.hidePopover(); exportDialog(); }, { disabled: !view.profiles.length }),
-    button(t('Backup importieren …'), () => { backupMenu.hidePopover(); importDialog(); }));
-  const backupButton = button(t('Backup'), null, { iconName: 'archive', iconOnly: true, title: t('Backup exportieren oder importieren') });
-  backupButton.setAttribute('popovertarget', 'backup-menu');
-  backupMenu.addEventListener('toggle', (event) => {
-    if (event.newState !== 'open') return;
-    const rect = backupButton.getBoundingClientRect();
-    backupMenu.style.position = 'fixed';
-    backupMenu.style.inset = 'auto';
-    backupMenu.style.top = `${rect.bottom + 4}px`;
-    backupMenu.style.left = `${Math.max(8, rect.right - backupMenu.offsetWidth)}px`;
-  });
+const PAGES = () => [
+  ['profiles', t('Profile'), 'key'],
+  ['projects', t('Projekte'), 'folder'],
+  ['mcp', t('MCP-Server'), 'plug'],
+  ['settings', t('Claude-Einstellungen'), 'shield'],
+  ['backup', t('Backup'), 'archive'],
+];
+
+let page = 'profiles';
+try { page = localStorage.getItem('page') ?? page; } catch { /* storage unavailable */ }
+
+function navigate(next) {
+  page = next;
+  try { localStorage.setItem('page', next); } catch { /* storage unavailable */ }
+  if (next === 'settings') {
+    settingsSelection = null;
+    call('refresh_all');
+  }
+  renderSidebar();
+  renderMain();
+  document.getElementById('main').scrollTop = 0;
+}
+
+let sidebarSignature = '';
+
+function renderSidebar() {
+  const attention = view.disabled ? 0 : view.bindings.filter((b) => projectStatus(b).attention).length;
+  const settingsProblems = view.globalFindings.filter((f) => f.severity !== 'info').length;
+  const badges = {
+    profiles: [view.profiles.length || null],
+    projects: attention ? [attention, 'warning'] : [view.bindings.length || null],
+    mcp: [view.mcpServers.length || null],
+    settings: settingsProblems ? [settingsProblems, 'warning'] : [null],
+    backup: [null],
+  };
+  const signature = JSON.stringify([page, view.language, view.disabled, badges, view.appVersion, view.updateCheckEnabled, view.platform]);
+  if (signature === sidebarSignature) return;
+  sidebarSignature = signature;
   const active = h('input', {
     type: 'checkbox', role: 'switch', checked: !view.disabled,
     onchange: async (event) => {
@@ -154,20 +185,24 @@ function renderToolbar() {
         t('Deaktivieren'))) call('set_disabled', { disabled: true });
     },
   });
-  document.getElementById('toolbar').replaceChildren(
-    h('h1', null, 'KeyZapper'),
-    h('span', { class: 'spacer' }),
-    button(t('Neues Profil'), () => profileEditor(null), { iconName: 'plus' }),
-    button(t('Projekt zuordnen'), () => addProjectDialog(null), { iconName: 'folderPlus', disabled: !view.profiles.length }),
-    button(t('Status aktualisieren'), () => call('refresh_all'), { iconName: 'refresh', iconOnly: true }),
-    button(t('Claude-Einstellungen prüfen'), () => { call('refresh_all'); claudeSettingsDialog(); },
-      { iconName: 'shield', iconOnly: true, title: t('~/.claude/settings.json prüfen, reparieren und Standardprofil setzen') }),
-    button(t('MCP-Server'), mcpServersDialog, { iconName: 'plug', iconOnly: true, title: t('MCP-Server einrichten, die Projekte automatisch nutzen') }),
-    backupButton,
-    backupMenu,
-    h('label', { class: 'switch', title: t('KeyZapper vorübergehend deaktivieren: Projekte nutzen dann die normale Claude-Anmeldung') },
-      active, t('KeyZapper aktiv')),
-    button(t('So funktioniert’s'), howItWorksDialog, { iconName: 'info', iconOnly: true }),
+  const checkUpdates = (beta) => call('check_for_updates', { beta });
+  document.getElementById('sidebar').replaceChildren(
+    h('div', { class: 'brand', 'data-tauri-drag-region': '' }, h('span', { class: 'logo' }, icon('bolt')), 'KeyZapper'),
+    ...PAGES().map(([id, label, symbol]) => {
+      const [count, tone] = badges[id];
+      return h('button', { type: 'button', class: `nav-item${page === id ? ' active' : ''}`, 'aria-current': page === id ? 'page' : null, onclick: () => navigate(id) },
+        icon(symbol), h('span', null, label), count != null && h('span', { class: `nav-badge ${tone ?? ''}` }, count));
+    }),
+    h('div', { class: 'sidebar-footer' },
+      h('label', { class: 'switch', title: t('KeyZapper vorübergehend deaktivieren: Projekte nutzen dann die normale Claude-Anmeldung') }, active, t('KeyZapper aktiv')),
+      button(t('So funktioniert’s'), howItWorksDialog, { iconName: 'info', cls: 'link' }),
+      h('div', { class: 'version' },
+        view.appVersion ? `KeyZapper ${view.appVersion}` : t('KeyZapper Entwicklungsversion'),
+        view.updateCheckEnabled
+          ? [button(t('Nach Updates suchen'), () => checkUpdates(false), { cls: 'link' }),
+            button(t('Beta-Version suchen'), () => checkUpdates(true), { cls: 'link' })]
+          : h('span', null, t('Updates über die IT')),
+        button(t('Projektseite'), () => call('open_url', { url: view.projectUrl }), { cls: 'link' }))),
   );
 }
 
@@ -177,8 +212,8 @@ function banner(kind, title, detail, actions = [], onDismiss = null) {
     h('div', { class: 'banner-text' },
       h('div', { class: `banner-title ${kind}` }, title),
       detail && h('div', { class: 'detail' }, detail)),
-    actions.map(([label, action]) => button(label, action)),
-    onDismiss && button(t('Schließen'), onDismiss, { iconName: 'close', iconOnly: true, cls: 'plain' }));
+    actions.map(([label, action], i) => button(label, action, { cls: i === 0 ? 'primary' : null })),
+    onDismiss && button(t('Schließen'), onDismiss, { iconName: 'close', iconOnly: true }));
 }
 
 function renderBanners() {
@@ -202,9 +237,9 @@ function renderBanners() {
       [[t('Aktivieren'), () => call('set_disabled', { disabled: false })]]));
   }
   const problems = view.globalFindings.filter((f) => f.severity !== 'info');
-  if (problems.length) {
+  if (problems.length && page !== 'settings') {
     items.push(banner('warning', t('~/.claude/settings.json: %@ Hinweis(e)', problems.length), problems[0].message,
-      [[t('Prüfen'), claudeSettingsDialog]]));
+      [[t('Prüfen'), () => navigate('settings')]]));
   }
   if (view.outdatedClis.length) {
     items.push(banner('warning', t('Claude-Code-CLI veraltet: %@', view.outdatedClis.join(', ')),
@@ -220,43 +255,199 @@ function renderBanners() {
           : t('Die Installation benötigt Administratorrechte, danach startet KeyZapper neu.'),
       [[t('Installieren'), () => call('install_update')], [t('Versionshinweise'), () => call('open_url', { url: view.availableUpdate.pageUrl })]]));
   }
-  if (view.notice) items.push(banner('info', view.notice, null, [], () => call('dismiss_notice')));
   document.getElementById('banners').replaceChildren(...items);
 }
 
-function renderMain() {
-  const main = document.getElementById('main');
-  if (!view.profiles.length) {
-    main.replaceChildren(h('div', { class: 'empty' },
-      icon('key'),
-      h('h2', null, t('Noch keine Profile')),
-      h('p', null, t('Lege ein Profil mit LiteLLM-Endpunkt, Modellalias und deinem freigegebenen Key an.')),
-      button(t('Profil anlegen'), () => profileEditor(null), { cls: 'primary' }),
-      button(t('Backup importieren …'), importDialog, { cls: 'link' })),
-      footer());
-    return;
-  }
-  main.replaceChildren(
-    ...view.profiles.map(profileCard),
-    h('div', { class: 'hint' }, icon('bolt', 'accent'),
-      t('Claude Code holt in jedem zugeordneten Projekt den passenden Key automatisch über den Helper – kein manuelles Wechseln nötig. Nach neuen Zuordnungen die Claude-Sitzung einmal neu starten.')),
-    footer());
+// MARK: Toasts
+
+let toastText = null;
+let toastTimer = null;
+
+/** Notices show briefly at the bottom right, so they are seen wherever the user clicked. */
+function renderToast() {
+  if (view.notice === toastText) return;
+  toastText = view.notice;
+  clearTimeout(toastTimer);
+  const container = document.getElementById('toasts');
+  if (!toastText) return container.replaceChildren();
+  const dismiss = () => call('dismiss_notice');
+  const later = (ms) => { clearTimeout(toastTimer); toastTimer = setTimeout(dismiss, ms); };
+  container.replaceChildren(h('div', { class: 'toast', onmouseenter: () => clearTimeout(toastTimer), onmouseleave: () => later(3000) },
+    icon('check', 'green'), h('div', { class: 'toast-text selectable' }, toastText),
+    button(t('Schließen'), dismiss, { iconName: 'close', iconOnly: true })));
+  later(7000);
 }
 
-function footer() {
-  // The result shows as a banner at the top, out of sight when the footer was clicked at the bottom.
-  const checkUpdates = async (beta) => {
-    await call('check_for_updates', { beta });
-    window.scrollTo(0, 0);
-  };
-  return h('div', { class: 'footer' },
-    view.appVersion ? `KeyZapper ${view.appVersion}` : t('KeyZapper Entwicklungsversion'),
-    view.updateCheckEnabled
-      ? [button(t('Nach Updates suchen'), () => checkUpdates(false), { cls: 'link' }),
-        button(t('Beta-Version suchen'), () => checkUpdates(true), { cls: 'link' })]
-      : h('span', null, t('Updates über die IT')),
-    button(t('So funktioniert’s'), howItWorksDialog, { cls: 'link' }),
-    button(t('Projektseite'), () => call('open_url', { url: view.projectUrl }), { cls: 'link' }));
+// MARK: Menus
+
+let openedMenu = null;
+/** The menu button whose menu the last outside click closed, so that click does not open it again. */
+let closedByTrigger = null;
+
+function closeMenu() {
+  openedMenu?.remove();
+  openedMenu = null;
+}
+
+/** Opens a menu below `anchor` (an element) or at a point; items are [label, action, { iconName, danger, disabled }] or '-'. */
+function openMenu(anchor, items) {
+  closeMenu();
+  const menu = h('div', { class: 'menu', popover: 'manual', role: 'menu' },
+    items.filter(Boolean).map((item) => (item === '-' ? h('div', { class: 'menu-separator', role: 'separator' })
+      : h('button', { type: 'button', role: 'menuitem', class: item[2]?.danger ? 'danger' : null, disabled: item[2]?.disabled,
+        onclick: () => { closeMenu(); item[1](); } }, icon(item[2]?.iconName ?? 'blank'), item[0]))));
+  menu.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      closeMenu();
+      if (anchor instanceof Element) anchor.focus();
+      return;
+    }
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    e.preventDefault();
+    const entries = [...menu.querySelectorAll('button:not(:disabled)')];
+    const next = entries.indexOf(document.activeElement) + (e.key === 'ArrowDown' ? 1 : -1);
+    entries[(next + entries.length) % entries.length]?.focus();
+  });
+  document.body.append(menu);
+  menu.showPopover();
+  openedMenu = menu;
+  const element = anchor instanceof Element;
+  const rect = element ? anchor.getBoundingClientRect() : { left: anchor.x, right: anchor.x, top: anchor.y, bottom: anchor.y };
+  const { offsetWidth: width, offsetHeight: height } = menu;
+  menu.style.left = `${Math.max(8, Math.min(element ? rect.right - width : rect.left, innerWidth - width - 8))}px`;
+  menu.style.top = `${rect.bottom + 4 + height <= innerHeight ? rect.bottom + 4 : Math.max(8, rect.top - 4 - height)}px`;
+  menu.querySelector('button:not(:disabled)')?.focus();
+}
+
+// Menus close on clicks outside, when the window loses focus or changes size.
+document.addEventListener('pointerdown', (e) => {
+  closedByTrigger = null;
+  if (!openedMenu || openedMenu.contains(e.target)) return;
+  closedByTrigger = e.target.closest?.('[aria-haspopup="menu"]') ?? null;
+  closeMenu();
+}, true);
+window.addEventListener('blur', closeMenu);
+window.addEventListener('resize', closeMenu);
+
+function menuButton(label, items) {
+  const trigger = button(label, () => {
+    if (closedByTrigger === trigger) closedByTrigger = null;
+    else openMenu(trigger, items());
+  }, { iconName: 'more', iconOnly: true });
+  trigger.setAttribute('aria-haspopup', 'menu');
+  return trigger;
+}
+
+/** Right-click menu; the innermost element with one wins, text fields keep the system menu. */
+const contextMenu = (items) => (event) => {
+  if (event.target.closest('input, textarea, select, .selectable')) return;
+  event.preventDefault();
+  event.stopPropagation();
+  openMenu({ x: event.clientX, y: event.clientY }, items());
+};
+
+// MARK: Pages
+
+function renderMain() {
+  const main = document.getElementById('main');
+  const scroll = main.scrollTop;
+  const pages = { profiles: profilesPage, projects: projectsPage, mcp: mcpPage, settings: settingsPage, backup: backupPage };
+  main.replaceChildren(...[(pages[page] ?? profilesPage)()].flat(Infinity).filter(Boolean));
+  main.scrollTop = scroll;
+}
+
+function pageHeader(title, subtitle, ...actions) {
+  return h('header', { class: 'page-header', 'data-tauri-drag-region': '' },
+    h('div', { class: 'page-title', 'data-tauri-drag-region': '' },
+      h('h1', { 'data-tauri-drag-region': '' }, title),
+      subtitle && h('p', { 'data-tauri-drag-region': '' }, subtitle)),
+    h('div', { class: 'page-actions' }, actions));
+}
+
+const refreshButton = () => button(t('Status aktualisieren'), () => call('refresh_all'), { iconName: 'refresh', iconOnly: true });
+
+function noProfiles() {
+  return h('div', { class: 'empty' },
+    h('span', { class: 'logo big' }, icon('bolt')),
+    h('h2', null, t('Noch keine Profile')),
+    h('p', null, t('Lege ein Profil mit LiteLLM-Endpunkt, Modellalias und deinem freigegebenen Key an.')),
+    button(t('Profil anlegen'), () => profileEditor(null), { cls: 'primary' }),
+    button(t('Backup importieren …'), importDialog, { cls: 'link' }));
+}
+
+function profilesPage() {
+  if (!view.profiles.length) return noProfiles();
+  return [
+    pageHeader(t('Profile'), t('Ein Key oder eine SSO-Anmeldung je Profil – zugeordnete Projekte nutzen ihn automatisch.'),
+      refreshButton(),
+      button(t('Projekt zuordnen'), () => addProjectDialog(null), { iconName: 'folderPlus' }),
+      button(t('Neues Profil'), () => profileEditor(null), { iconName: 'plus', cls: 'primary' })),
+    summaryBar(),
+    view.profiles.map(profileCard),
+    h('div', { class: 'hint' }, icon('bolt', 'accent'),
+      t('Claude Code holt in jedem zugeordneten Projekt den passenden Key automatisch über den Helper – kein manuelles Wechseln nötig. Nach neuen Zuordnungen die Claude-Sitzung einmal neu starten.')),
+  ];
+}
+
+function projectsPage() {
+  if (!view.profiles.length) return noProfiles();
+  return [
+    pageHeader(t('Projekte'), t('Ordner aus dem %@ hierher ziehen, um sie zuzuordnen – auf ein Profil gezogen gilt direkt dieses.', isMac() ? 'Finder' : 'Explorer'),
+      refreshButton(),
+      button(t('Projekt zuordnen'), () => addProjectDialog(null), { iconName: 'folderPlus', cls: 'primary' })),
+    summaryBar(),
+    view.bindings.length
+      ? h('div', { class: 'project-list standalone' }, view.bindings.map((b) => projectRow(b, profileOf(b))))
+      : h('div', { class: 'empty compact' }, icon('folder'), h('h2', null, t('Noch keine Projekte')),
+        h('p', null, t('Ziehe einen Projektordner hierher oder wähle „Projekt zuordnen“.'))),
+  ];
+}
+
+/** "4 Projekte · 3 aktiv · 1 braucht Aufmerksamkeit" with one button that repairs what writing the settings again fixes. */
+function summaryBar() {
+  const bindings = view.bindings;
+  if (!bindings.length) return null;
+  if (view.disabled) {
+    return h('div', { class: 'summary' }, icon('pause', 'muted'), t('Pausiert – Claude nutzt in allen Projekten die normale Anmeldung.'));
+  }
+  const states = bindings.map(projectStatus);
+  const attention = states.filter((s) => s.attention).length;
+  const repairable = bindings.filter((b, i) => states[i].repairable);
+  const total = bindings.length === 1 ? t('1 Projekt') : t('%@ Projekte', bindings.length);
+  const active = states.filter((s) => s.tone === 'green').length;
+  return h('div', { class: `summary${attention ? ' attention' : ''}`, role: 'status' },
+    icon(attention ? 'warning' : 'check', attention ? 'orange' : 'green'),
+    h('span', null, h('strong', null, total),
+      h('span', { class: 'muted' }, ` · ${t('%@ aktiv', active)}`),
+      attention > 0 && h('span', { class: 'orange' }, ` · ${attention === 1 ? t('1 braucht Aufmerksamkeit') : t('%@ brauchen Aufmerksamkeit', attention)}`)),
+    h('span', { class: 'spacer' }),
+    repairable.length > 0 && button(repairable.length === 1 ? t('Reparieren') : t('Alle reparieren'),
+      () => call('reapply_many', { bindingIds: repairable.map((b) => b.id) }), { iconName: 'rotate', cls: 'primary' }));
+}
+
+// MARK: Profiles
+
+const PROFILE_COLORS = ['#4f46e5', '#0891b2', '#db2777', '#ea580c', '#059669', '#7c3aed', '#2563eb', '#ca8a04'];
+let profileColors = new Map();
+
+/** Stable color per profile (from its ID); collisions move to the next free color in profile order. */
+function assignColors() {
+  const taken = new Set();
+  profileColors = new Map(view.profiles.map((p) => {
+    let index = [...p.id].reduce((hash, c) => (hash * 31 + c.charCodeAt(0)) >>> 0, 7) % PROFILE_COLORS.length;
+    for (let i = 0; i < PROFILE_COLORS.length && taken.has(index); i++) index = (index + 1) % PROFILE_COLORS.length;
+    taken.add(index);
+    return [p.id, PROFILE_COLORS[index]];
+  }));
+}
+
+const colorOf = (profileId) => profileColors.get(profileId) ?? 'var(--muted)';
+const profileOf = (binding) => view.profiles.find((p) => p.id === binding.profileId)
+  ?? { id: binding.profileId, name: t('Unbekanntes Profil'), sso: false, hasKey: false };
+
+function initials(name) {
+  const words = name.trim().split(/\s+/).filter(Boolean);
+  return (words.length > 1 ? words[0][0] + words[1][0] : (words[0] ?? '?').slice(0, 2)).toUpperCase();
 }
 
 function tierModels(p) {
@@ -276,22 +467,79 @@ function parseResetDate(text) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-function budgetLine(budget) {
+/** "in 14 Tagen", "morgen", "in 5 Stunden"; null once the date has passed. */
+function relativeTime(date) {
+  const hours = (date.getTime() - Date.now()) / 3_600_000;
+  if (hours <= 0) return null;
+  const format = new Intl.RelativeTimeFormat(locale(), { numeric: 'auto' });
+  return hours < 24 ? format.format(Math.ceil(hours), 'hour') : format.format(Math.round(hours / 24), 'day');
+}
+
+/** Budget bar: green below 70 % used, orange below 90 %, red above. */
+function budgetMeter(budget) {
   const reset = budget.resetAt && parseResetDate(budget.resetAt);
-  return h('div', { class: 'line' }, icon('dollar', 'muted'),
-    budget.maxBudget != null
-      ? [h('strong', { class: budget.remaining > 0 ? 'green' : 'red' }, t('%@ übrig', money(budget.remaining))),
-        h('span', { class: 'muted' }, t('von %@', money(budget.maxBudget)))]
-      : h('strong', { class: 'green' }, t('Kein Budgetlimit')),
-    h('span', { class: 'muted' }, '·'),
-    h('span', { class: 'red' }, t('%@ verbraucht', money(budget.spend))),
-    reset && h('span', { class: 'muted' }, t('· Reset %@', new Intl.DateTimeFormat(locale(), { dateStyle: 'medium' }).format(reset))));
+  const resetText = reset && relativeTime(reset);
+  const resetInfo = resetText && h('span', { class: 'muted small', title: new Intl.DateTimeFormat(locale(), { dateStyle: 'medium', timeStyle: 'short' }).format(reset) },
+    t('Reset %@', resetText));
+  if (budget.maxBudget == null) {
+    return h('div', { class: 'budget' }, h('div', { class: 'budget-text' },
+      h('strong', null, t('%@ verbraucht', money(budget.spend))), h('span', { class: 'muted' }, t('Kein Budgetlimit')),
+      h('span', { class: 'spacer' }), resetInfo));
+  }
+  const used = budget.maxBudget > 0 ? Math.min(1, Math.max(0, budget.spend / budget.maxBudget)) : 1;
+  const tone = used >= 0.9 ? 'red' : used >= 0.7 ? 'orange' : 'green';
+  const percent = Math.round(used * 100);
+  return h('div', { class: 'budget' },
+    h('div', { class: 'budget-text' },
+      h('strong', { class: tone }, t('%@ übrig', money(budget.remaining ?? 0))),
+      h('span', { class: 'muted' }, t('von %@', money(budget.maxBudget))),
+      h('span', { class: 'spacer' }),
+      h('span', { class: 'muted small' }, t('%@ % verbraucht', percent)),
+      resetInfo && h('span', { class: 'muted small' }, '·'), resetInfo),
+    h('div', { class: 'meter', role: 'meter', 'aria-label': t('Budget verbraucht'), 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': percent },
+      h('div', { class: `meter-fill ${tone}`, style: `width: ${(used * 100).toFixed(1)}%` })));
+}
+
+function profileMenu(profile, bindings, testConnection) {
+  const locked = profile.managed;
+  return [
+    [t('Bearbeiten'), () => profileEditor(profile), { iconName: 'pencil', disabled: locked }],
+    profile.sso
+      ? [profile.ssoState === 'loggedIn' ? t('Neu anmelden') : t('Anmelden'), () => call('sso_login', { profileId: profile.id }), { iconName: 'key', disabled: profile.ssoLoggingIn }]
+      : [profile.hasKey ? t('Key ändern') : t('Key hinterlegen'), () => replaceKeyDialog(profile), { iconName: 'key' }],
+    !profile.sso && [t('Key kopieren'), () => call('copy_key', { profileId: profile.id }), { iconName: 'copy', disabled: !profile.hasKey || !view.allowKeyExport }],
+    profile.sso && [t('Abmelden'), () => call('sso_logout', { profileId: profile.id }), { iconName: 'keyOff', disabled: profile.ssoLoggingIn || profile.ssoState === 'loggedOut' }],
+    [t('Verbindung prüfen'), testConnection, { iconName: 'activity', disabled: !credentialOk(profile) }],
+    [t('Projekt zuordnen …'), () => addProjectDialog(profile.id), { iconName: 'folderPlus' }],
+    '-',
+    [t('Profil löschen'), () => deleteProfile(profile, bindings), { iconName: 'trash', danger: true, disabled: locked }],
+  ];
+}
+
+function credentialRow(profile, testConnection, check) {
+  const ok = credentialOk(profile);
+  let text;
+  if (profile.sso) {
+    const expiry = profile.ssoExpiresAt && profile.ssoExpiresAt * 1000 > Date.now() ? new Date(profile.ssoExpiresAt * 1000) : null;
+    text = profile.ssoLoggingIn ? t('Anmeldung läuft – bitte im Browser abschließen …')
+      : ok ? (expiry ? t('Angemeldet, Token gültig bis %@', expiry.toLocaleString(locale())) : t('Angemeldet')) : ssoStateText(profile);
+  } else {
+    text = profile.hasKey ? `Key ${profile.keyHint ?? '••••'}` : t('Kein Key hinterlegt – Anfragen schlagen fehl');
+  }
+  return h('div', { class: 'key-row' },
+    h('span', { class: `chip ${ok ? 'ok' : 'missing'}` }, icon(ok ? 'key' : 'keyOff'),
+      h('span', { class: !profile.sso && profile.hasKey ? 'mono' : null }, text)),
+    profile.ssoLoggingIn && h('span', { class: 'spinner', role: 'status', 'aria-label': t('Anmeldung läuft') }),
+    h('span', { class: 'spacer' }),
+    ok && button(check.checking ? t('Wird geprüft …') : t('Verbindung prüfen'), testConnection, { iconName: 'activity', disabled: check.checking }),
+    !ok && (profile.sso
+      ? button(t('Anmelden'), () => call('sso_login', { profileId: profile.id }), { iconName: 'key', cls: 'primary', disabled: profile.ssoLoggingIn })
+      : button(t('Key hinterlegen'), () => replaceKeyDialog(profile), { iconName: 'key', cls: 'primary' })));
 }
 
 function profileCard(profile) {
   const bindings = view.bindings.filter((b) => b.profileId === profile.id);
   const check = checks.get(profile.id) ?? {};
-  const keyColor = credentialOk(profile) ? 'var(--green)' : 'var(--red)';
   const testConnection = async () => {
     checks.set(profile.id, { checking: true });
     renderMain();
@@ -299,60 +547,29 @@ function profileCard(profile) {
     checks.set(profile.id, { result });
     renderMain();
   };
-  const projectsTitle = !bindings.length ? t('Noch keinem Projekt zugeordnet')
-    : bindings.length === 1 ? t('Nutzen diesen Key · 1 Projekt') : t('Nutzen diesen Key · %@ Projekte', bindings.length);
-
-  return h('section', { class: 'card', 'aria-label': profile.name },
+  const menu = () => profileMenu(profile, bindings, testConnection);
+  return h('section', { class: 'card profile-card', 'aria-label': profile.name, 'data-profile-id': profile.id, style: `--profile: ${colorOf(profile.id)}`,
+    oncontextmenu: contextMenu(menu) },
     h('div', { class: 'card-head' },
-      h('div', { class: 'spacer' },
+      h('span', { class: 'avatar', 'aria-hidden': 'true' }, initials(profile.name)),
+      h('div', { class: 'card-title' },
         h('h2', null, profile.name, profile.sso && h('span', { class: 'badge' }, 'SSO'), profile.managed && h('span', { class: 'badge' }, t('Von der IT vorgegeben'))),
-        h('div', { class: 'muted selectable' }, profile.endpoint + (profile.modelAlias ? t(' · Modell %@', profile.modelAlias) : '')),
+        h('div', { class: 'muted small selectable' }, profile.endpoint + (profile.modelAlias ? t(' · Modell %@', profile.modelAlias) : '')),
         tierModels(profile) && h('div', { class: 'mono muted' }, tierModels(profile))),
-      button(t('Bearbeiten'), () => profileEditor(profile), { disabled: profile.managed }),
-      button(t('Löschen'), () => deleteProfile(profile, bindings), { cls: 'danger', disabled: profile.managed })),
-    profile.sso ? ssoRow(profile, testConnection, check) : h('div', { class: 'key-row' },
-      h('span', { class: `chip ${profile.hasKey ? 'ok' : 'missing'}` }, icon(profile.hasKey ? 'key' : 'keyOff'),
-        h('span', { class: profile.hasKey ? 'mono' : null }, profile.hasKey ? `Key ${profile.keyHint ?? '••••'}` : t('Kein Key hinterlegt – Anfragen schlagen fehl'))),
-      h('span', { class: 'spacer' }),
-      button(t('Kopieren'), () => call('copy_key', { profileId: profile.id }),
-        { iconName: 'copy', disabled: !profile.hasKey || !view.allowKeyExport, title: view.allowKeyExport ? null : t('Laut Firmenrichtlinie deaktiviert') }),
-      button(profile.hasKey ? t('Ändern') : t('Key hinterlegen'), () => replaceKeyDialog(profile), { iconName: 'pencil' }),
-      button(t('Verbindung prüfen'), testConnection, { disabled: check.checking || !profile.hasKey })),
-    profile.hasKey && profile.budget && budgetLine(profile.budget),
-    profile.hasKey && profile.killers.length > 0 && h('div', { class: 'line orange' }, icon('flame'),
+      menuButton(t('Weitere Aktionen'), menu)),
+    credentialRow(profile, testConnection, check),
+    profile.hasKey && profile.budget && budgetMeter(profile.budget),
+    profile.hasKey && profile.killers.length > 0 && h('div', { class: 'line orange small' }, icon('flame'),
       t('Wird vom Budget-Killer in „%@“ verbrannt', profile.killers.join(', '))),
-    check.checking && h('div', { class: 'muted' }, t('Verbindung wird geprüft …')),
     check.result && h('div', { class: `check-result ${check.result.success ? 'green' : 'orange'}` },
       icon(check.result.success ? 'check' : 'warning'), h('span', { class: 'selectable' }, check.result.message)),
-    h('div', { class: 'projects', style: `--connector: color-mix(in srgb, ${keyColor} 45%, transparent)` },
-      h('div', { class: 'projects-head' }, icon('turn'), h('span', { class: 'spacer' }, projectsTitle),
-        button(t('Projekt zuordnen …'), () => addProjectDialog(profile.id), { iconName: 'folderPlus' })),
-      bindings.length > 0 && h('div', { class: 'project-list' }, bindings.map((b) => projectRow(b, profile)))));
+    h('div', { class: 'projects' },
+      bindings.length > 0 && h('div', { class: 'project-list' }, bindings.map((b) => projectRow(b, profile))),
+      h('button', { type: 'button', class: 'add-row', onclick: () => addProjectDialog(profile.id) }, icon('folderPlus'),
+        bindings.length ? t('Weiteres Projekt zuordnen – oder Ordner hierher ziehen') : t('Projekt zuordnen – oder Ordner hierher ziehen'))));
 }
 
-function ssoRow(profile, testConnection, check) {
-  const expiry = profile.ssoExpiresAt && profile.ssoExpiresAt * 1000 > Date.now()
-    ? new Date(profile.ssoExpiresAt * 1000).toLocaleString(locale()) : null;
-  const text = profile.ssoLoggingIn ? t('Anmeldung läuft – bitte im Browser abschließen …')
-    : profile.ssoState === 'loggedIn' ? (expiry ? t('Angemeldet, Token gültig bis %@', expiry) : t('Angemeldet'))
-      : ssoStateText(profile);
-  const ok = profile.ssoState === 'loggedIn';
-  return h('div', { class: 'key-row' },
-    h('span', { class: `chip ${ok ? 'ok' : 'missing'}` }, icon(ok ? 'key' : 'keyOff'), h('span', null, text)),
-    profile.ssoLoggingIn && h('span', { class: 'spinner', role: 'status', 'aria-label': t('Anmeldung läuft') }),
-    h('span', { class: 'spacer' }),
-    button(ok || profile.ssoState === 'expired' ? t('Neu anmelden') : t('Anmelden'), () => call('sso_login', { profileId: profile.id }),
-      { iconName: 'key', cls: ok ? null : 'primary', disabled: profile.ssoLoggingIn }),
-    button(t('Abmelden'), () => call('sso_logout', { profileId: profile.id }), { disabled: profile.ssoLoggingIn || profile.ssoState === 'loggedOut' }),
-    button(t('Verbindung prüfen'), testConnection, { disabled: check.checking || !ok }));
-}
-
-function statusAppearance(status, keyPresent) {
-  if (!status) return ['question', 'muted'];
-  if (status.health.state === 'folderMissing' || !keyPresent || status.conflicts.some((c) => c.blocking)) return ['error', 'red'];
-  if (status.health.state !== 'active') return ['warning', 'orange'];
-  return ['check', 'green'];
-}
+// MARK: Projects
 
 function describeHealth(health, keyPresent, sso) {
   if (!keyPresent && health?.state === 'active' && sso) return t('Nicht angemeldet – Claude-Anfragen schlagen fehl. Beim Profil „Anmelden“ wählen.');
@@ -366,16 +583,48 @@ function describeHealth(health, keyPresent, sso) {
   }
 }
 
+/** Pill, tone and whether "Alle reparieren" can fix it (writing the settings again). */
+function projectStatus(binding) {
+  const profile = profileOf(binding);
+  const keyPresent = credentialOk(profile);
+  const status = binding.status;
+  const state = status?.health.state;
+  const blocking = status?.conflicts.some((c) => c.blocking);
+  const result = (symbol, tone, label, attention = true, repairable = false) => ({ symbol, tone, label, attention, repairable });
+  if (view.disabled) return result('pause', 'muted', t('Pausiert'), false);
+  if (!status) return result('question', 'muted', t('Wird geprüft'), false);
+  if (state === 'folderMissing') return result('error', 'red', t('Ordner fehlt'));
+  if (!keyPresent) return result('keyOff', 'red', profile.sso ? t('Nicht angemeldet') : t('Kein Key'));
+  if (blocking) return result('error', 'red', t('Konflikt'));
+  if (state === 'notApplied') return result('warning', 'orange', t('Nicht eingerichtet'), true, true);
+  if (state === 'drifted') return result('warning', 'orange', t('Abweichung'), true, true);
+  if (!binding.mcpActive) return result('warning', 'orange', t('MCP weicht ab'), true, true);
+  return result('check', 'green', t('Aktiv'), false);
+}
+
+function projectMenu(binding, folderMissing, confirmUnbind) {
+  return [
+    [t('Für Agenten optimieren'), () => agentsDialog(binding, profileOf(binding)), { iconName: 'sparkles', disabled: folderMissing }],
+    [t('MCP-Server …'), () => projectMcpDialog(binding), { iconName: 'plug', disabled: folderMissing }],
+    [revealLabel(), () => call('reveal', { path: binding.path }), { iconName: 'folder', disabled: folderMissing }],
+    [t('Erneut anwenden'), () => call('reapply', { bindingId: binding.id }), { iconName: 'rotate', disabled: folderMissing || view.disabled }],
+    '-',
+    [t('Zuordnung entfernen'), confirmUnbind, { iconName: 'trash', danger: true }],
+  ];
+}
+
 function projectRow(binding, profile) {
   const status = binding.status;
   const keyPresent = credentialOk(profile);
-  const [symbol, color] = statusAppearance(status, keyPresent);
+  const state = projectStatus(binding);
+  const folderMissing = status?.health.state === 'folderMissing';
   const healthOk = status?.health.state === 'active' && keyPresent;
-  const statusTip = view.disabled ? t('Deaktiviert – Claude nutzt hier die normale Anmeldung.')
+  const tip = view.disabled ? t('Deaktiviert – Claude nutzt hier die normale Anmeldung.')
     : !healthOk ? describeHealth(status?.health, keyPresent, profile.sso) : status.conflicts[0]?.message ?? t('Aktiv');
-  // Hidden: three clicks on the status icon switch the Budget-Killer on or off.
-  const statusIcon = view.disabled ? h('span', { class: 'status-icon muted', title: statusTip }, icon('pause'))
-    : h('span', { class: `status-icon ${color}`, title: statusTip, onclick: (e) => { if (e.detail === 3 && !profile.sso) call('toggle_pool', { bindingId: binding.id }); } }, icon(symbol));
+  // Hidden: three clicks on the status switch the Budget-Killer on or off.
+  const pill = h('span', { class: `pill ${state.tone}`, title: tip,
+    onclick: (e) => { if (e.detail === 3 && !profile.sso && !view.disabled) call('toggle_pool', { bindingId: binding.id }); } },
+  icon(state.symbol), state.label);
   const select = h('select', {
     'aria-label': t('Profil'), title: t('Profil für dieses Projekt wechseln'), disabled: view.disabled,
     onchange: async (e) => {
@@ -388,24 +637,26 @@ function projectRow(binding, profile) {
       t('Nur die von der App gesetzten Einträge werden aus .claude/settings.local.json entfernt. Andere Einstellungen bleiben erhalten.'),
       t('Entfernen'))) call('unbind', { bindingId: binding.id });
   };
-  return h('div', { class: 'project' },
-    h('div', { class: 'project-main' }, statusIcon,
-      h('div', { class: 'project-name' }, h('strong', null, binding.name), h('span', { class: 'mono', title: binding.path }, `\u200E${binding.displayPath}\u200E`)),
+  return h('div', { class: 'project', style: `--profile: ${colorOf(binding.profileId)}`, oncontextmenu: contextMenu(() => projectMenu(binding, folderMissing, confirmUnbind)) },
+    h('div', { class: 'project-main' },
+      h('div', { class: 'project-name' },
+        h('div', { class: 'line' }, h('strong', null, binding.name), pill),
+        h('span', { class: 'mono', title: binding.path }, `‎${binding.displayPath}‎`)),
       select,
-      button(t('Für Agenten optimieren'), () => agentsDialog(binding, profile),
-        { iconName: 'sparkles', iconOnly: true, title: t('AGENTS.md für dieses Repository per KI-Analyse erzeugen oder verbessern'), disabled: status?.health.state === 'folderMissing' }),
-      button(t('MCP-Server'), () => projectMcpDialog(binding),
-        { iconName: 'plug', iconOnly: true, title: t('MCP-Server für dieses Projekt auswählen'), disabled: status?.health.state === 'folderMissing' }),
-      button(revealLabel(), () => call('reveal', { path: binding.path }), { iconName: 'folder', iconOnly: true }),
-      button(t('Erneut anwenden'), () => call('reapply', { bindingId: binding.id }),
-        { iconName: 'rotate', iconOnly: true, title: t('Einstellungen erneut schreiben'), disabled: status?.health.state === 'folderMissing' || view.disabled }),
-      button(t('Entfernen'), confirmUnbind, { iconName: 'trash', iconOnly: true, title: t('Zuordnung entfernen'), cls: 'danger' })),
+      h('div', { class: 'row-actions' },
+        button(t('Für Agenten optimieren'), () => agentsDialog(binding, profile),
+          { iconName: 'sparkles', iconOnly: true, title: t('AGENTS.md für dieses Repository per KI-Analyse erzeugen oder verbessern'), disabled: folderMissing }),
+        button(t('MCP-Server'), () => projectMcpDialog(binding),
+          { iconName: 'plug', iconOnly: true, title: t('MCP-Server für dieses Projekt auswählen'), disabled: folderMissing }),
+        button(revealLabel(), () => call('reveal', { path: binding.path }), { iconName: 'folder', iconOnly: true }),
+        button(t('Erneut anwenden'), () => call('reapply', { bindingId: binding.id }),
+          { iconName: 'rotate', iconOnly: true, title: t('Einstellungen erneut schreiben'), disabled: folderMissing || view.disabled }),
+        button(t('Entfernen'), confirmUnbind, { iconName: 'trash', iconOnly: true, title: t('Zuordnung entfernen'), cls: 'danger' }))),
     binding.mcpNames.length > 0 && h('div', { class: `note ${binding.mcpActive ? 'muted' : 'orange'}` }, icon(binding.mcpActive ? 'plug' : 'warning'),
-      binding.mcpActive ? t('MCP: %@', binding.mcpNames.join(', ')) : t('MCP: %@ – .mcp.json weicht ab, „Erneut anwenden“ wählen.', binding.mcpNames.join(', '))),
+      binding.mcpActive ? binding.mcpNames.join(', ') : t('MCP: %@ – .mcp.json weicht ab, „Erneut anwenden“ wählen.', binding.mcpNames.join(', '))),
     binding.pooled && !view.disabled && h('div', { class: 'note red' }, icon('flame'),
       t('Budget-Killer: Nach dem Budget dieses Keys werden die Keys der anderen Profile am selben Gateway verbrannt.')),
-    view.disabled ? h('div', { class: 'note muted' }, t('Deaktiviert – Claude nutzt hier die normale Anmeldung.'))
-      : !healthOk && h('div', { class: `note ${color}` }, describeHealth(status?.health, keyPresent, profile.sso)),
+    !view.disabled && !healthOk && h('div', { class: `note ${state.tone}` }, describeHealth(status?.health, keyPresent, profile.sso)),
     (status?.conflicts ?? []).map((c) => h('div', { class: `note ${c.blocking ? 'red' : 'orange'}` },
       icon(c.blocking ? 'error' : 'warning'), h('span', { class: 'selectable' }, c.message))));
 }
@@ -420,6 +671,70 @@ async function deleteProfile(profile, bindings) {
     checks.delete(profile.id);
     call('delete_profile', { profileId: profile.id });
   }
+}
+
+// MARK: Claude settings and backup pages
+
+/** Default profile chosen on the settings page but not applied yet; null = take the stored one. */
+let settingsSelection = null;
+
+function settingsPage() {
+  if (settingsSelection === null) settingsSelection = view.globalProfileId ?? '';
+  const selected = settingsSelection;
+  const findings = view.globalFindings;
+  const needsRepair = findings.some((f) => f.severity === 'error' || f.id.startsWith('plaintext-'));
+  const health = view.globalHealth;
+  const unchanged = (selected || null) === (view.globalProfileId ?? null) && health?.state === 'active';
+  const healthText = !health ? null : {
+    active: t('Standardprofil ist aktiv.'),
+    notApplied: t('Standardprofil fehlt in der Datei – „Übernehmen“ wählen.'),
+    drifted: t('Abweichung in %@ – „Übernehmen“ wählen.', health.keys.join(', ')),
+    folderMissing: t('Datei nicht gefunden.'),
+  }[health.state];
+  const severityIcon = { error: ['error', 'red'], warning: ['warning', 'orange'], info: ['info', 'muted'] };
+  return [
+    pageHeader(t('Claude-Einstellungen'), t('~/.claude/settings.json prüfen, reparieren und Standardprofil setzen')),
+    h('section', { class: 'card' },
+      h('div', { class: 'card-head' }, h('div', { class: 'card-title' }, h('h2', null, t('Prüfung')), h('div', { class: 'mono muted small' }, view.userSettingsPath)),
+        button(revealLabel(), () => call('reveal', { path: view.userSettingsFullPath }), { iconName: 'folder', iconOnly: true, disabled: !view.userSettingsExists })),
+      findings.every((f) => f.severity === 'info') && h('div', { class: 'finding green' }, icon('check'), t('Keine Probleme gefunden.')),
+      findings.map((f) => h('div', { class: `finding ${severityIcon[f.severity][1]}` }, icon(severityIcon[f.severity][0]), h('span', { class: 'selectable' }, f.message))),
+      h('div', { class: 'line' },
+        button(t('Erneut prüfen'), () => call('refresh_all'), { iconName: 'refresh' }),
+        button(view.userSettingsExists ? t('Reparieren') : t('Erzeugen'), () => call('repair_user_settings'),
+          { cls: 'primary', disabled: view.userSettingsExists && !needsRepair })),
+      h('div', { class: 'section-note' }, t('„Reparieren“ macht die Datei gültig, entfernt Klartext-Keys und wandelt Werte in „env“ in Text um. Vorher legt KeyZapper eine Sicherung settings.json.keyzapper-<Zeit>.bak an.'))),
+    h('section', { class: 'card' },
+      h('h2', null, t('Standardprofil für alle übrigen Ordner')),
+      field(t('Standardprofil'), h('select', { onchange: (e) => { settingsSelection = e.target.value; renderMain(); } },
+        h('option', { value: '', selected: !selected }, t('Keins')),
+        view.profiles.map((p) => h('option', { value: p.id, selected: p.id === selected }, profileLabel(p)))), 'c-profile'),
+      healthText && h('div', { class: `finding ${health.state === 'active' ? 'green' : 'orange'}` },
+        icon(health.state === 'active' ? 'check' : 'warning'), healthText),
+      h('div', { class: 'line' }, h('span', { class: 'spacer' }),
+        button(t('Übernehmen'), async () => { if (!selected || await ensureLogin(selected)) call('set_global_profile', { profileId: selected || null }); },
+          { cls: 'primary', disabled: unchanged || (!selected && !view.globalProfileId) || view.disabled })),
+      h('div', { class: 'section-note' }, t('Trägt das Profil in ~/.claude/settings.json ein. Claude Code nutzt es in allen Ordnern ohne eigene Zuordnung, statt auf einen Klartext-Key oder die normale Anmeldung zurückzufallen. Zugeordnete Projekte behalten ihr eigenes Profil.'))),
+  ];
+}
+
+function backupPage() {
+  return [
+    pageHeader(t('Backup'), t('Profile, Projektzuordnungen und MCP-Server sichern oder auf einen anderen Rechner übertragen.')),
+    h('div', { class: 'tiles' },
+      h('section', { class: 'card tile' },
+        h('span', { class: 'tile-icon' }, icon('upload')),
+        h('h2', null, t('Backup exportieren')),
+        h('p', { class: 'muted' }, view.allowKeyExport
+          ? t('Enthält Profile, Projektzuordnungen und Keys – verschlüsselt mit AES-256-GCM.')
+          : t('Enthält Profile und Projektzuordnungen. Keys sind laut Firmenrichtlinie vom Export ausgenommen.')),
+        button(t('Backup exportieren …'), exportDialog, { cls: 'primary', disabled: !view.profiles.length })),
+      h('section', { class: 'card tile' },
+        h('span', { class: 'tile-icon' }, icon('download')),
+        h('h2', null, t('Backup importieren')),
+        h('p', { class: 'muted' }, t('Profile und Keys aus dem Backup überschreiben vorhandene mit gleicher ID. Projekte werden zugeordnet, sofern ihr Ordner auf diesem Rechner existiert.')),
+        button(t('Backup importieren …'), importDialog))),
+  ];
 }
 
 // MARK: Dialogs
@@ -614,8 +929,8 @@ function replaceKeyDialog(profile) {
   document.getElementById('k-key')?.focus();
 }
 
-function addProjectDialog(preselected) {
-  const s = { picked: null, profileId: preselected ?? (view.profiles.length === 1 ? view.profiles[0].id : '') };
+function addProjectDialog(preselected, picked = null) {
+  const s = { picked, profileId: preselected ?? (view.profiles.length === 1 ? view.profiles[0].id : '') };
   const dlg = openDialog(t('Projekt zuordnen'), (close) => {
     const existing = s.picked?.existingProfileId;
     return {
@@ -690,49 +1005,6 @@ function importDialog() {
   restoreCaret(dlg);
 }
 
-function claudeSettingsDialog() {
-  let selected = view.globalProfileId ?? '';
-  const dlg = openDialog(t('Claude-Einstellungen prüfen'), (close) => {
-    const findings = view.globalFindings;
-    const needsRepair = findings.some((f) => f.severity === 'error' || f.id.startsWith('plaintext-'));
-    const health = view.globalHealth;
-    const unchanged = (selected || null) === (view.globalProfileId ?? null) && health?.state === 'active';
-    const healthText = !health ? null : {
-      active: t('Standardprofil ist aktiv.'),
-      notApplied: t('Standardprofil fehlt in der Datei – „Übernehmen“ wählen.'),
-      drifted: t('Abweichung in %@ – „Übernehmen“ wählen.', health.keys.join(', ')),
-      folderMissing: t('Datei nicht gefunden.'),
-    }[health.state];
-    const severityIcon = { error: ['error', 'red'], warning: ['warning', 'orange'], info: ['info', 'muted'] };
-    return {
-      body: [
-        h('h2', null, t('Claude-Einstellungen prüfen')),
-        h('fieldset', null, h('legend', { class: 'mono' }, view.userSettingsPath),
-          findings.every((f) => f.severity === 'info') && h('div', { class: 'finding green' }, icon('check'), t('Keine Probleme gefunden.')),
-          findings.map((f) => h('div', { class: `finding ${severityIcon[f.severity][1]}` }, icon(severityIcon[f.severity][0]), h('span', { class: 'selectable' }, f.message))),
-          h('div', { class: 'line' },
-            button(t('Erneut prüfen'), () => call('refresh_all')),
-            button(view.userSettingsExists ? t('Reparieren') : t('Erzeugen'), () => call('repair_user_settings'),
-              { disabled: view.userSettingsExists && !needsRepair }),
-            h('span', { class: 'spacer' }),
-            button(revealLabel(), () => call('reveal', { path: view.userSettingsFullPath }), { iconName: 'folder', disabled: !view.userSettingsExists })),
-          h('div', { class: 'section-note' }, t('„Reparieren“ macht die Datei gültig, entfernt Klartext-Keys und wandelt Werte in „env“ in Text um. Vorher legt KeyZapper eine Sicherung settings.json.keyzapper-<Zeit>.bak an.'))),
-        h('fieldset', null, h('legend', null, t('Standardprofil für alle übrigen Ordner')),
-          field(t('Standardprofil'), h('select', { onchange: (e) => { selected = e.target.value; dlg.render(); } },
-            h('option', { value: '', selected: !selected }, t('Keins')),
-            view.profiles.map((p) => h('option', { value: p.id, selected: p.id === selected }, profileLabel(p)))), 'c-profile'),
-          healthText && h('div', { class: `finding ${health.state === 'active' ? 'green' : 'orange'}` },
-            icon(health.state === 'active' ? 'check' : 'warning'), healthText),
-          h('div', { class: 'line' }, h('span', { class: 'spacer' }),
-            button(t('Übernehmen'), async () => { if (!selected || await ensureLogin(selected)) call('set_global_profile', { profileId: selected || null }); },
-              { disabled: unchanged || (!selected && !view.globalProfileId) || view.disabled })),
-          h('div', { class: 'section-note' }, t('Trägt das Profil in ~/.claude/settings.json ein. Claude Code nutzt es in allen Ordnern ohne eigene Zuordnung, statt auf einen Klartext-Key oder die normale Anmeldung zurückzufallen. Zugeordnete Projekte behalten ihr eigenes Profil.'))),
-      ],
-      actions: [button(t('Fertig'), close, { cls: 'primary' })],
-    };
-  }, { live: true, wide: true });
-}
-
 const agentGoals = () => [
   ['cost', t('Kosteneffizienz'), t('Wenig Tokens und Tool-Aufrufe, kleine Diffs, günstigstes geeignetes Modell')],
   ['quality', t('Qualität & Korrektheit'), t('Gründlich prüfen, Tests und Builds, Diff vor Abschluss reviewen')],
@@ -760,7 +1032,7 @@ function agentsDialog(binding, profile) {
     if (s.scan?.hasAgentsFile && !(await confirmDialog(t('AGENTS.md ersetzen?'),
       t('Die vorhandene AGENTS.md in „%@“ wird überschrieben.', binding.name), t('Ersetzen')))) return;
     const result = await call('write_agents_file', { bindingId: binding.id, content: s.content });
-    if (result?.[0]) { close(); window.scrollTo(0, 0); }
+    if (result?.[0]) close();
   };
   const scanSummary = () => {
     if (s.scanError) return h('div', { class: 'error-text' }, s.scanError);
@@ -829,31 +1101,81 @@ function agentsDialog(binding, profile) {
 // MARK: MCP servers
 
 const MCP_TRANSPORTS = () => [['stdio', t('Lokaler Prozess (stdio)')], ['http', 'HTTP'], ['sse', t('SSE (veraltet)')]];
+const transportLabel = (transport) => ({ stdio: t('Lokal'), http: 'HTTP', sse: 'SSE' }[transport] ?? transport);
 /** One-line summary of how a server is started or reached. */
 const mcpSummary = (s) => (s.transport === 'stdio' ? [s.command, ...s.argsText.split('\n')].filter(Boolean).join(' ') : s.url);
 
-function mcpServersDialog() {
-  const remove = async (server) => {
+/** Ready-made entries from the Claude Code documentation; secrets stay `${NAME}` references. */
+const MCP_TEMPLATES = () => {
+  const browserLogin = t('Anmeldung beim ersten Aufruf von „/mcp“ in Claude Code im Browser.');
+  return [
+    { name: 'github', title: 'GitHub', color: '#24292f', description: t('Issues, Pull Requests und Code'), transport: 'http',
+      url: 'https://api.githubcopilot.com/mcp/', headersText: 'Authorization: Bearer ${GITHUB_PAT}',
+      note: t('Einen GitHub Personal Access Token als Umgebungsvariable GITHUB_PAT setzen.') },
+    { name: 'notion', title: 'Notion', color: '#191919', description: t('Seiten und Datenbanken'), transport: 'http', url: 'https://mcp.notion.com/mcp', note: browserLogin },
+    { name: 'sentry', title: 'Sentry', color: '#362d59', description: t('Fehler und Performance'), transport: 'http', url: 'https://mcp.sentry.dev/mcp', note: browserLogin },
+    { name: 'asana', title: 'Asana', color: '#f06a6a', description: t('Aufgaben und Projekte'), transport: 'sse', url: 'https://mcp.asana.com/sse', note: browserLogin },
+    { name: 'stripe', title: 'Stripe', color: '#635bff', description: t('Zahlungen und Kunden'), transport: 'http', url: 'https://mcp.stripe.com', note: browserLogin },
+    { name: 'playwright', title: 'Playwright', color: '#2ead33', description: t('Browser steuern und testen'), transport: 'stdio',
+      command: 'npx', argsText: '@playwright/mcp@latest', note: t('Startet einen lokalen Browser. Benötigt Node.js.') },
+    { name: 'postgres', title: 'PostgreSQL', color: '#336791', description: t('Datenbank abfragen'), transport: 'stdio',
+      command: 'npx', argsText: '-y\n@bytebase/dbhub\n--dsn\n${DATABASE_URL}',
+      note: t('Die Verbindungs-URL als Umgebungsvariable DATABASE_URL setzen, am besten mit einem Nur-Lese-Benutzer. Benötigt Node.js.') },
+    { name: 'airtable', title: 'Airtable', color: '#2d7ff9', description: t('Tabellen lesen und schreiben'), transport: 'stdio',
+      command: 'npx', argsText: '-y\nairtable-mcp-server', envText: 'AIRTABLE_API_KEY=${AIRTABLE_API_KEY}',
+      note: t('Einen Airtable-API-Key als Umgebungsvariable AIRTABLE_API_KEY setzen. Benötigt Node.js.') },
+  ];
+};
+
+/** Switches one server on or off for one project; the view brings back the old state if writing fails. */
+function setProjectServer(binding, serverId, on) {
+  const ids = binding.mcpServerIds.filter((id) => id !== serverId);
+  if (on) ids.push(serverId);
+  return call('set_project_mcp_servers', { bindingId: binding.id, serverIds: ids });
+}
+
+function toggleChip(label, checked, onChange, { disabled, color } = {}) {
+  return h('label', { class: `toggle-chip${checked ? ' on' : ''}${disabled ? ' disabled' : ''}`, style: color ? `--profile: ${color}` : null },
+    h('input', { type: 'checkbox', role: 'switch', checked, disabled, onchange: (e) => onChange(e.target.checked) }),
+    h('span', { class: 'dot', 'aria-hidden': 'true' }), label);
+}
+
+function mcpServerCard(server) {
+  const remove = async () => {
     const message = server.usedBy.length ? t('Der Server wird aus %@ Projekt(en) entfernt.', server.usedBy.length) : t('Der Server wird gelöscht.');
     if (await confirmDialog(t('MCP-Server „%@“ löschen?', server.name), message, t('Löschen'))) call('delete_mcp_server', { serverId: server.id });
   };
-  openDialog(t('MCP-Server'), (close) => ({
-    body: [
-      h('h2', null, t('MCP-Server')),
-      h('div', { class: 'section-note' },
-        t('MCP-Server geben Claude Code zusätzliche Werkzeuge, z. B. GitHub, Datenbanken oder einen Browser. Am Projekt (🔌) wählst du aus, welche Server dort gelten; KeyZapper schreibt sie in die .mcp.json des Repositorys und schaltet sie frei, damit Claude Code sie ohne Rückfrage lädt.')),
-      !view.mcpServers.length ? h('div', { class: 'muted' }, t('Noch keine MCP-Server eingerichtet.'))
-        : h('div', { class: 'project-list' }, view.mcpServers.map((s) => h('div', { class: 'project' },
-          h('div', { class: 'project-main' },
-            h('div', { class: 'project-name' },
-              h('strong', null, s.name, ' ', h('span', { class: 'badge' }, s.transport)),
-              h('span', { class: 'mono', title: mcpSummary(s) }, `‎${mcpSummary(s)}‎`)),
-            button(t('Bearbeiten'), () => mcpServerEditor(s), { iconName: 'pencil', iconOnly: true }),
-            button(t('Löschen'), () => remove(s), { iconName: 'trash', iconOnly: true, cls: 'danger' })),
-          s.usedBy.length > 0 && h('div', { class: 'note muted' }, t('Genutzt von: %@', s.usedBy.join(', ')))))),
-    ],
-    actions: [button(t('Neuer Server'), () => mcpServerEditor(null), { iconName: 'plus', cls: 'left' }), button(t('Fertig'), close, { cls: 'primary' })],
-  }), { live: true, wide: true });
+  const template = MCP_TEMPLATES().find((tpl) => tpl.name === server.name);
+  const menu = () => [[t('Bearbeiten'), () => mcpServerEditor(server), { iconName: 'pencil' }], '-', [t('Löschen'), remove, { iconName: 'trash', danger: true }]];
+  return h('section', { class: 'card', 'aria-label': server.name, oncontextmenu: contextMenu(menu) },
+    h('div', { class: 'card-head' },
+      h('span', { class: 'avatar', style: `--profile: ${template?.color ?? 'var(--accent-fill)'}`, 'aria-hidden': 'true' }, (template?.title ?? server.name).slice(0, 1).toUpperCase()),
+      h('div', { class: 'card-title' },
+        h('h2', null, server.name, h('span', { class: 'badge' }, transportLabel(server.transport)), server.oauthClientId && h('span', { class: 'badge' }, 'OAuth')),
+        h('div', { class: 'mono muted selectable', title: mcpSummary(server) }, mcpSummary(server))),
+      button(t('Bearbeiten'), () => mcpServerEditor(server), { iconName: 'pencil', iconOnly: true }),
+      menuButton(t('Weitere Aktionen'), menu)),
+    view.bindings.length
+      ? h('div', { class: 'toggle-row' }, h('span', { class: 'muted small' }, t('Aktiv in')),
+        view.bindings.map((b) => toggleChip(b.name, b.mcpServerIds.includes(server.id), (on) => setProjectServer(b, server.id, on),
+          { disabled: b.status?.health.state === 'folderMissing', color: colorOf(b.profileId) })))
+      : h('div', { class: 'muted small' }, t('Noch keine Projekte zugeordnet.')));
+}
+
+function mcpPage() {
+  const installed = new Set(view.mcpServers.map((s) => s.name));
+  const templates = MCP_TEMPLATES().filter((tpl) => !installed.has(tpl.name));
+  return [
+    pageHeader(t('MCP-Server'), t('Zusätzliche Werkzeuge für Claude Code, z. B. GitHub, Datenbanken oder ein Browser. Je Projekt einschalten – KeyZapper schreibt sie in die .mcp.json des Repositorys und schaltet sie frei.'),
+      button(t('Neuer Server'), () => mcpServerEditor(null), { iconName: 'plus', cls: 'primary' })),
+    view.mcpServers.map(mcpServerCard),
+    templates.length > 0 && h('section', { class: 'templates' },
+      h('h3', null, view.mcpServers.length ? t('Weitere Vorlagen') : t('Mit einer Vorlage starten')),
+      h('div', { class: 'template-grid' }, templates.map((tpl) => h('button', { type: 'button', class: 'template', onclick: () => mcpServerEditor(null, tpl) },
+        h('span', { class: 'avatar', style: `--profile: ${tpl.color}`, 'aria-hidden': 'true' }, tpl.title.slice(0, 1)),
+        h('span', { class: 'template-text' }, h('strong', null, tpl.title), h('span', { class: 'muted small' }, tpl.description)),
+        h('span', { class: 'badge' }, transportLabel(tpl.transport)))))),
+  ];
 }
 
 /** Lines that are not `NAME=value` (environment) or `Name: value` (headers). */
@@ -866,11 +1188,13 @@ function invalidPairLines(text, separator) {
   });
 }
 
-function mcpServerEditor(existing) {
-  const s = { name: existing?.name ?? '', transport: existing?.transport ?? 'stdio', command: existing?.command ?? '', argsText: existing?.argsText ?? '',
-    envText: existing?.envText ?? '', url: existing?.url ?? '', headersText: existing?.headersText ?? '', oauthClientId: existing?.oauthClientId ?? '',
-    oauthCallbackPort: existing?.oauthCallbackPort ?? '', oauthScopes: existing?.oauthScopes ?? '', saving: false };
-  const dlg = openDialog(existing ? t('Bearbeiten') : t('Neuer Server'), (close) => {
+/** Editor for a new server (optionally prefilled from a template) or an existing one. */
+function mcpServerEditor(existing, template = null) {
+  const base = existing ?? template ?? {};
+  const s = { name: base.name ?? '', transport: base.transport ?? 'http', command: base.command ?? '', argsText: base.argsText ?? '',
+    envText: base.envText ?? '', url: base.url ?? '', headersText: base.headersText ?? '', oauthClientId: base.oauthClientId ?? '',
+    oauthCallbackPort: base.oauthCallbackPort ?? '', oauthScopes: base.oauthScopes ?? '', saving: false };
+  const dlg = openDialog(existing ? t('Bearbeiten') : template?.title ?? t('Neuer Server'), (close) => {
     const update = (key) => (value) => { s[key] = value; dlg.render(); };
     const nameOk = /^[A-Za-z0-9_.-]+$/.test(s.name.trim());
     const duplicate = view.mcpServers.some((o) => o.name === s.name.trim() && o.id !== existing?.id);
@@ -886,7 +1210,8 @@ function mcpServerEditor(existing) {
     };
     return {
       body: [
-        h('h2', null, existing ? existing.name : t('Neuer Server')),
+        h('h2', null, existing ? existing.name : template ? t('%@ einrichten', template.title) : t('Neuer Server')),
+        template?.note && h('div', { class: 'note' }, icon('info', 'accent'), template.note),
         h('fieldset', null,
           field(t('Name'), input({ value: s.name, placeholder: 'github' }, update('name')), 'm-name'),
           s.name.trim() && !nameOk && h('div', { class: 'field-note error-text' }, t('Nur Buchstaben, Ziffern, „-“, „_“ und „.“')),
@@ -925,24 +1250,23 @@ function mcpServerEditor(existing) {
   document.getElementById('m-name')?.focus();
 }
 
-/** Chooses which of the configured servers a project uses. */
+/** Switches the configured servers on or off for one project; each switch is written right away. */
 function projectMcpDialog(binding) {
-  const selected = new Set(binding.mcpServerIds);
-  const dlg = openDialog(t('MCP-Server für „%@“', binding.name), (close) => {
-    const current = view.bindings.find((b) => b.id === binding.id)?.mcpServerIds ?? [];
-    const unchanged = current.length === selected.size && current.every((id) => selected.has(id));
+  openDialog(t('MCP-Server für „%@“', binding.name), (close) => {
+    const current = view.bindings.find((b) => b.id === binding.id) ?? binding;
     return {
       body: [
         h('h2', null, t('MCP-Server für „%@“', binding.name)),
         !view.mcpServers.length ? h('div', { class: 'muted' }, t('Noch keine MCP-Server eingerichtet.'))
-          : h('fieldset', null, h('legend', null, t('Server auswählen')), view.mcpServers.map((s) => h('label', { class: 'check' },
-            h('input', { type: 'checkbox', checked: selected.has(s.id), onchange: (e) => { if (e.target.checked) selected.add(s.id); else selected.delete(s.id); dlg.render(); } }),
-            h('span', null, h('strong', null, s.name), ' ', h('span', { class: 'mono muted small' }, mcpSummary(s)))))),
+          : h('div', { class: 'switch-list' }, view.mcpServers.map((s) => h('label', { class: 'switch-row' },
+            h('span', { class: 'switch-text' }, h('strong', null, s.name, h('span', { class: 'badge' }, transportLabel(s.transport))),
+              h('span', { class: 'mono muted small' }, mcpSummary(s))),
+            h('input', { type: 'checkbox', role: 'switch', checked: current.mcpServerIds.includes(s.id),
+              onchange: (e) => setProjectServer(current, s.id, e.target.checked) })))),
         h('div', { class: 'section-note' },
           t('KeyZapper schreibt die gewählten Server in die .mcp.json des Repositorys (nicht eingecheckt) und schaltet sie in .claude/settings.local.json frei. Claude Code lädt sie in diesem Repository dann automatisch.')),
       ],
-      actions: [button(t('MCP-Server verwalten …'), mcpServersDialog, { cls: 'left' }), button(t('Abbrechen'), close),
-        button(t('Übernehmen'), () => { close(); call('set_project_mcp_servers', { bindingId: binding.id, serverIds: [...selected] }); }, { cls: 'primary', disabled: unchanged })],
+      actions: [button(t('MCP-Server verwalten …'), () => { close(); navigate('mcp'); }, { cls: 'left' }), button(t('Fertig'), close, { cls: 'primary' })],
     };
   }, { live: true });
 }
@@ -989,7 +1313,9 @@ function howItWorksDialog() {
         hint('key', t('Neuer Key? Einmal „Ändern“ – alle zugeordneten Projekte nutzen ihn automatisch. Neue Sitzungen sofort, laufende nach spätestens 5 Minuten.')),
         hint('folder', t('Die Zuordnung gilt für das ganze Repository samt Unterordnern und Worktrees. Außerhalb zugeordneter Ordner nutzt Claude die normale Anmeldung.')),
         hint('shield', t('Fehlt ein Key, schlagen Anfragen fehl. Es wird nie ein anderer Key verwendet.')),
-        hint('plug', t('MCP-Server einmal einrichten (🔌 in der Leiste) und je Projekt auswählen – Claude Code lädt sie dort automatisch.'))),
+        hint('plug', t('MCP-Server einmal unter „MCP-Server“ einrichten und je Projekt einschalten – Claude Code lädt sie dort automatisch.')),
+        hint('bolt', isMac() ? t('Schließt du das Fenster, läuft KeyZapper in der Menüleiste weiter: Budgets im Blick und Profile je Projekt wechseln.')
+          : t('Schließt du das Fenster, läuft KeyZapper im Infobereich der Taskleiste weiter: Budgets im Blick und Profile je Projekt wechseln.'))),
     ],
     actions: [button(t('Verstanden'), close, { cls: 'primary' })],
   }), { wide: true });
@@ -1036,6 +1362,43 @@ document.addEventListener('mouseover', (event) => {
 });
 for (const type of ['mousedown', 'keydown', 'scroll']) document.addEventListener(type, hideTip, true);
 
+// MARK: Drag & drop
+
+/** Folders dragged from Finder or Explorer: onto a profile card they are bound to it, anywhere else "Projekt zuordnen" opens. */
+let dropTarget = null;
+
+function profileCardAt(position) {
+  const scale = window.devicePixelRatio || 1;
+  return document.elementFromPoint(position.x / scale, position.y / scale)?.closest('[data-profile-id]') ?? null;
+}
+
+function markDrop(position) {
+  const card = position && !document.querySelector('dialog[open]') ? profileCardAt(position) : null;
+  document.body.classList.toggle('dragging', !!position);
+  if (card === dropTarget) return;
+  dropTarget?.classList.remove('drop-target');
+  dropTarget = card;
+  dropTarget?.classList.add('drop-target');
+}
+
+async function dropped({ paths, position }) {
+  const card = profileCardAt(position);
+  markDrop(null);
+  if (!paths?.length || !view.profiles.length || view.disabled || document.querySelector('dialog[open]')) return;
+  const profileId = card?.dataset.profileId;
+  if (!profileId) {
+    const picked = await call('inspect_folder', { path: paths[0] });
+    if (picked) addProjectDialog(null, picked);
+    return;
+  }
+  if (!(await ensureLogin(profileId))) return;
+  for (const path of paths) {
+    const picked = await call('inspect_folder', { path });
+    if (!picked) break;
+    await call('bind', { folder: picked.folder, profileId });
+  }
+}
+
 // MARK: Start
 
 async function start() {
@@ -1043,6 +1406,10 @@ async function start() {
   english = await invoke('translations');
   setView(await invoke('get_view'));
   await listen('changed', async () => setView(await invoke('get_view')));
+  await listen('tauri://drag-enter', (e) => markDrop(e.payload.position));
+  await listen('tauri://drag-over', (e) => markDrop(e.payload.position));
+  await listen('tauri://drag-leave', () => markDrop(null));
+  await listen('tauri://drag-drop', (e) => dropped(e.payload));
 }
 
 start();

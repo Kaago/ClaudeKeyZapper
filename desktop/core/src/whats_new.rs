@@ -19,6 +19,9 @@ fn notes() -> Vec<(&'static str, Vec<String>)> {
         (
             "1.4.0",
             vec![
+                l!("Neues Design: Seitenleiste, Budgetbalken mit Ampel, Projektstatus auf einen Blick mit „Alle reparieren“ – und Projektordner einfach auf ein Profil ziehen."),
+                l!("Nach dem Schließen läuft KeyZapper in der Menüleiste bzw. im Infobereich weiter: Budgets im Blick und das Profil je Projekt mit einem Klick wechseln."),
+                l!("MCP-Server aus Vorlagen wie GitHub, Notion oder Sentry anlegen und je Projekt per Schalter einschalten. Unter Windows starten npx-Server automatisch über cmd /c."),
                 l!("MCP-Server einrichten und je Projekt auswählen: KeyZapper schreibt sie in die .mcp.json des Repositorys und schaltet sie frei, Claude Code lädt sie dort automatisch."),
                 l!("Updates installieren sich nach Bestätigung mit Administratorrechten selbst, danach startet KeyZapper automatisch neu."),
                 l!("Nach einem Update zeigt KeyZapper einmal, was neu ist."),
