@@ -463,10 +463,22 @@ impl Model {
         }
     }
 
-    /// Profiles that have a key, with endpoint and key, for gateway calls outside the lock.
-    pub fn keyed_profiles(&self) -> Vec<(String, String, String)> {
+    /// Profiles whose budget the gateway reports, with the stored key; signed-in SSO profiles come without (their token is fetched when needed).
+    pub fn budget_profiles(&self) -> Vec<(Profile, Option<String>)> {
         let keys = self.keys.all().unwrap_or_default();
-        self.state.profiles.iter().filter_map(|p| Some((p.id.clone(), p.endpoint.clone(), keys.get(&p.id)?.clone()))).collect()
+        let tokens = self.tokens.all().unwrap_or_default();
+        self.state
+            .profiles
+            .iter()
+            .filter_map(|p| {
+                if p.is_sso() {
+                    let signed_in = !self.sso_expired.contains(&p.id) && tokens.get(&p.id).is_some_and(|t| !t.refresh_token.is_empty());
+                    signed_in.then(|| (p.clone(), None))
+                } else {
+                    Some((p.clone(), Some(keys.get(&p.id)?.clone())))
+                }
+            })
+            .collect()
     }
 
     // MARK: Bindings
@@ -1150,7 +1162,7 @@ impl Model {
                         managed: self.config.is_managed(&p.id),
                         has_key: key.is_some(),
                         key_hint: key.map(|k| masked_hint(k)),
-                        budget: key.filter(|_| !p.is_sso()).and(self.budgets.get(&p.id)).map(|b| BudgetView {
+                        budget: self.budgets.get(&p.id).filter(|_| if p.is_sso() { session.is_some() && !self.sso_expired.contains(&p.id) } else { key.is_some() }).map(|b| BudgetView {
                             spend: b.spend,
                             max_budget: b.max_budget,
                             remaining: b.max_budget.map(|_| b.remaining()),

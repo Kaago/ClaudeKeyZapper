@@ -481,7 +481,7 @@ function relativeTime(date) {
 
 const dateTimeText = (date) => new Intl.DateTimeFormat(locale(), { dateStyle: 'medium', timeStyle: 'short' }).format(date);
 
-/** Budget bar: green below 70 % used, orange below 90 %, red above. */
+/** Budget bar: shrinks to what is left; green below 70 % used, orange below 90 %, red above. */
 function budgetMeter(budget) {
   const reset = budget.resetAt && parseResetDate(budget.resetAt);
   const resetText = reset && relativeTime(reset);
@@ -502,7 +502,7 @@ function budgetMeter(budget) {
       h('span', { class: 'muted small' }, t('%@ % verbraucht', percent)),
       resetInfo && h('span', { class: 'muted small' }, '·'), resetInfo),
     h('div', { class: 'meter', role: 'meter', 'aria-label': t('Budget verbraucht'), 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': percent },
-      h('div', { class: `meter-fill ${tone}`, style: `width: ${(used * 100).toFixed(1)}%` })));
+      h('div', { class: `meter-fill ${tone}`, style: `width: ${((1 - used) * 100).toFixed(1)}%` })));
 }
 
 // MARK: Claude subscription
@@ -512,10 +512,11 @@ const limitLabel = (limit) => ({ session: t('Aktuelle Sitzung'), weekly: t('Woch
 /** Colors like the budget bar: green below 70 % used, orange below 90 %, red above. */
 const usageTone = (used) => (used >= 0.9 ? 'red' : used >= 0.7 ? 'orange' : 'green');
 
-function meterBar(used, label) {
+/** `fill` is the bar's share: what is used for subscription limits, what is left for budgets. */
+function meterBar(used, label, fill = used) {
   const percent = Math.round(used * 100);
   return h('div', { class: 'meter', role: 'meter', 'aria-label': label, 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': percent },
-    h('div', { class: `meter-fill ${usageTone(used)}`, style: `width: ${(used * 100).toFixed(1)}%` }));
+    h('div', { class: `meter-fill ${usageTone(used)}`, style: `width: ${(fill * 100).toFixed(1)}%` }));
 }
 
 /** One limit of the subscription as a bar; a limit whose reset has passed counts as free again. `compact` puts the reset below the bar. */
@@ -613,7 +614,7 @@ function profileCard(profile) {
         tierModels(profile) && h('div', { class: 'mono muted' }, tierModels(profile))),
       menuButton(t('Weitere Aktionen'), menu)),
     credentialRow(profile, testConnection, check),
-    profile.hasKey && profile.budget && budgetMeter(profile.budget),
+    profile.budget && budgetMeter(profile.budget),
     profile.subscription && subscriptionUsage(),
     profile.hasKey && profile.killers.length > 0 && h('div', { class: 'line orange small' }, icon('flame'),
       t('Wird vom Budget-Killer in „%@“ verbrannt', profile.killers.join(', '))),
@@ -1413,15 +1414,14 @@ function popoverProfile(profile) {
   const status = (cls, text) => h('div', { class: 'budget-text' }, name, h('span', { class: 'spacer' }), h('span', { class: `small ${cls}` }, text));
   const budget = profile.budget;
   if (!credentialOk(profile)) return status('red', profile.sso ? ssoStateText(profile) : t('Kein Key'));
-  if (profile.sso) return status('green', t('Angemeldet'));
-  if (!budget) return status('muted', t('Budget nicht verfügbar'));
+  if (!budget) return profile.sso ? status('green', t('Angemeldet')) : status('muted', t('Budget nicht verfügbar'));
   if (budget.maxBudget == null) return status('muted', t('%@ verbraucht', money(budget.spend)));
   const used = budget.maxBudget > 0 ? Math.min(1, Math.max(0, budget.spend / budget.maxBudget)) : 1;
   const reset = budget.resetAt && parseResetDate(budget.resetAt);
   const resetText = reset && relativeTime(reset);
   return h('div', { class: 'popover-row' },
     h('div', { class: 'budget-text' }, name, h('span', { class: 'spacer' }), h('strong', { class: usageTone(used) }, t('%@ übrig', money(budget.remaining ?? 0)))),
-    meterBar(used, t('Budget verbraucht')),
+    meterBar(used, t('Budget verbraucht'), 1 - used),
     h('div', { class: 'budget-text muted small' }, t('%@ % von %@ verbraucht', Math.round(used * 100), money(budget.maxBudget)),
       h('span', { class: 'spacer' }), resetText && h('span', { title: dateTimeText(reset) }, t('Reset %@', resetText))));
 }

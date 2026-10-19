@@ -87,19 +87,23 @@ fn refresh(app: &AppHandle) {
     });
 }
 
-/// Loads the budget of every stored key from the gateway (LiteLLM `/key/info`).
+/// Loads the budget of every stored key and signed-in SSO profile from the gateway (LiteLLM `/key/info`, `/user/info`).
 fn refresh_budgets(app: &AppHandle, only: Option<&str>) {
-    let profiles = with_model(app, |m| m.keyed_profiles());
-    for (id, endpoint, key) in profiles.into_iter().filter(|p| only.is_none_or(|o| o == p.0)) {
+    let profiles = with_model(app, |m| m.budget_profiles());
+    for (profile, key) in profiles.into_iter().filter(|p| only.is_none_or(|o| o == p.0.id)) {
         let app = app.clone();
         std::thread::spawn(move || {
-            let budget = gateway::budget(&endpoint, &key, Duration::from_secs(10)).ok();
+            let timeout = Duration::from_secs(10);
+            let budget = match key {
+                Some(key) => gateway::budget(&profile.endpoint, &key, timeout).ok(),
+                None => with_model(&app, |m| m.sso_token(&profile)).ok().and_then(|token| gateway::sso_budget(&profile.endpoint, &token, timeout).ok()),
+            };
             with_model(&app, |m| match budget {
                 Some(b) => {
-                    m.budgets.insert(id, b);
+                    m.budgets.insert(profile.id, b);
                 }
                 None => {
-                    m.budgets.remove(&id);
+                    m.budgets.remove(&profile.id);
                 }
             });
             changed(&app);
