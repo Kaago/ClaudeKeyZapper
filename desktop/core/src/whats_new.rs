@@ -17,6 +17,13 @@ pub struct Release {
 fn notes() -> Vec<(&'static str, Vec<String>)> {
     vec![
         (
+            "1.4.2",
+            vec![
+                l!("Budgetbalken zeigen jetzt, was übrig ist, und werden mit dem Verbrauch kürzer."),
+                l!("SSO-Profile zeigen jetzt ihr verbleibendes Budget, z. B. an LiteLLM – ohne eigenen Key das Budget des angemeldeten Nutzers."),
+            ],
+        ),
+        (
             "1.4.1",
             vec![
                 l!("Claude-Abo als Profiltyp: Projekte nutzen dein Claude Pro, Max oder Team über die Anmeldung von Claude Code – ohne Gateway und Key."),
