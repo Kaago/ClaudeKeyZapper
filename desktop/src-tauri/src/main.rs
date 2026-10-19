@@ -6,7 +6,7 @@ mod tray;
 
 use keyzapper_core::errors::Error;
 use keyzapper_core::gateway::CheckResult;
-use keyzapper_core::{agents, backup, clipboard, gateway, l, legacy_keychain, oidc, update};
+use keyzapper_core::{agents, backup, clipboard, gateway, l, legacy_keychain, oidc, subscription, update};
 use model::{McpServerInput, Model, ProfileInput, View};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -14,6 +14,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
+use window_vibrancy::NSVisualEffectMaterial;
 
 struct Shared(Mutex<Model>);
 
@@ -37,6 +38,7 @@ fn changed(app: &AppHandle) {
 
 /// Brings the main window back, e.g. from the tray or the Dock.
 fn show_window(app: &AppHandle) {
+    tray::hide_popover(app);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
@@ -46,12 +48,12 @@ fn show_window(app: &AppHandle) {
 
 /// Puts the system's translucent material behind the window: vibrancy on macOS, Mica on Windows 11.
 /// False where it is not available (Windows 10, Linux); the page then paints its own background.
-fn apply_window_material(window: &tauri::WebviewWindow) -> bool {
-    use window_vibrancy::{NSVisualEffectMaterial, NSVisualEffectState};
+fn apply_window_material(window: &tauri::WebviewWindow, material: window_vibrancy::NSVisualEffectMaterial, radius: Option<f64>) -> bool {
+    use window_vibrancy::NSVisualEffectState;
     if cfg!(windows) {
         window_vibrancy::apply_mica(window, None).is_ok()
     } else {
-        window_vibrancy::apply_vibrancy(window, NSVisualEffectMaterial::Sidebar, Some(NSVisualEffectState::FollowsWindowActiveState), None).is_ok()
+        window_vibrancy::apply_vibrancy(window, material, Some(NSVisualEffectState::FollowsWindowActiveState), radius).is_ok()
     }
 }
 
@@ -105,6 +107,32 @@ fn refresh_budgets(app: &AppHandle, only: Option<&str>) {
     }
 }
 
+/// Plan and usage limits of the Claude subscription. Claude Code's login is only read while a subscription profile exists.
+fn refresh_subscription(app: &AppHandle) {
+    let Some(previous) = with_model(app, |m| {
+        if !m.has_subscription_profile() {
+            m.subscription = None;
+            return None;
+        }
+        Some(m.subscription.clone())
+    }) else {
+        return;
+    };
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let status = subscription::status(previous.as_ref(), Duration::from_secs(10));
+        with_model(&app, |m| m.subscription = Some(status));
+        changed(&app);
+    });
+}
+
+/// Everything the tray popover shows: key budgets and the subscription's limits.
+fn refresh_usage(app: &AppHandle) {
+    with_model(app, |m| m.usage_refreshed_at = Some(std::time::Instant::now()));
+    refresh_budgets(app, None);
+    refresh_subscription(app);
+}
+
 /// Stable releases only, unless `beta` was asked for or a beta is installed (testers get the next beta too).
 fn check_updates(app: &AppHandle, user_initiated: bool, beta: bool) {
     let (enabled, version) = with_model(app, |m| (m.config.update_check_enabled, m.app_version.clone()));
@@ -135,12 +163,12 @@ const BACKGROUND_REFRESH: Duration = Duration::from_secs(10 * 60);
 /// Start-up work that may take a while: status, budgets, updates, CLI versions, keys left in the keychain.
 fn start_background(app: &AppHandle) {
     refresh(app);
-    refresh_budgets(app, None);
+    refresh_usage(app);
     let handle = app.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(BACKGROUND_REFRESH);
         refresh(&handle);
-        refresh_budgets(&handle, None);
+        refresh_usage(&handle);
     });
     let handle = app.clone();
     std::thread::spawn(move || check_updates(&handle, false, false));
@@ -177,7 +205,7 @@ fn get_view(app: AppHandle) -> View {
 async fn refresh_all(app: AppHandle) -> View {
     blocking(move || {
         refresh(&app);
-        refresh_budgets(&app, None);
+        refresh_usage(&app);
         view(&app)
     })
     .await
@@ -211,6 +239,7 @@ async fn save_profile(app: AppHandle, input: ProfileInput) -> (bool, View) {
         let ok = with_model(&app, |m| m.save_profile_input(input));
         refresh(&app);
         refresh_budgets(&app, None);
+        refresh_subscription(&app);
         (ok, view(&app))
     })
     .await
@@ -262,6 +291,18 @@ struct CheckOutcome {
 #[tauri::command]
 async fn test_connection(app: AppHandle, profile_id: String) -> Result<CheckOutcome, String> {
     blocking(move || {
+        if let Some(previous) = with_model(&app, |m| m.state.profile(&profile_id).filter(|p| p.is_subscription()).map(|_| m.subscription.clone())) {
+            let status = subscription::status(previous.as_ref(), Duration::from_secs(10));
+            let outcome = match (&status.problem, &status.plan) {
+                _ if !status.logged_in => CheckOutcome { success: false, message: l!("Nicht bei Claude angemeldet – in Claude Code „/login“ ausführen.") },
+                (Some(problem), _) => CheckOutcome { success: false, message: problem.clone() },
+                (None, Some(plan)) => CheckOutcome { success: true, message: l!("Bei Claude angemeldet (%@).", plan) },
+                (None, None) => CheckOutcome { success: true, message: l!("Bei Claude angemeldet.") },
+            };
+            with_model(&app, |m| m.subscription = Some(status));
+            changed(&app);
+            return Ok(outcome);
+        }
         let (endpoint, models, key, sso) = with_model(&app, |m| {
             let profile = m.state.profile(&profile_id).cloned().ok_or_else(|| l!("Unbekanntes Profil: %@", profile_id))?;
             let key = if profile.is_sso() { m.sso_token(&profile) } else { m.keys.read(&profile_id).map_err(|e| e.to_string()) };
@@ -680,6 +721,33 @@ fn dismiss_whats_new(app: AppHandle) -> View {
     view(&app)
 }
 
+// MARK: Tray popover
+
+/// The popover's content height in logical pixels, so the window fits it.
+#[tauri::command]
+fn fit_usage_popover(app: AppHandle, height: f64) {
+    tray::fit_popover(&app, height);
+}
+
+#[tauri::command]
+fn hide_usage_popover(app: AppHandle) {
+    tray::hide_popover(&app);
+}
+
+/// Opens the main window from the popover, optionally on one page (`projects`, …).
+#[tauri::command]
+fn open_main_window(app: AppHandle, page: Option<String>) {
+    show_window(&app);
+    if let Some(page) = page {
+        let _ = app.emit_to("main", "navigate", page);
+    }
+}
+
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    app.exit(0);
+}
+
 #[tauri::command]
 fn reveal(app: AppHandle, path: String) {
     let _ = app.opener().reveal_item_in_dir(path);
@@ -703,7 +771,10 @@ fn main() {
         .setup(|app| {
             let version = (!cfg!(debug_assertions)).then(|| app.package_info().version.to_string());
             let mut model = Model::load(version);
-            model.vibrancy = app.get_webview_window("main").is_some_and(|w| apply_window_material(&w));
+            model.vibrancy = app.get_webview_window("main").is_some_and(|w| apply_window_material(&w, NSVisualEffectMaterial::Sidebar, None));
+            if let Some(popover) = app.get_webview_window(tray::POPOVER) {
+                apply_window_material(&popover, NSVisualEffectMaterial::Popover, Some(12.0));
+            }
             app.manage(Shared(Mutex::new(model)));
             if let Err(e) = tray::create(app.handle()) {
                 eprintln!("KeyZapper: tray icon unavailable: {e}");
@@ -712,6 +783,9 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() == tray::POPOVER {
+                return tray::popover_event(window, event);
+            }
             // Closing only hides the window while the tray icon can bring it back.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if tray::exists(window.app_handle()) {
@@ -760,6 +834,10 @@ fn main() {
             check_for_updates,
             install_update,
             dismiss_whats_new,
+            fit_usage_popover,
+            hide_usage_popover,
+            open_main_window,
+            quit_app,
             reveal,
             open_url,
         ])

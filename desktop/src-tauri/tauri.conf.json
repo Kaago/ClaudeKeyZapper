@@ -21,6 +21,20 @@
         "transparent": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true
+      },
+      {
+        "label": "usage",
+        "url": "usage.html",
+        "title": "KeyZapper",
+        "width": 340,
+        "height": 320,
+        "visible": false,
+        "decorations": false,
+        "resizable": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visibleOnAllWorkspaces": true
       }
     ],
     "security": {

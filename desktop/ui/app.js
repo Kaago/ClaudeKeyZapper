@@ -104,10 +104,11 @@ async function call(command, args) {
 const isMac = () => view?.platform !== 'windows';
 const revealLabel = () => (isMac() ? t('Im Finder zeigen') : t('Im Explorer zeigen'));
 const profileName = (id) => view.profiles.find((p) => p.id === id)?.name ?? t('Unbekanntes Profil');
-const credentialOk = (p) => (p.sso ? p.ssoState === 'loggedIn' : p.hasKey);
+/** Key stored, signed in, or (subscription) Claude Code's login present; unknown until checked counts as present. */
+const credentialOk = (p) => (p.subscription ? view.subscription?.loggedIn !== false : p.sso ? p.ssoState === 'loggedIn' : p.hasKey);
 const ssoStateText = (p) => ({ loggedIn: t('Angemeldet'), expired: t('Sitzung abgelaufen') }[p.ssoState] ?? t('Nicht angemeldet'));
-/** Picker label: SSO profiles carry a badge and their login state. */
-const profileLabel = (p) => (p.sso ? `${p.name} · SSO (${ssoStateText(p)})` : p.name);
+/** Picker label: SSO and subscription profiles carry a badge, SSO also its login state. */
+const profileLabel = (p) => (p.subscription ? `${p.name} · ${t('Claude-Abo')}` : p.sso ? `${p.name} · SSO (${ssoStateText(p)})` : p.name);
 /** Signs an SSO profile in before it is used; false if it is (still) not signed in. */
 async function ensureLogin(profileId) {
   const profile = view.profiles.find((p) => p.id === profileId);
@@ -123,9 +124,11 @@ function setView(next) {
   view = next;
   const root = document.documentElement;
   root.lang = view.language;
-  root.classList.toggle('vibrancy', !!view.vibrancy);
+  // The popover gets the system material only on macOS (vibrancy); on Windows it paints its own background.
+  root.classList.toggle('vibrancy', !!view.vibrancy && (!isPopover() || isMac()));
   root.classList.toggle('mac', isMac());
   assignColors();
+  if (isPopover()) return renderPopover();
   renderSidebar();
   renderBanners();
   renderMain();
@@ -378,7 +381,7 @@ function noProfiles() {
 function profilesPage() {
   if (!view.profiles.length) return noProfiles();
   return [
-    pageHeader(t('Profile'), t('Ein Key oder eine SSO-Anmeldung je Profil – zugeordnete Projekte nutzen ihn automatisch.'),
+    pageHeader(t('Profile'), t('Ein Key, eine SSO-Anmeldung oder dein Claude-Abo je Profil – zugeordnete Projekte nutzen es automatisch.'),
       refreshButton(),
       button(t('Projekt zuordnen'), () => addProjectDialog(null), { iconName: 'folderPlus' }),
       button(t('Neues Profil'), () => profileEditor(null), { iconName: 'plus', cls: 'primary' })),
@@ -467,20 +470,22 @@ function parseResetDate(text) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-/** "in 14 Tagen", "morgen", "in 5 Stunden"; null once the date has passed. */
+/** "in 14 Tagen", "morgen", "in 5 Stunden", "in 20 Minuten"; null once the date has passed. */
 function relativeTime(date) {
   const hours = (date.getTime() - Date.now()) / 3_600_000;
   if (hours <= 0) return null;
   const format = new Intl.RelativeTimeFormat(locale(), { numeric: 'auto' });
+  if (hours < 1) return format.format(Math.ceil(hours * 60), 'minute');
   return hours < 24 ? format.format(Math.ceil(hours), 'hour') : format.format(Math.round(hours / 24), 'day');
 }
+
+const dateTimeText = (date) => new Intl.DateTimeFormat(locale(), { dateStyle: 'medium', timeStyle: 'short' }).format(date);
 
 /** Budget bar: green below 70 % used, orange below 90 %, red above. */
 function budgetMeter(budget) {
   const reset = budget.resetAt && parseResetDate(budget.resetAt);
   const resetText = reset && relativeTime(reset);
-  const resetInfo = resetText && h('span', { class: 'muted small', title: new Intl.DateTimeFormat(locale(), { dateStyle: 'medium', timeStyle: 'short' }).format(reset) },
-    t('Reset %@', resetText));
+  const resetInfo = resetText && h('span', { class: 'muted small', title: dateTimeText(reset) }, t('Reset %@', resetText));
   if (budget.maxBudget == null) {
     return h('div', { class: 'budget' }, h('div', { class: 'budget-text' },
       h('strong', null, t('%@ verbraucht', money(budget.spend))), h('span', { class: 'muted' }, t('Kein Budgetlimit')),
@@ -500,14 +505,57 @@ function budgetMeter(budget) {
       h('div', { class: `meter-fill ${tone}`, style: `width: ${(used * 100).toFixed(1)}%` })));
 }
 
+// MARK: Claude subscription
+
+const limitLabel = (limit) => ({ session: t('Aktuelle Sitzung'), weekly: t('Woche · alle Modelle') }[limit.kind] ?? t('Woche · %@', limit.model));
+
+/** Colors like the budget bar: green below 70 % used, orange below 90 %, red above. */
+const usageTone = (used) => (used >= 0.9 ? 'red' : used >= 0.7 ? 'orange' : 'green');
+
+function meterBar(used, label) {
+  const percent = Math.round(used * 100);
+  return h('div', { class: 'meter', role: 'meter', 'aria-label': label, 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': percent },
+    h('div', { class: `meter-fill ${usageTone(used)}`, style: `width: ${(used * 100).toFixed(1)}%` }));
+}
+
+/** One limit of the subscription as a bar; a limit whose reset has passed counts as free again. `compact` puts the reset below the bar. */
+function limitMeter(limit, compact) {
+  const reset = limit.resetsAt && parseResetDate(limit.resetsAt);
+  const passed = reset && reset.getTime() <= Date.now();
+  const used = passed ? 0 : Math.min(1, Math.max(0, limit.percent / 100));
+  const resetText = passed ? t('Zurückgesetzt') : reset && relativeTime(reset) && t('Reset %@', relativeTime(reset));
+  const resetInfo = resetText && h('span', { class: 'muted small', title: reset ? dateTimeText(reset) : null }, compact ? resetText : `· ${resetText}`);
+  return h('div', { class: 'budget' },
+    h('div', { class: 'budget-text' },
+      h('strong', null, limitLabel(limit)),
+      h('span', { class: 'spacer' }),
+      h('span', { class: `small ${usageTone(used)}` }, t('%@ % verbraucht', Math.round(used * 100))),
+      !compact && resetInfo),
+    meterBar(used, limitLabel(limit)),
+    compact && resetInfo);
+}
+
+/** The subscription's limits, or why they are missing; nothing while Claude Code is not logged in (the caller says so). */
+function subscriptionUsage(compact = false) {
+  const sub = view.subscription;
+  if (!sub) return h('div', { class: 'muted small' }, t('Verbrauch wird geladen …'));
+  if (!sub.loggedIn) return null;
+  return [
+    sub.limits.map((limit) => limitMeter(limit, compact)),
+    !sub.limits.length && !sub.problem && h('div', { class: 'muted small' }, t('Claude meldet für diesen Tarif keine Nutzungslimits.')),
+    sub.problem && h('div', { class: 'finding orange small' }, icon('warning'),
+      h('span', { class: 'spacer' }, sub.problem, sub.limits.length && sub.checkedAt ? ` ${t('Stand: %@', dateTimeText(new Date(sub.checkedAt * 1000)))}` : '')),
+  ];
+}
+
 function profileMenu(profile, bindings, testConnection) {
   const locked = profile.managed;
   return [
     [t('Bearbeiten'), () => profileEditor(profile), { iconName: 'pencil', disabled: locked }],
-    profile.sso
+    profile.subscription ? null : profile.sso
       ? [profile.ssoState === 'loggedIn' ? t('Neu anmelden') : t('Anmelden'), () => call('sso_login', { profileId: profile.id }), { iconName: 'key', disabled: profile.ssoLoggingIn }]
       : [profile.hasKey ? t('Key ändern') : t('Key hinterlegen'), () => replaceKeyDialog(profile), { iconName: 'key' }],
-    !profile.sso && [t('Key kopieren'), () => call('copy_key', { profileId: profile.id }), { iconName: 'copy', disabled: !profile.hasKey || !view.allowKeyExport }],
+    !profile.sso && !profile.subscription && [t('Key kopieren'), () => call('copy_key', { profileId: profile.id }), { iconName: 'copy', disabled: !profile.hasKey || !view.allowKeyExport }],
     profile.sso && [t('Abmelden'), () => call('sso_logout', { profileId: profile.id }), { iconName: 'keyOff', disabled: profile.ssoLoggingIn || profile.ssoState === 'loggedOut' }],
     [t('Verbindung prüfen'), testConnection, { iconName: 'activity', disabled: !credentialOk(profile) }],
     [t('Projekt zuordnen …'), () => addProjectDialog(profile.id), { iconName: 'folderPlus' }],
@@ -519,7 +567,12 @@ function profileMenu(profile, bindings, testConnection) {
 function credentialRow(profile, testConnection, check) {
   const ok = credentialOk(profile);
   let text;
-  if (profile.sso) {
+  if (profile.subscription) {
+    const sub = view.subscription;
+    text = !sub ? t('Claude-Anmeldung wird geprüft …')
+      : sub.loggedIn ? (sub.plan ? t('Bei Claude angemeldet · %@', sub.plan) : t('Bei Claude angemeldet'))
+        : t('Nicht bei Claude angemeldet – in Claude Code „/login“ ausführen.');
+  } else if (profile.sso) {
     const expiry = profile.ssoExpiresAt && profile.ssoExpiresAt * 1000 > Date.now() ? new Date(profile.ssoExpiresAt * 1000) : null;
     text = profile.ssoLoggingIn ? t('Anmeldung läuft – bitte im Browser abschließen …')
       : ok ? (expiry ? t('Angemeldet, Token gültig bis %@', expiry.toLocaleString(locale())) : t('Angemeldet')) : ssoStateText(profile);
@@ -532,7 +585,7 @@ function credentialRow(profile, testConnection, check) {
     profile.ssoLoggingIn && h('span', { class: 'spinner', role: 'status', 'aria-label': t('Anmeldung läuft') }),
     h('span', { class: 'spacer' }),
     ok && button(check.checking ? t('Wird geprüft …') : t('Verbindung prüfen'), testConnection, { iconName: 'activity', disabled: check.checking }),
-    !ok && (profile.sso
+    !ok && !profile.subscription && (profile.sso
       ? button(t('Anmelden'), () => call('sso_login', { profileId: profile.id }), { iconName: 'key', cls: 'primary', disabled: profile.ssoLoggingIn })
       : button(t('Key hinterlegen'), () => replaceKeyDialog(profile), { iconName: 'key', cls: 'primary' })));
 }
@@ -553,12 +606,15 @@ function profileCard(profile) {
     h('div', { class: 'card-head' },
       h('span', { class: 'avatar', 'aria-hidden': 'true' }, initials(profile.name)),
       h('div', { class: 'card-title' },
-        h('h2', null, profile.name, profile.sso && h('span', { class: 'badge' }, 'SSO'), profile.managed && h('span', { class: 'badge' }, t('Von der IT vorgegeben'))),
-        h('div', { class: 'muted small selectable' }, profile.endpoint + (profile.modelAlias ? t(' · Modell %@', profile.modelAlias) : '')),
+        h('h2', null, profile.name, profile.sso && h('span', { class: 'badge' }, 'SSO'), profile.subscription && h('span', { class: 'badge' }, t('Claude-Abo')),
+          profile.managed && h('span', { class: 'badge' }, t('Von der IT vorgegeben'))),
+        h('div', { class: 'muted small selectable' }, (profile.subscription ? t('Anmeldung von Claude Code') : profile.endpoint)
+          + (profile.modelAlias ? t(' · Modell %@', profile.modelAlias) : '')),
         tierModels(profile) && h('div', { class: 'mono muted' }, tierModels(profile))),
       menuButton(t('Weitere Aktionen'), menu)),
     credentialRow(profile, testConnection, check),
     profile.hasKey && profile.budget && budgetMeter(profile.budget),
+    profile.subscription && subscriptionUsage(),
     profile.hasKey && profile.killers.length > 0 && h('div', { class: 'line orange small' }, icon('flame'),
       t('Wird vom Budget-Killer in „%@“ verbrannt', profile.killers.join(', '))),
     check.result && h('div', { class: `check-result ${check.result.success ? 'green' : 'orange'}` },
@@ -571,7 +627,8 @@ function profileCard(profile) {
 
 // MARK: Projects
 
-function describeHealth(health, keyPresent, sso) {
+function describeHealth(health, keyPresent, { sso, subscription }) {
+  if (!keyPresent && health?.state === 'active' && subscription) return t('Nicht bei Claude angemeldet – in Claude Code „/login“ ausführen.');
   if (!keyPresent && health?.state === 'active' && sso) return t('Nicht angemeldet – Claude-Anfragen schlagen fehl. Beim Profil „Anmelden“ wählen.');
   if (!keyPresent && health?.state === 'active') return t('Für das Profil ist kein Key hinterlegt – Claude-Anfragen schlagen fehl.');
   switch (health?.state) {
@@ -594,7 +651,7 @@ function projectStatus(binding) {
   if (view.disabled) return result('pause', 'muted', t('Pausiert'), false);
   if (!status) return result('question', 'muted', t('Wird geprüft'), false);
   if (state === 'folderMissing') return result('error', 'red', t('Ordner fehlt'));
-  if (!keyPresent) return result('keyOff', 'red', profile.sso ? t('Nicht angemeldet') : t('Kein Key'));
+  if (!keyPresent) return result('keyOff', 'red', profile.sso || profile.subscription ? t('Nicht angemeldet') : t('Kein Key'));
   if (blocking) return result('error', 'red', t('Konflikt'));
   if (state === 'notApplied') return result('warning', 'orange', t('Nicht eingerichtet'), true, true);
   if (state === 'drifted') return result('warning', 'orange', t('Abweichung'), true, true);
@@ -604,7 +661,7 @@ function projectStatus(binding) {
 
 function projectMenu(binding, folderMissing, confirmUnbind) {
   return [
-    [t('Für Agenten optimieren'), () => agentsDialog(binding, profileOf(binding)), { iconName: 'sparkles', disabled: folderMissing }],
+    [t('Für Agenten optimieren'), () => agentsDialog(binding, profileOf(binding)), { iconName: 'sparkles', disabled: folderMissing || profileOf(binding).subscription }],
     [t('MCP-Server …'), () => projectMcpDialog(binding), { iconName: 'plug', disabled: folderMissing }],
     [revealLabel(), () => call('reveal', { path: binding.path }), { iconName: 'folder', disabled: folderMissing }],
     [t('Erneut anwenden'), () => call('reapply', { bindingId: binding.id }), { iconName: 'rotate', disabled: folderMissing || view.disabled }],
@@ -620,10 +677,10 @@ function projectRow(binding, profile) {
   const folderMissing = status?.health.state === 'folderMissing';
   const healthOk = status?.health.state === 'active' && keyPresent;
   const tip = view.disabled ? t('Deaktiviert – Claude nutzt hier die normale Anmeldung.')
-    : !healthOk ? describeHealth(status?.health, keyPresent, profile.sso) : status.conflicts[0]?.message ?? t('Aktiv');
+    : !healthOk ? describeHealth(status?.health, keyPresent, profile) : status.conflicts[0]?.message ?? t('Aktiv');
   // Hidden: three clicks on the status switch the Budget-Killer on or off.
   const pill = h('span', { class: `pill ${state.tone}`, title: tip,
-    onclick: (e) => { if (e.detail === 3 && !profile.sso && !view.disabled) call('toggle_pool', { bindingId: binding.id }); } },
+    onclick: (e) => { if (e.detail === 3 && !profile.sso && !profile.subscription && !view.disabled) call('toggle_pool', { bindingId: binding.id }); } },
   icon(state.symbol), state.label);
   const select = h('select', {
     'aria-label': t('Profil'), title: t('Profil für dieses Projekt wechseln'), disabled: view.disabled,
@@ -645,7 +702,8 @@ function projectRow(binding, profile) {
       select,
       h('div', { class: 'row-actions' },
         button(t('Für Agenten optimieren'), () => agentsDialog(binding, profile),
-          { iconName: 'sparkles', iconOnly: true, title: t('AGENTS.md für dieses Repository per KI-Analyse erzeugen oder verbessern'), disabled: folderMissing }),
+          { iconName: 'sparkles', iconOnly: true, disabled: folderMissing || profile.subscription,
+            title: profile.subscription ? t('Die KI-Analyse läuft über ein Gateway-Profil.') : t('AGENTS.md für dieses Repository per KI-Analyse erzeugen oder verbessern') }),
         button(t('MCP-Server'), () => projectMcpDialog(binding),
           { iconName: 'plug', iconOnly: true, title: t('MCP-Server für dieses Projekt auswählen'), disabled: folderMissing }),
         button(revealLabel(), () => call('reveal', { path: binding.path }), { iconName: 'folder', iconOnly: true }),
@@ -656,13 +714,16 @@ function projectRow(binding, profile) {
       binding.mcpActive ? binding.mcpNames.join(', ') : t('MCP: %@ – .mcp.json weicht ab, „Erneut anwenden“ wählen.', binding.mcpNames.join(', '))),
     binding.pooled && !view.disabled && h('div', { class: 'note red' }, icon('flame'),
       t('Budget-Killer: Nach dem Budget dieses Keys werden die Keys der anderen Profile am selben Gateway verbrannt.')),
-    !view.disabled && !healthOk && h('div', { class: `note ${state.tone}` }, describeHealth(status?.health, keyPresent, profile.sso)),
+    !view.disabled && !healthOk && h('div', { class: `note ${state.tone}` }, describeHealth(status?.health, keyPresent, profile)),
     (status?.conflicts ?? []).map((c) => h('div', { class: `note ${c.blocking ? 'red' : 'orange'}` },
       icon(c.blocking ? 'error' : 'warning'), h('span', { class: 'selectable' }, c.message))));
 }
 
 async function deleteProfile(profile, bindings) {
-  const message = profile.sso
+  const message = profile.subscription
+    ? (bindings.length ? t('%@ Projektzuordnung(en) werden zurückgenommen. Die Claude-Anmeldung in Claude Code bleibt bestehen.', bindings.length)
+      : t('Die Claude-Anmeldung in Claude Code bleibt bestehen.'))
+    : profile.sso
     ? (bindings.length ? t('Die SSO-Anmeldung wird entfernt und %@ Projektzuordnung(en) werden zurückgenommen.', bindings.length) : t('Die SSO-Anmeldung wird entfernt.'))
     : bindings.length
       ? t('Der Key wird gelöscht und %@ Projektzuordnung(en) werden zurückgenommen.', bindings.length)
@@ -819,7 +880,7 @@ function profileEditor(existing) {
     name: existing?.name ?? '', endpoint: existing?.endpoint ?? view.defaultEndpoint ?? '',
     modelAlias: existing?.modelAlias ?? view.defaultModelAlias ?? '', opusModel: existing?.opusModel ?? '',
     sonnetModel: existing?.sonnetModel ?? '', haikuModel: existing?.haikuModel ?? '',
-    environmentText: existing?.environmentText ?? '', key: '', authType: existing?.sso ? 'oidc' : 'apiKey',
+    environmentText: existing?.environmentText ?? '', key: '', authType: existing?.subscription ? 'subscription' : existing?.sso ? 'oidc' : 'apiKey',
     oidcIssuer: existing?.oidcIssuer ?? '', oidcClientId: existing?.oidcClientId ?? '', oidcScope: existing?.oidcScope ?? '',
     oidcTokenType: existing?.oidcTokenType ?? 'access', models: [], loading: false, saving: false,
   };
@@ -829,8 +890,10 @@ function profileEditor(existing) {
     const allowed = !host || isHostAllowed(host);
     const invalid = invalidEnvironmentLines(s.environmentText);
     const sso = s.authType === 'oidc';
+    const subscription = s.authType === 'subscription';
     const issuerOk = !sso || /^https:\/\//i.test(s.oidcIssuer.trim()) || /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(s.oidcIssuer.trim());
-    const valid = s.name.trim() && host && allowed && (sso ? issuerOk && s.oidcClientId.trim() : existing || s.key) && !invalid.length;
+    const valid = s.name.trim() && (subscription || (host && allowed))
+      && (sso ? issuerOk && s.oidcClientId.trim() : subscription || existing || s.key) && !invalid.length;
     const update = (key) => (value) => { s[key] = value; dlg.render(); };
     const modelField = (label, key, id) => field(label, input({ value: s[key], placeholder: t('Claude-Standard'), list: 'gateway-models', disabled: managed }, update(key)), id);
     const loadModels = async () => {
@@ -855,16 +918,21 @@ function profileEditor(existing) {
       body: [
         h('h2', null, existing ? existing.name : t('Neues Profil')),
         h('fieldset', { disabled: managed },
-          field(t('Name'), input({ value: s.name, placeholder: t('z. B. Projekt Alpha') }, update('name')), 'p-name'),
-          field(t('LiteLLM-Endpunkt'), input({ value: s.endpoint, placeholder: 'https://litellm.firma.intern' }, update('endpoint')), 'p-endpoint'),
-          s.endpoint && !host && h('div', { class: 'field-note error-text' }, t('Bitte eine vollständige https-URL angeben (http nur für localhost).')),
-          host && !allowed && h('div', { class: 'field-note error-text' }, t('Host nicht freigegeben. Erlaubt: %@', view.allowedHosts.join(', ')))),
+          field(t('Name'), input({ value: s.name, placeholder: subscription ? t('z. B. Claude Max') : t('z. B. Projekt Alpha') }, update('name')), 'p-name'),
+          !subscription && [
+            field(t('LiteLLM-Endpunkt'), input({ value: s.endpoint, placeholder: 'https://litellm.firma.intern' }, update('endpoint')), 'p-endpoint'),
+            s.endpoint && !host && h('div', { class: 'field-note error-text' }, t('Bitte eine vollständige https-URL angeben (http nur für localhost).')),
+            host && !allowed && h('div', { class: 'field-note error-text' }, t('Host nicht freigegeben. Erlaubt: %@', view.allowedHosts.join(', ')))]),
         managed && h('div', { class: 'section-note' }, sso ? t('Von der IT vorgegeben – nur die Anmeldung ist möglich.') : t('Von der IT vorgegeben – nur der Key kann geändert werden.')),
         h('fieldset', { disabled: !!existing },
           field(t('Anmeldung'), h('select', { onchange: (e) => { s.authType = e.target.value; dlg.render(); } },
-            h('option', { value: 'apiKey', selected: !sso }, t('Key')),
-            h('option', { value: 'oidc', selected: sso }, 'SSO')), 'p-auth')),
-        sso ? h('fieldset', { disabled: managed },
+            h('option', { value: 'apiKey', selected: s.authType === 'apiKey' }, t('Key')),
+            h('option', { value: 'oidc', selected: sso }, 'SSO'),
+            h('option', { value: 'subscription', selected: subscription }, t('Claude-Abo (Pro, Max, Team)'))), 'p-auth')),
+        subscription ? h('fieldset', null,
+          h('div', { class: 'section-note' }, t('Projekte mit diesem Profil nutzen dein Claude-Abo über die Anmeldung von Claude Code – ohne Gateway und ohne Key. Einstellungen anderer Profile (Helper, Endpunkt, Modellnamen) gelten dort nicht.')),
+          h('div', { class: 'section-note' }, t('Noch nicht angemeldet? In Claude Code „/login“ ausführen und das Claude-Konto wählen. KeyZapper liest die Anmeldung nur, um Tarif und Verbrauch anzuzeigen.')))
+        : sso ? h('fieldset', { disabled: managed },
           field(t('Issuer'), input({ value: s.oidcIssuer, placeholder: 'https://login.microsoftonline.com/<tenant>/v2.0' }, update('oidcIssuer')), 'p-issuer'),
           s.oidcIssuer.trim() && !issuerOk && h('div', { class: 'field-note error-text' }, t('Die SSO-Adresse muss https verwenden: %@', s.oidcIssuer.trim())),
           field(t('Client-ID'), input({ value: s.oidcClientId }, update('oidcClientId')), 'p-client'),
@@ -878,7 +946,11 @@ function profileEditor(existing) {
           field(existing ? t('Neuer Key') : t('Key'), input({ type: 'password', value: s.key,
             placeholder: existing ? t('leer lassen, um den Key zu behalten') : 'sk-…' }, update('key')), 'p-key'),
           h('div', { class: 'section-note' }, t('Der Key wird nur lokal in einer Datei gespeichert, die nur dein Benutzerkonto lesen kann – nie im Projekt.'))),
-        h('fieldset', null, h('legend', null, t('Modelle')),
+        subscription ? h('fieldset', null, h('legend', null, t('Modelle')),
+          field(t('Standardmodell'), input({ value: s.modelAlias, placeholder: t('Claude-Standard'), list: 'claude-aliases' }, update('modelAlias')), 'p-alias'),
+          h('datalist', { id: 'claude-aliases' }, ['opus', 'sonnet', 'haiku', 'opusplan'].map((m) => h('option', { value: m }))),
+          h('div', { class: 'section-note' }, t('Optional, z. B. opus oder sonnet. Leer lassen, um den Standard deines Tarifs zu verwenden.')))
+        : h('fieldset', null, h('legend', null, t('Modelle')),
           modelField('Opus', 'opusModel', 'p-opus'), modelField('Sonnet', 'sonnetModel', 'p-sonnet'),
           modelField('Haiku', 'haikuModel', 'p-haiku'), modelField(t('Standardmodell'), 'modelAlias', 'p-alias'),
           h('datalist', { id: 'gateway-models' }, s.models.map((m) => h('option', { value: m }))),
@@ -1314,11 +1386,97 @@ function howItWorksDialog() {
         hint('folder', t('Die Zuordnung gilt für das ganze Repository samt Unterordnern und Worktrees. Außerhalb zugeordneter Ordner nutzt Claude die normale Anmeldung.')),
         hint('shield', t('Fehlt ein Key, schlagen Anfragen fehl. Es wird nie ein anderer Key verwendet.')),
         hint('plug', t('MCP-Server einmal unter „MCP-Server“ einrichten und je Projekt einschalten – Claude Code lädt sie dort automatisch.')),
-        hint('bolt', isMac() ? t('Schließt du das Fenster, läuft KeyZapper in der Menüleiste weiter: Budgets im Blick und Profile je Projekt wechseln.')
-          : t('Schließt du das Fenster, läuft KeyZapper im Infobereich der Taskleiste weiter: Budgets im Blick und Profile je Projekt wechseln.'))),
+        hint('bolt', isMac() ? t('Schließt du das Fenster, läuft KeyZapper in der Menüleiste weiter: Klick aufs Symbol zeigt Abo-Verbrauch und Budgets, Rechtsklick wechselt Profile je Projekt.')
+          : t('Schließt du das Fenster, läuft KeyZapper im Infobereich der Taskleiste weiter: Klick aufs Symbol zeigt Abo-Verbrauch und Budgets, Rechtsklick wechselt Profile je Projekt.')),
+        hint('sparkles', t('Mit einem Profil vom Typ „Claude-Abo“ nutzen Projekte dein Claude-Abo statt eines Gateway-Keys.'))),
     ],
     actions: [button(t('Verstanden'), close, { cls: 'primary' })],
   }), { wide: true });
+}
+
+// MARK: Tray popover
+
+const isPopover = () => document.body.classList.contains('popover-window');
+let popoverHeight = 0;
+let popoverRefreshing = false;
+
+async function refreshPopover() {
+  popoverRefreshing = true;
+  renderPopover();
+  await call('refresh_all');
+  setTimeout(() => { popoverRefreshing = false; renderPopover(); }, 800);
+}
+
+/** A gateway profile in the popover: what is left of its budget, or why that is unknown. */
+function popoverProfile(profile) {
+  const name = h('span', { class: 'popover-name' }, h('span', { class: 'dot', style: `background: ${colorOf(profile.id)}` }), profile.name);
+  const status = (cls, text) => h('div', { class: 'budget-text' }, name, h('span', { class: 'spacer' }), h('span', { class: `small ${cls}` }, text));
+  const budget = profile.budget;
+  if (!credentialOk(profile)) return status('red', profile.sso ? ssoStateText(profile) : t('Kein Key'));
+  if (profile.sso) return status('green', t('Angemeldet'));
+  if (!budget) return status('muted', t('Budget nicht verfügbar'));
+  if (budget.maxBudget == null) return status('muted', t('%@ verbraucht', money(budget.spend)));
+  const used = budget.maxBudget > 0 ? Math.min(1, Math.max(0, budget.spend / budget.maxBudget)) : 1;
+  const reset = budget.resetAt && parseResetDate(budget.resetAt);
+  const resetText = reset && relativeTime(reset);
+  return h('div', { class: 'popover-row' },
+    h('div', { class: 'budget-text' }, name, h('span', { class: 'spacer' }), h('strong', { class: usageTone(used) }, t('%@ übrig', money(budget.remaining ?? 0)))),
+    meterBar(used, t('Budget verbraucht')),
+    h('div', { class: 'budget-text muted small' }, t('%@ % von %@ verbraucht', Math.round(used * 100), money(budget.maxBudget)),
+      h('span', { class: 'spacer' }), resetText && h('span', { title: dateTimeText(reset) }, t('Reset %@', resetText))));
+}
+
+/** Usage at a glance from the tray icon: the Claude subscription's limits and every key's budget. */
+function renderPopover() {
+  const subscriptionProfiles = view.profiles.filter((p) => p.subscription);
+  const gatewayProfiles = view.profiles.filter((p) => !p.subscription);
+  const attention = view.disabled ? 0 : view.bindings.filter((b) => projectStatus(b).attention).length;
+  const open = (page = null) => invoke('open_main_window', { page });
+  const sub = view.subscription;
+  document.getElementById('popover').replaceChildren(
+    h('header', { class: 'popover-head' },
+      h('span', { class: 'logo' }, icon('bolt')),
+      h('strong', null, t('Verbrauch')),
+      h('span', { class: 'spacer' }),
+      button(t('Aktualisieren'), refreshPopover, { iconName: 'refresh', iconOnly: true, cls: popoverRefreshing ? 'spinning' : null, disabled: popoverRefreshing })),
+    h('div', { class: 'popover-body' },
+      !view.profiles.length && h('div', { class: 'muted' }, t('Noch keine Profile')),
+      subscriptionProfiles.length > 0 && h('section', { class: 'popover-section' },
+        h('div', { class: 'popover-title' }, t('Claude-Abo'), sub?.plan && h('span', { class: 'badge' }, sub.plan)),
+        sub && !sub.loggedIn
+          ? h('div', { class: 'line red small' }, icon('keyOff'), t('Nicht bei Claude angemeldet – in Claude Code „/login“ ausführen.'))
+          : subscriptionUsage(true)),
+      gatewayProfiles.length > 0 && h('section', { class: 'popover-section' },
+        h('div', { class: 'popover-title' }, t('Budgets')),
+        gatewayProfiles.map(popoverProfile)),
+      view.disabled && h('div', { class: 'line orange small' }, icon('pause'), t('KeyZapper ist deaktiviert')),
+      attention > 0 && h('button', { type: 'button', class: 'popover-attention', onclick: () => open('projects') },
+        icon('warning', 'orange'),
+        h('span', { class: 'spacer' }, attention === 1 ? t('1 Projekt braucht Aufmerksamkeit') : t('%@ Projekte brauchen Aufmerksamkeit', attention)),
+        icon('arrow', 'muted'))),
+    h('footer', { class: 'popover-foot' },
+      button(t('KeyZapper öffnen'), () => open(), { cls: 'primary' }),
+      h('span', { class: 'spacer' }),
+      button(t('KeyZapper beenden'), () => invoke('quit_app'), { cls: 'link' })));
+  fitPopover();
+}
+
+/** Asks for a window as high as the content (the body scrolls beyond the maximum). */
+function fitPopover() {
+  const [head, body, foot] = document.getElementById('popover').children;
+  const height = Math.ceil(head.offsetHeight + body.scrollHeight + foot.offsetHeight);
+  if (height === popoverHeight) return;
+  popoverHeight = height;
+  invoke('fit_usage_popover', { height });
+}
+
+async function startPopover() {
+  document.body.append(tooltip);
+  english = await invoke('translations');
+  setView(await invoke('get_view'));
+  await listen('changed', async () => setView(await invoke('get_view')));
+  await listen('popover-shown', async () => setView(await invoke('get_view')));
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') invoke('hide_usage_popover'); });
 }
 
 // MARK: Tooltips
@@ -1402,10 +1560,12 @@ async function dropped({ paths, position }) {
 // MARK: Start
 
 async function start() {
+  if (isPopover()) return startPopover();
   document.body.append(tooltip);
   english = await invoke('translations');
   setView(await invoke('get_view'));
   await listen('changed', async () => setView(await invoke('get_view')));
+  await listen('navigate', (e) => navigate(e.payload));
   await listen('tauri://drag-enter', (e) => markDrop(e.payload.position));
   await listen('tauri://drag-over', (e) => markDrop(e.payload.position));
   await listen('tauri://drag-leave', () => markDrop(null));

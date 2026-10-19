@@ -146,6 +146,9 @@ impl SettingsBinder {
     /// neutralise values inherited from the IDE/shell environment (otherwise headers get mixed, spike T6/T7/T12).
     /// In pool mode the helper is asked every minute, so an exhausted key is replaced quickly.
     pub fn desired_values(&self, profile: &Profile, pooled: bool) -> BTreeMap<String, String> {
+        if profile.is_subscription() {
+            return subscription_values(profile);
+        }
         let pooled = pooled && !profile.is_sso(); // pooling needs static keys
         let endpoint = profile.endpoint.trim_end_matches('/').to_string();
         let command = if pooled { "pool" } else { "credential" };
@@ -172,7 +175,7 @@ impl SettingsBinder {
     // MARK: Apply / revert
 
     pub fn apply(&self, profile: &Profile, folder: &str, previous: Option<&WorkspaceBinding>, pooled: bool) -> Result<ApplyResult> {
-        let pooled = pooled && !profile.is_sso();
+        let pooled = pooled && !profile.is_sso() && !profile.is_subscription();
         let root = paths::canonical_path(folder);
         if !is_directory(&root) {
             return Err(Error::FolderNotFound(root));
@@ -411,6 +414,24 @@ impl SettingsBinder {
         }
         result
     }
+}
+
+/// Claude Code's own claude.ai login: helper, gateway, keys and gateway model names from other layers (user settings,
+/// IDE/shell environment) are set to "" so they do not apply; Claude Code then falls back to the subscription.
+fn subscription_values(profile: &Profile) -> BTreeMap<String, String> {
+    let mut values: BTreeMap<String, String> = std::iter::once("apiKeyHelper".to_string())
+        .chain(AUTH_ENV_KEYS.iter().chain(MODEL_ENV_KEYS.iter()).map(|k| format!("env.{k}")))
+        .map(|key| (key, String::new()))
+        .collect();
+    for (name, value) in profile.model_environment() {
+        values.insert(format!("env.{name}"), value);
+    }
+    for (name, value) in profile.environment.iter().flatten() {
+        if Profile::is_allowed_environment_name(name) {
+            values.insert(format!("env.{name}"), value.clone());
+        }
+    }
+    values
 }
 
 fn health(settings: &Object, desired: &BTreeMap<String, String>) -> BindingHealth {

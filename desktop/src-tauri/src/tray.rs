@@ -1,13 +1,15 @@
-//! Menu bar (macOS) or notification area (Windows) icon: budgets at a glance and a project's profile switched
-//! without opening the window. Closing the window keeps KeyZapper running here.
+//! Menu bar (macOS) or notification area (Windows) icon: a left click opens the usage popover (subscription limits and
+//! key budgets), a right click the menu to switch a project's profile without opening the window. Closing the window
+//! keeps KeyZapper running here.
 
 use crate::model::TrayInfo;
-use crate::{changed, refresh, show_window, with_model};
+use crate::{changed, refresh, refresh_usage, show_window, with_model};
 use keyzapper_core::l;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, Rect, WebviewWindow, Window, WindowEvent};
 
 const TRAY_ID: &str = "main";
 const OPEN: &str = "open";
@@ -17,23 +19,33 @@ const BIND: &str = "bind";
 /// The content shown last (main thread only); the menu is only rebuilt when it changes, so it does not flicker while open.
 static SHOWN: Mutex<Option<TrayInfo>> = Mutex::new(None);
 
+/// Label of the usage popover window (tauri.conf.json).
+pub const POPOVER: &str = "usage";
+const POPOVER_WIDTH: f64 = 340.0;
+/// Values older than this are reloaded when the popover opens.
+const USAGE_MAX_AGE: Duration = Duration::from_secs(120);
+/// Tray icon the popover belongs to, in physical pixels: x, y, width, height.
+static ANCHOR: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
+/// Logical height the popover's content asked for.
+static HEIGHT: Mutex<f64> = Mutex::new(320.0);
+/// When losing focus last hid the popover: the click on the tray icon that caused it must not open it again.
+static HIDDEN_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
 pub fn create(app: &AppHandle) -> tauri::Result<()> {
-    // macOS: a black template image that the menu bar tints; Windows: the colored app icon.
+    // The bolt of the app logo. macOS: a black template image that the menu bar tints; Windows: the colored logo tile.
     #[cfg(target_os = "macos")]
     let icon = tauri::include_image!("icons/tray.png");
     #[cfg(not(target_os = "macos"))]
-    let icon = tauri::include_image!("icons/32x32.png");
+    let icon = tauri::include_image!("icons/tray-windows.png");
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
         .icon_as_template(cfg!(target_os = "macos"))
-        .show_menu_on_left_click(cfg!(target_os = "macos"))
+        .show_menu_on_left_click(false)
         .tooltip("KeyZapper")
         .on_menu_event(|app, event| handle(app, event.id().as_ref()))
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
-                if !cfg!(target_os = "macos") {
-                    show_window(tray.app_handle());
-                }
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, rect, .. } = event {
+                toggle_popover(tray.app_handle(), rect);
             }
         })
         .build(app)?;
@@ -141,4 +153,86 @@ fn handle(app: &AppHandle, id: &str) {
 
 pub fn exists(app: &AppHandle) -> bool {
     app.tray_by_id(TRAY_ID).is_some()
+}
+
+// MARK: Usage popover
+
+fn popover(app: &AppHandle) -> Option<WebviewWindow> {
+    app.get_webview_window(POPOVER)
+}
+
+fn toggle_popover(app: &AppHandle, rect: Rect) {
+    let Some(window) = popover(app) else { return show_window(app) };
+    if window.is_visible().unwrap_or(false) {
+        return hide_popover(app);
+    }
+    if HIDDEN_AT.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|at| at.elapsed() < Duration::from_millis(400)) {
+        return;
+    }
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let (position, size) = (rect.position.to_physical::<f64>(scale), rect.size.to_physical::<f64>(scale));
+    *ANCHOR.lock().unwrap_or_else(|e| e.into_inner()) = Some((position.x, position.y, size.width, size.height));
+    place(&window);
+    let _ = window.show();
+    let _ = window.set_focus();
+    let _ = window.emit("popover-shown", ());
+    if with_model(app, |m| m.usage_refreshed_at.is_none_or(|at| at.elapsed() > USAGE_MAX_AGE)) {
+        refresh_usage(app);
+    }
+}
+
+pub fn hide_popover(app: &AppHandle) {
+    if let Some(window) = popover(app) {
+        let _ = window.hide();
+    }
+}
+
+/// Fits the popover to its content (logical height) and keeps it at the tray icon.
+pub fn fit_popover(app: &AppHandle, height: f64) {
+    let height = height.clamp(120.0, 640.0);
+    *HEIGHT.lock().unwrap_or_else(|e| e.into_inner()) = height;
+    if let Some(window) = popover(app) {
+        let _ = window.set_size(LogicalSize::new(POPOVER_WIDTH, height));
+        place(&window);
+    }
+}
+
+/// Centered below the tray icon (menu bar at the top), or above it when the icon is in the lower half of its screen
+/// (Windows taskbar), kept inside that screen's work area.
+fn place(window: &WebviewWindow) {
+    let Some((x, y, width, height)) = *ANCHOR.lock().unwrap_or_else(|e| e.into_inner()) else { return };
+    let (center_x, center_y) = (x + width / 2.0, y + height / 2.0);
+    let monitor = window.available_monitors().unwrap_or_default().into_iter().find(|m| {
+        let (p, s) = (m.position(), m.size());
+        (p.x as f64..p.x as f64 + s.width as f64).contains(&center_x) && (p.y as f64..p.y as f64 + s.height as f64).contains(&center_y)
+    });
+    let scale = monitor.as_ref().map_or_else(|| window.scale_factor().unwrap_or(1.0), |m| m.scale_factor());
+    let (w, h, gap) = (POPOVER_WIDTH * scale, *HEIGHT.lock().unwrap_or_else(|e| e.into_inner()) * scale, 6.0 * scale);
+    let (mut left, mut top) = (center_x - w / 2.0, y + height + gap);
+    if let Some(monitor) = monitor {
+        let area = monitor.work_area();
+        let (ax, ay) = (area.position.x as f64, area.position.y as f64);
+        let (aw, ah) = (area.size.width as f64, area.size.height as f64);
+        if center_y > ay + ah / 2.0 {
+            top = y - h - gap;
+        }
+        left = left.clamp(ax + gap, (ax + aw - w - gap).max(ax + gap));
+        top = top.clamp(ay, (ay + ah - h).max(ay));
+    }
+    let _ = window.set_position(PhysicalPosition::new(left.round() as i32, top.round() as i32));
+}
+
+/// The popover closes when it loses focus (a click elsewhere) and is hidden instead of closed.
+pub fn popover_event(window: &Window, event: &WindowEvent) {
+    match event {
+        WindowEvent::Focused(false) if window.is_visible().unwrap_or(false) => {
+            *HIDDEN_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+            let _ = window.hide();
+        }
+        WindowEvent::CloseRequested { api, .. } => {
+            api.prevent_close();
+            let _ = window.hide();
+        }
+        _ => {}
+    }
 }
