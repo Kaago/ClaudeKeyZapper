@@ -17,7 +17,7 @@ pub struct Release {
 fn notes() -> Vec<(&'static str, Vec<String>)> {
     vec![
         (
-            "1.4.2",
+            "1.4.3",
             vec![
                 l!("Budgetbalken zeigen jetzt, was übrig ist, und werden mit dem Verbrauch kürzer."),
                 l!("SSO-Profile zeigen jetzt ihr verbleibendes Budget, z. B. an LiteLLM – ohne eigenen Key das Budget des angemeldeten Nutzers."),
