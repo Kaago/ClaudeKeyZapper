@@ -666,6 +666,9 @@ fn whats_new_lists_releases_since_the_previous_version() {
     assert!(versions(Some("1.4.0-beta.2"), "1.4.0").is_empty());
     assert_eq!(versions(Some("1.4.0"), "1.4.1"), vec!["1.4.1"]);
     assert!(versions(Some("1.4.1"), "1.4.2").is_empty());
+    assert_eq!(versions(Some("1.4.2"), "1.4.3"), vec!["1.4.3"]);
+    assert_eq!(versions(Some("1.4.1"), "1.4.3"), vec!["1.4.3"]);
+    assert!(versions(Some("1.4.3"), "1.4.4").is_empty());
     assert!(since(Some("1.3.0"), "1.4.0")[0].items.iter().all(|i| !i.is_empty()));
 }
 
