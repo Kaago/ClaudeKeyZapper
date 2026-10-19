@@ -32,11 +32,11 @@ static HEIGHT: Mutex<f64> = Mutex::new(320.0);
 static HIDDEN_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
 pub fn create(app: &AppHandle) -> tauri::Result<()> {
-    // macOS: a black template image that the menu bar tints; Windows: the colored app icon.
+    // The bolt of the app logo. macOS: a black template image that the menu bar tints; Windows: the colored logo tile.
     #[cfg(target_os = "macos")]
     let icon = tauri::include_image!("icons/tray.png");
     #[cfg(not(target_os = "macos"))]
-    let icon = tauri::include_image!("icons/32x32.png");
+    let icon = tauri::include_image!("icons/tray-windows.png");
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
         .icon_as_template(cfg!(target_os = "macos"))
