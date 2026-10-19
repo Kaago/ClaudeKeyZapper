@@ -26,12 +26,14 @@ impl CredentialReference {
 }
 
 /// How a profile authenticates against the gateway: static LiteLLM key or OIDC access token (SSO).
+/// `Subscription` uses no gateway: Claude Code's own claude.ai login (Pro, Max, Team, Enterprise).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AuthType {
     #[default]
     ApiKey,
     Oidc,
+    Subscription,
 }
 
 /// Which token of the OIDC token response an SSO profile hands to the gateway as bearer token.
@@ -106,6 +108,10 @@ impl Profile {
 
     pub fn is_sso(&self) -> bool {
         self.auth_type == AuthType::Oidc
+    }
+
+    pub fn is_subscription(&self) -> bool {
+        self.auth_type == AuthType::Subscription
     }
 
     /// IDs from files are normalised and `credential` is always derived from the ID.

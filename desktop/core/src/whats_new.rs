@@ -17,6 +17,13 @@ pub struct Release {
 fn notes() -> Vec<(&'static str, Vec<String>)> {
     vec![
         (
+            "1.5.0",
+            vec![
+                l!("Claude-Abo als Profiltyp: Projekte nutzen dein Claude Pro, Max oder Team über die Anmeldung von Claude Code – ohne Gateway und Key."),
+                l!("Ein Klick aufs Symbol in der Menüleiste bzw. im Infobereich zeigt den Verbrauch auf einen Blick: Limits des Claude-Abos und Budgets aller Keys. Rechtsklick öffnet das bisherige Menü."),
+            ],
+        ),
+        (
             "1.4.0",
             vec![
                 l!("Neues Design: Seitenleiste, Budgetbalken mit Ampel, Projektstatus auf einen Blick mit „Alle reparieren“ – und Projektordner einfach auf ein Profil ziehen."),

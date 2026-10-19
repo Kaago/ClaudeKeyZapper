@@ -37,7 +37,8 @@ in, so the costs land on the right project without anyone switching keys by hand
 * MCP servers (stdio, HTTP or SSE) defined once – or from templates such as GitHub, Notion or Sentry – and switched on per project. The app writes them into the repository's `.mcp.json` (excluded from Git) and approves them in `.claude/settings.local.json`, so Claude Code loads them there automatically. Remote servers with OAuth (e.g. Weave-MCP via Entra ID or Keycloak) take a client ID, callback port and scopes; Claude Code handles the browser sign-in.
 * Test connection against LiteLLM (invalid or blocked key, rate limit, budget, gateway unreachable).
 * Remaining budget per key, as reported by LiteLLM (`/key/info`): a bar that turns orange from 70 % and red from 90 % used, amount left of the limit and next reset, or the spend for keys without a limit.
-* Menu bar (macOS) or notification area (Windows) icon: budgets at a glance and a project's profile switched without opening the window. Closing the window keeps KeyZapper running there.
+* Claude subscription profiles: projects use your Claude Pro, Max, Team or Enterprise plan through Claude Code's own login instead of a gateway key (see below).
+* Menu bar (macOS) or notification area (Windows) icon: a click shows usage at a glance – your Claude subscription's limits (session, week, per model) and every key's budget; a right-click switches a project's profile without opening the window. Closing the window keeps KeyZapper running there.
 * Removing an assignment only removes the entries the app set itself.
 * Sidebar with profiles, projects, MCP servers, Claude settings and backup. Everything can be changed directly – via the ⋯ menu or a right-click; keys can be copied and replaced.
 * Update check against the GitHub releases with one-click installation; the version is shown in the app and under “About KeyZapper”.
@@ -97,6 +98,19 @@ sessions. Exit code 67 means the session expired; sign in again in KeyZapper.
 
 **Limitations:** SSO profiles do not support Budget-Killer pool, budget display, or key copying. Model loading and test connection
 use the access token.
+
+## Claude subscription profiles
+
+A profile of type *Claude subscription* has no endpoint and no key: assigned projects use the Claude account Claude Code is
+logged in with (`/login`). KeyZapper writes `apiKeyHelper`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`
+and the gateway model variables as empty values into `.claude/settings.local.json`, so a default profile or shell variables do
+not apply there; an optional default model (e.g. `opus`) goes into `ANTHROPIC_MODEL`.
+
+For plan and usage, KeyZapper reads Claude Code's login (macOS keychain item "Claude Code-credentials", otherwise
+`~/.claude/.credentials.json`) and asks `api.anthropic.com/api/oauth/usage`, like Claude Code's `/usage`. The token is never
+refreshed, stored or copied; while it has expired (Claude Code renews it when it runs), the last known values are shown. The
+endpoint is not a public API and may change. The gateway allowlist does not apply to these profiles, and the repository analysis
+needs a gateway profile.
 
 ## How it works
 

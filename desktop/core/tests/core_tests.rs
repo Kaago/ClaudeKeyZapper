@@ -734,3 +734,58 @@ fn mcp_files_created_for_servers_vanish_on_revert_and_tracked_mcp_json_blocks() 
     assert!(git(&repo, &["add", ".mcp.json"]).is_some() && git(&repo, &["commit", "-qm", "mcp"]).is_some());
     assert!(matches!(mcp::apply(&repo, &[server], &BTreeMap::new(), None), Err(Error::SettingsConflicts(_))));
 }
+
+#[test]
+fn subscription_profile_neutralises_gateway_and_switches_back() {
+    let root = temp_dir("proj");
+    let mut subscription = Profile::new(BETA.into(), "Abo".into(), String::new(), "opus".into());
+    subscription.auth_type = AuthType::Subscription;
+    let keyed = binder().apply(&sample(), &root, None, true).unwrap();
+    let applied = binder().apply(&subscription, &root, Some(&keyed.binding), true).unwrap();
+    assert_eq!(applied.binding.pooled, None);
+    let settings = read(&local(&root));
+    assert_eq!(settings["apiKeyHelper"], "");
+    for key in ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL"] {
+        assert_eq!(settings["env"][key], "", "{key}");
+    }
+    assert_eq!(settings["env"]["ANTHROPIC_MODEL"], "opus");
+    assert!(settings["env"].get("CLAUDE_CODE_API_KEY_HELPER_TTL_MS").is_none());
+    assert_eq!(binder().inspect(&applied.binding, &subscription, &BTreeMap::new()).health, BindingHealth::Active);
+    let back = binder().apply(&sample(), &root, Some(&applied.binding), false).unwrap();
+    assert!(read(&local(&root))["apiKeyHelper"].as_str().unwrap().ends_with(&format!("credential --profile {ALPHA}")));
+    binder().revert(&back.binding).unwrap();
+    assert!(!Path::new(&local(&root)).exists());
+}
+
+#[test]
+fn reads_claude_login_and_plan() {
+    use keyzapper_core::subscription::{parse_login, plan_name};
+    let login = parse_login(r#"{"claudeAiOauth": {"accessToken": "sk-ant-oat01-x", "refreshToken": "r", "expiresAt": 1760000000000,
+        "subscriptionType": "max", "rateLimitTier": "default_claude_max_20x"}}"#).unwrap();
+    assert_eq!(login.access_token, "sk-ant-oat01-x");
+    assert_eq!(login.expires_at, Some(1_760_000_000_000));
+    assert_eq!(login.plan.as_deref(), Some("Max 20×"));
+    assert_eq!(plan_name(Some("pro"), None).as_deref(), Some("Pro"));
+    assert_eq!(plan_name(Some("team"), Some("default_claude_team")).as_deref(), Some("Team"));
+    assert!(parse_login(r#"{"claudeAiOauth": {"accessToken": ""}}"#).is_none());
+    assert!(parse_login("not json").is_none());
+}
+
+#[test]
+fn parses_usage_limits_in_both_formats() {
+    use keyzapper_core::subscription::parse_usage;
+    let listed = parse_usage(r#"{"five_hour": null, "limits": [
+        {"kind": "session", "percent": 35.0, "resets_at": "2026-10-19T12:00:00+00:00"},
+        {"kind": "weekly_all", "percent": 14},
+        {"kind": "weekly_scoped", "percent": 120, "resets_at": null, "scope": {"model": {"display_name": "Opus"}}},
+        {"kind": "something_new", "percent": 1}]}"#).unwrap();
+    assert_eq!(listed.iter().map(|l| (l.kind.as_str(), l.model.as_deref(), l.percent)).collect::<Vec<_>>(),
+        vec![("session", None, 35.0), ("weekly", None, 14.0), ("model", Some("Opus"), 100.0)]);
+    assert_eq!(listed[0].resets_at.as_deref(), Some("2026-10-19T12:00:00+00:00"));
+    let flat = parse_usage(r#"{"five_hour": {"utilization": 6.0, "resets_at": "2026-10-19T04:59:59+00:00"},
+        "seven_day": {"utilization": 35.0, "resets_at": null}, "seven_day_opus": null,
+        "seven_day_sonnet": {"utilization": 2.5, "resets_at": null}, "extra_usage": {"is_enabled": false}}"#).unwrap();
+    assert_eq!(flat.iter().map(|l| (l.kind.as_str(), l.model.as_deref(), l.percent)).collect::<Vec<_>>(),
+        vec![("session", None, 6.0), ("weekly", None, 35.0), ("model", Some("Sonnet"), 2.5)]);
+    assert!(parse_usage("[]").is_none());
+}

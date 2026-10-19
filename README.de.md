@@ -38,7 +38,8 @@ richtigen Projekt.
 * MCP-Server (stdio, HTTP oder SSE) einmal definieren – oder aus Vorlagen wie GitHub, Notion oder Sentry – und je Projekt einschalten. Die App schreibt sie in die `.mcp.json` des Repositorys (von Git ausgeschlossen) und schaltet sie in `.claude/settings.local.json` frei, damit Claude Code sie dort automatisch lädt. Remote-Server mit OAuth (z. B. Weave-MCP über Entra ID oder Keycloak) bekommen Client-ID, Callback-Port und Scopes; den Browser-Login übernimmt Claude Code.
 * Verbindungstest gegen LiteLLM (ungültiger oder gesperrter Key, Rate-Limit, Budget, Gateway nicht erreichbar).
 * Verbleibendes Budget je Key laut LiteLLM (`/key/info`): ein Balken, der ab 70 % Verbrauch orange und ab 90 % rot wird, Rest vom Limit und nächster Reset, bei Keys ohne Limit die bisherigen Ausgaben.
-* Symbol in der Menüleiste (macOS) bzw. im Infobereich (Windows): Budgets im Blick und das Profil eines Projekts wechseln, ohne das Fenster zu öffnen. Nach dem Schließen des Fensters läuft KeyZapper dort weiter.
+* Claude-Abo-Profile: Projekte nutzen dein Claude Pro, Max, Team oder Enterprise über die Anmeldung von Claude Code statt eines Gateway-Keys (siehe unten).
+* Symbol in der Menüleiste (macOS) bzw. im Infobereich (Windows): Ein Klick zeigt den Verbrauch auf einen Blick – Limits des Claude-Abos (Sitzung, Woche, je Modell) und das Budget jedes Keys; per Rechtsklick wechselst du das Profil eines Projekts, ohne das Fenster zu öffnen. Nach dem Schließen des Fensters läuft KeyZapper dort weiter.
 * Rücknahme entfernt nur die Einträge, die die App selbst gesetzt hat.
 * Seitenleiste mit Profilen, Projekten, MCP-Servern, Claude-Einstellungen und Backup. Alles lässt sich direkt ändern – über das ⋯-Menü oder per Rechtsklick; Keys lassen sich kopieren und ersetzen.
 * Update-Prüfung gegen die GitHub-Releases mit Installation per Klick; die Version steht in der App und unter „Über KeyZapper“.
@@ -98,6 +99,19 @@ setzen (z. B. 900000 für 60–90 Min. Tokens). Für lange Streams über ein Gat
 
 **Einschränkungen:** SSO-Profile unterstützen keinen Budget-Killer-Pool, keine Budget-Anzeige und kein Key-Kopieren.
 Modell-Laden und Verbindungstest verwenden das Access-Token.
+
+## Claude-Abo-Profile
+
+Ein Profil vom Typ *Claude-Abo* hat weder Endpunkt noch Key: Zugeordnete Projekte nutzen das Claude-Konto, mit dem Claude
+Code angemeldet ist (`/login`). KeyZapper schreibt `apiKeyHelper`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN` und die Gateway-Modellvariablen als leere Werte in `.claude/settings.local.json`, damit ein
+Standardprofil oder Shell-Variablen dort nicht greifen; ein optionales Standardmodell (z. B. `opus`) landet in `ANTHROPIC_MODEL`.
+
+Für Tarif und Verbrauch liest KeyZapper die Anmeldung von Claude Code (macOS-Schlüsselbundeintrag „Claude Code-credentials“,
+sonst `~/.claude/.credentials.json`) und fragt `api.anthropic.com/api/oauth/usage` ab – wie `/usage` in Claude Code. Das Token
+wird nie erneuert, gespeichert oder kopiert; ist es abgelaufen (Claude Code erneuert es, sobald es läuft), zeigt KeyZapper den
+letzten Stand. Der Endpunkt ist keine öffentliche API und kann sich ändern. Die Gateway-Allowlist gilt für diese Profile nicht,
+und die Repository-Analyse benötigt ein Gateway-Profil.
 
 ## So funktioniert es
 

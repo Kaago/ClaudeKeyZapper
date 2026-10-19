@@ -23,6 +23,7 @@ pub mod models;
 pub mod oidc;
 pub mod paths;
 pub mod settings;
+pub mod subscription;
 pub mod time;
 pub mod tokens;
 pub mod update;

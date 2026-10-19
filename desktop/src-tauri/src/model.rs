@@ -13,7 +13,7 @@ use keyzapper_core::paths::{abbreviate_home, folder_name};
 use keyzapper_core::settings::{self, BindingHealth, BindingStatus, SettingsBinder};
 use keyzapper_core::update::ReleaseInfo;
 use keyzapper_core::tokens::TokenStore;
-use keyzapper_core::{agents, cli, helper, l, legacy_keychain, mcp, oidc, update, whats_new};
+use keyzapper_core::{agents, cli, helper, l, legacy_keychain, mcp, oidc, subscription, update, whats_new};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -45,6 +45,10 @@ pub struct Model {
     pub app_version: Option<String>,
     pub keys: KeyStore,
     pub tokens: TokenStore,
+    /// Claude Code's claude.ai login with plan and usage limits; None until checked or without subscription profile.
+    pub subscription: Option<subscription::Status>,
+    /// Start of the last budget and subscription refresh, so opening the tray popover only reloads stale values.
+    pub usage_refreshed_at: Option<std::time::Instant>,
     /// SSO profiles whose refresh failed (session expired); cleared on login/logout.
     pub sso_expired: HashSet<String>,
     /// SSO profiles with a browser login in progress.
@@ -138,6 +142,8 @@ impl Model {
             app_version: version,
             keys: KeyStore::default(),
             tokens: TokenStore::default(),
+            subscription: None,
+            usage_refreshed_at: None,
             sso_expired: HashSet::new(),
             sso_logging_in: HashSet::new(),
             binder: None,
@@ -219,6 +225,15 @@ impl Model {
         self.state.bindings.iter().find(|b| b.id == id).cloned()
     }
 
+    /// Subscription profiles send nothing to a gateway, so the gateway allowlist does not apply to them.
+    fn is_allowed(&self, profile: &Profile) -> bool {
+        profile.is_subscription() || self.config.is_endpoint_allowed(&profile.endpoint)
+    }
+
+    pub fn has_subscription_profile(&self) -> bool {
+        self.state.profiles.iter().any(Profile::is_subscription)
+    }
+
     fn not_allowed_message(&self, endpoint: &str) -> String {
         if !is_secure_endpoint(endpoint) {
             return l!("Der Endpunkt %@ verwendet kein https. Keys werden nur verschlüsselt übertragen (http nur für localhost).", endpoint);
@@ -282,16 +297,21 @@ impl Model {
     // MARK: Profiles
 
     pub fn save_profile_input(&mut self, input: ProfileInput) -> bool {
-        let Some(endpoint) = valid_endpoint(&input.endpoint) else {
-            self.error = Some(l!("Bitte eine vollständige https-URL angeben (http nur für localhost)."));
-            return false;
+        let existing = input.id.as_deref().and_then(parse_id).and_then(|id| self.profile(&id));
+        let auth_type = existing.as_ref().map_or(input.auth_type, |p| p.auth_type);
+        let (sso, subscription) = (auth_type == AuthType::Oidc, auth_type == AuthType::Subscription);
+        let endpoint = match valid_endpoint(&input.endpoint) {
+            _ if subscription => String::new(),
+            Some(endpoint) => endpoint,
+            None => {
+                self.error = Some(l!("Bitte eine vollständige https-URL angeben (http nur für localhost)."));
+                return false;
+            }
         };
         let (environment, invalid) = Profile::parse_environment(&input.environment_text);
         if input.name.trim().is_empty() || !invalid.is_empty() {
             return false;
         }
-        let existing = input.id.as_deref().and_then(parse_id).and_then(|id| self.profile(&id));
-        let sso = existing.as_ref().map_or(input.auth_type, |p| p.auth_type) == AuthType::Oidc;
         if sso {
             if let Err(e) = oidc::validate_url(&input.oidc_issuer) {
                 self.error = Some(e.to_string());
@@ -300,7 +320,7 @@ impl Model {
             if input.oidc_client_id.trim().is_empty() {
                 return false;
             }
-        } else if existing.is_none() && input.key.trim().is_empty() {
+        } else if !subscription && existing.is_none() && input.key.trim().is_empty() {
             return false;
         }
         let mut profile = existing.unwrap_or_else(|| Profile::new(new_id(), String::new(), String::new(), String::new()));
@@ -308,10 +328,14 @@ impl Model {
             profile.name = input.name.trim().to_string();
             profile.endpoint = endpoint;
             profile.model_alias = input.model_alias.trim().to_string();
-            profile.opus_model = non_empty(&input.opus_model);
-            profile.sonnet_model = non_empty(&input.sonnet_model);
-            profile.haiku_model = non_empty(&input.haiku_model);
+            // A subscription uses Claude's own model names; only the default model can be chosen.
+            profile.opus_model = non_empty(&input.opus_model).filter(|_| !subscription);
+            profile.sonnet_model = non_empty(&input.sonnet_model).filter(|_| !subscription);
+            profile.haiku_model = non_empty(&input.haiku_model).filter(|_| !subscription);
             profile.environment = (!environment.is_empty()).then_some(environment);
+            if subscription {
+                profile.auth_type = AuthType::Subscription;
+            }
             if sso {
                 profile.auth_type = AuthType::Oidc;
                 profile.oidc_issuer = Some(input.oidc_issuer.trim().to_string());
@@ -320,11 +344,11 @@ impl Model {
                 profile.oidc_token_type = input.oidc_token_type;
             }
         }
-        self.save_profile(profile, (!sso).then_some(input.key))
+        self.save_profile(profile, (!sso && !subscription).then_some(input.key))
     }
 
     pub fn save_profile(&mut self, profile: Profile, new_key: Option<String>) -> bool {
-        if !self.config.is_endpoint_allowed(&profile.endpoint) {
+        if !self.is_allowed(&profile) {
             self.error = Some(self.not_allowed_message(&profile.endpoint));
             return false;
         }
@@ -357,7 +381,7 @@ impl Model {
     }
 
     pub fn store_key(&mut self, id: &str, key: &str) -> bool {
-        let Some(profile) = self.profile(id) else { return false };
+        let Some(profile) = self.profile(id).filter(|p| !p.is_subscription()) else { return false };
         if !self.config.is_endpoint_allowed(&profile.endpoint) {
             self.error = Some(self.not_allowed_message(&profile.endpoint));
             return false;
@@ -480,7 +504,9 @@ impl Model {
         let keys = self.keys.all().unwrap_or_default();
         let tokens = self.tokens.all().unwrap_or_default();
         let usable = |p: &Profile| {
-            if p.is_sso() {
+            if p.is_subscription() {
+                self.subscription.as_ref().is_none_or(|s| s.logged_in)
+            } else if p.is_sso() {
                 !self.sso_expired.contains(&p.id) && tokens.get(&p.id).is_some_and(|t| !t.refresh_token.is_empty())
             } else {
                 keys.get(&p.id).is_some_and(|k| !k.is_empty())
@@ -515,7 +541,7 @@ impl Model {
 
     /// Projects whose Budget-Killer may burn this profile's key: pooled bindings of other profiles on the same endpoint.
     pub fn budget_killers(&self, profile: &Profile) -> Vec<String> {
-        if self.is_disabled() || profile.is_sso() {
+        if self.is_disabled() || profile.is_sso() || profile.is_subscription() {
             return vec![];
         }
         self.state
@@ -533,7 +559,7 @@ impl Model {
     /// Hidden Budget-Killer: switches a project between its own key and the pool of all keys on the same endpoint.
     pub fn toggle_pool(&mut self, binding_id: &str) {
         let Some(binding) = self.binding(binding_id) else { return };
-        let Some(profile) = self.profile(&binding.profile_id).filter(|p| !p.is_sso()) else { return };
+        let Some(profile) = self.profile(&binding.profile_id).filter(|p| !p.is_sso() && !p.is_subscription()) else { return };
         let pooled = !binding.is_pooled();
         if !self.apply(&profile, &binding.path, Some(&binding), Some(pooled)) {
             return;
@@ -582,6 +608,9 @@ impl Model {
     pub fn analysis_access(&mut self, binding_id: &str) -> Result<(Profile, String, String), String> {
         let binding = self.binding(binding_id).ok_or_else(|| l!("Unbekannte Zuordnung."))?;
         let profile = self.profile(&binding.profile_id).ok_or_else(|| l!("Unbekanntes Profil: %@", binding.profile_id))?;
+        if profile.is_subscription() {
+            return Err(l!("Die Analyse läuft über ein Gateway; mit einem Claude-Abo ist sie nicht verfügbar."));
+        }
         if !self.config.is_endpoint_allowed(&profile.endpoint) {
             return Err(self.not_allowed_message(&profile.endpoint));
         }
@@ -877,7 +906,7 @@ impl Model {
         let mut skipped = 0;
         let mut changed_profiles = Vec::new();
         for profile in &payload.state.profiles {
-            if !self.config.is_endpoint_allowed(&profile.endpoint) {
+            if !self.is_allowed(profile) {
                 skipped += 1;
                 continue;
             }
@@ -1096,6 +1125,7 @@ impl Model {
                     let session = tokens.get(&p.id).filter(|t| !t.refresh_token.is_empty());
                     ProfileView {
                         sso: p.is_sso(),
+                        subscription: p.is_subscription(),
                         oidc_issuer: p.oidc_issuer.clone(),
                         oidc_client_id: p.oidc_client_id.clone(),
                         oidc_scope: p.oidc_scope.clone(),
@@ -1169,6 +1199,7 @@ impl Model {
                     used_by: self.state.bindings.iter().filter(|b| b.mcp_server_ids.contains(&s.id)).map(|b| folder_name(&b.path)).collect(),
                 })
                 .collect(),
+            subscription: self.subscription.clone().filter(|_| self.has_subscription_profile()),
             global_profile_id: self.state.global_binding.as_ref().map(|g| g.profile_id.clone()),
             global_health: self.global_health.as_ref().map(HealthView::from),
             global_findings: self.global_findings.clone(),
@@ -1248,6 +1279,8 @@ pub struct View {
     profiles: Vec<ProfileView>,
     bindings: Vec<BindingView>,
     mcp_servers: Vec<McpServerView>,
+    /// Plan and usage limits of the Claude subscription, shared by all subscription profiles.
+    subscription: Option<subscription::Status>,
     global_profile_id: Option<String>,
     global_health: Option<HealthView>,
     global_findings: Vec<Finding>,
@@ -1304,6 +1337,8 @@ pub struct TrayProject {
 struct ProfileView {
     id: String,
     sso: bool,
+    /// Uses Claude Code's claude.ai login instead of a gateway.
+    subscription: bool,
     oidc_issuer: Option<String>,
     oidc_client_id: Option<String>,
     oidc_scope: Option<String>,
