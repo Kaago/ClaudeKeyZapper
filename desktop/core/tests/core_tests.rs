@@ -629,6 +629,31 @@ fn gateway_complete_posts_messages_and_reads_text() {
 }
 
 #[test]
+fn gateway_sso_budget_falls_back_to_the_user() {
+    use keyzapper_core::gateway::sso_budget;
+    use std::io::{Read, Write};
+    use std::time::Duration;
+    // A JWT without a mapped virtual key: `/key/info` finds no key, `/user/info` has the user's budget.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let replies = [("404 Not Found", r#"{"error":{"message":"Key not found in database"}}"#),
+            ("200 OK", r#"{"user_id":"u1","user_info":{"spend":12.5,"max_budget":50.0,"budget_reset_at":"2026-11-01T00:00:00"},"keys":[],"teams":[]}"#)];
+        replies.map(|(status, body)| {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let n = stream.read(&mut buffer).unwrap();
+            write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+            String::from_utf8_lossy(&buffer[..n]).lines().next().unwrap_or_default().to_lowercase()
+        })
+    });
+    let budget = sso_budget(&endpoint, "jwt", Duration::from_secs(5)).unwrap();
+    assert_eq!((budget.spend, budget.max_budget, budget.reset_at.as_deref()), (12.5, Some(50.0), Some("2026-11-01T00:00:00")));
+    let requests = server.join().unwrap();
+    assert!(requests[0].starts_with("get /key/info ") && requests[1].starts_with("get /user/info "), "{requests:?}");
+}
+
+#[test]
 fn whats_new_lists_releases_since_the_previous_version() {
     use keyzapper_core::whats_new::since;
     let versions = |previous: Option<&str>, current: &str| since(previous, current).into_iter().map(|r| r.version).collect::<Vec<_>>();

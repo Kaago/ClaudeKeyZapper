@@ -162,9 +162,21 @@ pub fn models(endpoint: &str, key: &str) -> Result<Vec<String>, CheckResult> {
 
 /// LiteLLM's `GET /key/info` without `key` parameter describes the calling key: spend, limit and next reset.
 pub fn budget(endpoint: &str, key: &str, timeout: Duration) -> Result<KeyBudget, CheckResult> {
-    let body = get("key/info", endpoint, key, timeout)?;
-    let value: serde_json::Value = serde_json::from_str(&body).map_err(|_| CheckResult::HttpError(200))?;
-    let info = value.get("info").filter(|i| i.is_object()).ok_or(CheckResult::HttpError(200))?;
+    parse_budget(&get("key/info", endpoint, key, timeout)?, "info")
+}
+
+/// Budget for an SSO token: LiteLLM only finds a key for a JWT mapped to a virtual key; otherwise `/key/info` fails (404)
+/// and `GET /user/info` without `user_id` describes the signed-in user: spend, limit and next reset.
+pub fn sso_budget(endpoint: &str, token: &str, timeout: Duration) -> Result<KeyBudget, CheckResult> {
+    match budget(endpoint, token, timeout) {
+        Err(CheckResult::HttpError(_)) => parse_budget(&get("user/info", endpoint, token, timeout)?, "user_info"),
+        other => other,
+    }
+}
+
+fn parse_budget(body: &str, field: &str) -> Result<KeyBudget, CheckResult> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|_| CheckResult::HttpError(200))?;
+    let info = value.get(field).filter(|i| i.is_object()).ok_or(CheckResult::HttpError(200))?;
     Ok(KeyBudget {
         spend: info["spend"].as_f64().unwrap_or(0.0),
         max_budget: info["max_budget"].as_f64(),
