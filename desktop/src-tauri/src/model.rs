@@ -13,7 +13,9 @@ use keyzapper_core::paths::{abbreviate_home, folder_name};
 use keyzapper_core::settings::{self, BindingHealth, BindingStatus, SettingsBinder};
 use keyzapper_core::update::ReleaseInfo;
 use keyzapper_core::tokens::TokenStore;
-use keyzapper_core::{agents, cli, helper, l, legacy_keychain, mcp, oidc, subscription, update, whats_new};
+use keyzapper_core::mcp_catalog::{Catalog, FetchError};
+use keyzapper_core::tools::{Tool, ToolStatus};
+use keyzapper_core::{agents, claude_desktop, cli, helper, l, legacy_keychain, mcp, mcp_catalog, oidc, subscription, update, whats_new};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -57,6 +59,15 @@ pub struct Model {
     pub refresh_generation: u64,
     /// True if the window got the system's translucent material (macOS vibrancy, Windows 11 Mica).
     pub vibrancy: bool,
+    /// Central MCP server list (`ManagedMcpServersURL`) as last fetched; its servers are managed by IT.
+    pub mcp_catalog: Option<Catalog>,
+    pub mcp_catalog_problem: Option<String>,
+    pub mcp_catalog_loading: bool,
+    /// Installed Claude tools; None until checked.
+    pub tools: Option<Vec<ToolStatus>>,
+    pub installing_tool: Option<Tool>,
+    /// KeyZapper's entry in Claude Desktop's configuration library.
+    pub claude_desktop: claude_desktop::Status,
     backup_dir: Option<PathBuf>,
     metadata: MetadataStore,
     /// Set when metadata could not be read (e.g. newer schema); saving is blocked to avoid data loss.
@@ -149,6 +160,12 @@ impl Model {
             binder: None,
             refresh_generation: 0,
             vibrancy: false,
+            mcp_catalog: None,
+            mcp_catalog_problem: None,
+            mcp_catalog_loading: false,
+            tools: None,
+            installing_tool: None,
+            claude_desktop: claude_desktop::Status::default(),
             backup_dir,
             metadata,
             metadata_unreadable: false,
@@ -184,6 +201,10 @@ impl Model {
         }
         model.sync_managed_profiles();
         model.migrate_helper_path();
+        if let Some(url) = model.config.managed_mcp_servers_url.clone() {
+            model.mcp_catalog = mcp_catalog::load_cache(&url);
+            model.sync_managed_mcp_servers(None);
+        }
         model
     }
 
@@ -376,6 +397,9 @@ impl Model {
                     self.apply_global(&profile, Some(&global));
                 }
             }
+            if claude_desktop::status(&claude_desktop::library_dir()).profile_id.as_deref() == Some(profile.id.as_str()) {
+                self.apply_claude_desktop(&profile);
+            }
         }
         true
     }
@@ -419,6 +443,10 @@ impl Model {
                 let _ = binder.revert_global(&global);
             }
             self.state.global_binding = None;
+        }
+        if claude_desktop::status(&claude_desktop::library_dir()).profile_id.as_deref() == Some(id) {
+            let _ = claude_desktop::remove(&claude_desktop::library_dir());
+            self.claude_desktop = claude_desktop::status(&claude_desktop::library_dir());
         }
         self.state.profiles.retain(|p| p.id != id);
         self.budgets.remove(id);
@@ -703,9 +731,18 @@ impl Model {
         self.state.mcp_server(id).cloned()
     }
 
+    /// Server of the central list; IT changes it there, not in the app.
+    fn is_managed_mcp(&self, id: &str) -> bool {
+        self.mcp_catalog.as_ref().is_some_and(|c| c.servers.iter().any(|s| s.id == id))
+    }
+
     pub fn save_mcp_server(&mut self, input: McpServerInput) -> bool {
         let name = input.name.trim().to_string();
         let existing = input.id.as_deref().and_then(parse_id).and_then(|id| self.mcp_server(&id));
+        if existing.as_ref().is_some_and(|e| self.is_managed_mcp(&e.id)) {
+            self.error = Some(l!("Dieser MCP-Server wird von der IT verwaltet und kann nicht geändert werden."));
+            return false;
+        }
         if !McpServer::is_valid_name(&name) {
             self.error = Some(l!("Der Servername darf nur Buchstaben, Ziffern, „-“, „_“ und „.“ enthalten."));
             return false;
@@ -780,6 +817,10 @@ impl Model {
 
     pub fn delete_mcp_server(&mut self, id: &str) {
         let Some(server) = self.mcp_server(id) else { return };
+        if self.is_managed_mcp(id) {
+            self.error = Some(l!("Dieser MCP-Server wird von der IT verwaltet und kann nicht geändert werden."));
+            return;
+        }
         for binding in self.state.bindings.clone().iter().filter(|b| b.mcp_server_ids.contains(&server.id)) {
             let ids = binding.mcp_server_ids.iter().filter(|i| **i != server.id).cloned().collect();
             if !self.set_project_mcp_servers(&binding.id, ids) {
@@ -836,12 +877,141 @@ impl Model {
         }
     }
 
-    /// Takes over MCP servers from a backup (new ones added, known ones updated).
+    /// Takes over MCP servers from a backup (new ones added, known ones updated; those of the central list stay as IT set them).
     fn merge_mcp_servers(&mut self, servers: &[McpServer]) {
         for server in servers {
+            if self.is_managed_mcp(&server.id) {
+                continue;
+            }
             match self.state.mcp_servers.iter_mut().find(|s| s.id == server.id) {
                 Some(existing) => *existing = server.clone(),
                 None => self.state.mcp_servers.push(server.clone()),
+            }
+        }
+    }
+
+    // MARK: Central MCP server list
+
+    /// Address of the central list and the token of an SSO profile signed in at its host (gateway or identity
+    /// provider), so the server can answer per user. Only hosts that get this token anyway receive it.
+    pub fn mcp_catalog_request(&mut self) -> Option<(String, Option<String>)> {
+        let url = self.config.managed_mcp_servers_url.clone()?;
+        let host = host_of(&url);
+        let now = oidc::unix_now();
+        let token = self
+            .state
+            .profiles
+            .iter()
+            .filter(|p| p.is_sso() && host.is_some() && [host_of(&p.endpoint), p.oidc_issuer.as_deref().and_then(host_of)].contains(&host))
+            .find_map(|p| oidc::access_token(p, &self.tokens, now).ok());
+        self.mcp_catalog_loading = true;
+        Some((url, token))
+    }
+
+    pub fn take_mcp_catalog(&mut self, result: Result<Catalog, FetchError>) {
+        self.mcp_catalog_loading = false;
+        match result {
+            Ok(catalog) => {
+                if let Err(e) = mcp_catalog::save_cache(&catalog) {
+                    eprintln!("KeyZapper: MCP list not cached: {e}");
+                }
+                let previous = self.mcp_catalog.replace(catalog);
+                self.mcp_catalog_problem = None;
+                self.sync_managed_mcp_servers(previous.as_ref());
+            }
+            Err(e) => self.mcp_catalog_problem = Some(e.to_string()),
+        }
+    }
+
+    /// Takes over the central list: new servers are added, changed ones rewritten in the projects using them, and
+    /// those IT took off the list (compared with `previous`) leave the projects. A server of your own with the same
+    /// name keeps its place; the list's entry is then left out.
+    fn sync_managed_mcp_servers(&mut self, previous: Option<&Catalog>) {
+        let Some(catalog) = self.mcp_catalog.clone() else { return };
+        let notice = self.notice.clone();
+        let (mut added, mut changed) = (false, Vec::new());
+        for server in &catalog.servers {
+            if self.state.mcp_servers.iter().any(|s| s.name == server.name && s.id != server.id) {
+                continue;
+            }
+            match self.state.mcp_servers.iter_mut().find(|s| s.id == server.id) {
+                Some(existing) if existing == server => {}
+                Some(existing) => {
+                    *existing = server.clone();
+                    changed.push(server.id.clone());
+                }
+                None => {
+                    self.state.mcp_servers.push(server.clone());
+                    added = true;
+                }
+            }
+        }
+        if added || !changed.is_empty() {
+            self.persist();
+        }
+        for binding in self.state.bindings.clone().iter().filter(|b| b.mcp_server_ids.iter().any(|id| changed.contains(id))) {
+            self.apply_mcp(&binding.id, true);
+        }
+        for gone in previous.into_iter().flat_map(|p| p.servers.iter()).filter(|s| !catalog.servers.iter().any(|c| c.id == s.id)) {
+            self.delete_mcp_server(&gone.id);
+        }
+        self.notice = notice;
+    }
+
+    /// Names on the central list that were left out because a server of your own has that name.
+    fn shadowed_mcp_names(&self) -> Vec<String> {
+        let Some(catalog) = &self.mcp_catalog else { return vec![] };
+        catalog.servers.iter().filter(|c| self.state.mcp_server(&c.id).is_none()).map(|c| c.name.clone()).collect()
+    }
+
+    // MARK: Claude tools
+
+    pub fn tool_installed_message(tool: Tool) -> String {
+        match tool {
+            Tool::Cli => l!("Claude Code ist installiert. Neue Terminal-Fenster finden den Befehl claude."),
+            Tool::VsCode => l!("Claude Code für VS Code ist installiert. Bitte das VS Code-Fenster neu laden."),
+            Tool::Intellij => l!("Das Claude Code-Plugin ist installiert. Bitte IntelliJ IDEA neu starten."),
+            Tool::Desktop => l!("Claude Desktop ist installiert."),
+        }
+    }
+
+    /// Lets Claude Desktop use a profile's gateway (key or SSO via the helper); None restores its normal sign-in.
+    pub fn set_claude_desktop_profile(&mut self, profile_id: Option<String>) {
+        let profile = match profile_id {
+            Some(id) => match self.profile(&id) {
+                Some(profile) => Some(profile),
+                None => {
+                    self.error = Some(l!("Unbekanntes Profil: %@", id));
+                    return;
+                }
+            },
+            None => None,
+        };
+        match profile {
+            Some(profile) if profile.is_subscription() => {
+                self.error = Some(l!("Mit einem Claude-Abo meldet sich Claude Desktop selbst an. Bitte „Normale Anmeldung“ wählen."));
+            }
+            Some(profile) if !self.is_allowed(&profile) => self.error = Some(self.not_allowed_message(&profile.endpoint)),
+            Some(profile) => {
+                if self.apply_claude_desktop(&profile) {
+                    self.notice = Some(l!("Claude Desktop nutzt jetzt „%@“. Bitte Claude Desktop beenden und neu öffnen.", profile.name));
+                }
+            }
+            None => match claude_desktop::remove(&claude_desktop::library_dir()) {
+                Ok(()) => self.notice = Some(l!("KeyZapper-Konfiguration aus Claude Desktop entfernt. Nach einem Neustart meldet sich Claude Desktop wieder normal an.")),
+                Err(e) => self.error = Some(l!("Claude Desktop konnte nicht eingerichtet werden: %@", e)),
+            },
+        }
+        self.claude_desktop = claude_desktop::status(&claude_desktop::library_dir());
+    }
+
+    fn apply_claude_desktop(&mut self, profile: &Profile) -> bool {
+        let Some(helper) = self.binder.as_ref().map(|b| b.helper_path.clone()) else { return false };
+        match claude_desktop::apply(&claude_desktop::library_dir(), profile, &helper) {
+            Ok(()) => true,
+            Err(e) => {
+                self.error = Some(l!("Claude Desktop konnte nicht eingerichtet werden: %@", e));
+                false
             }
         }
     }
@@ -1197,6 +1367,7 @@ impl Model {
                 .mcp_servers
                 .iter()
                 .map(|s| McpServerView {
+                    managed: self.is_managed_mcp(&s.id),
                     id: s.id.clone(),
                     name: s.name.clone(),
                     transport: s.transport,
@@ -1211,6 +1382,23 @@ impl Model {
                     used_by: self.state.bindings.iter().filter(|b| b.mcp_server_ids.contains(&s.id)).map(|b| folder_name(&b.path)).collect(),
                 })
                 .collect(),
+            mcp_catalog: self.config.managed_mcp_servers_url.as_ref().map(|url| McpCatalogView {
+                url: url.clone(),
+                fetched_at: self.mcp_catalog.as_ref().map(|c| c.fetched_at),
+                count: self.mcp_catalog.as_ref().map_or(0, |c| c.servers.len()),
+                skipped: self.mcp_catalog.as_ref().map(|c| c.skipped.clone()).unwrap_or_default(),
+                shadowed: self.shadowed_mcp_names(),
+                problem: self.mcp_catalog_problem.clone(),
+                loading: self.mcp_catalog_loading,
+            }),
+            claude_tools_enabled: self.config.claude_tools_enabled,
+            tools: self.tools.clone(),
+            installing_tool: self.installing_tool,
+            claude_desktop: ClaudeDesktopView {
+                profile_id: self.claude_desktop.profile_id.clone(),
+                applied: self.claude_desktop.applied,
+                managed: self.claude_desktop.managed,
+            },
             subscription: self.subscription.clone().filter(|_| self.has_subscription_profile()),
             global_profile_id: self.state.global_binding.as_ref().map(|g| g.profile_id.clone()),
             global_health: self.global_health.as_ref().map(HealthView::from),
@@ -1291,6 +1479,12 @@ pub struct View {
     profiles: Vec<ProfileView>,
     bindings: Vec<BindingView>,
     mcp_servers: Vec<McpServerView>,
+    /// Present if IT set `ManagedMcpServersURL`.
+    mcp_catalog: Option<McpCatalogView>,
+    claude_tools_enabled: bool,
+    tools: Option<Vec<ToolStatus>>,
+    installing_tool: Option<Tool>,
+    claude_desktop: ClaudeDesktopView,
     /// Plan and usage limits of the Claude subscription, shared by all subscription profiles.
     subscription: Option<subscription::Status>,
     global_profile_id: Option<String>,
@@ -1402,6 +1596,8 @@ struct BindingView {
 #[serde(rename_all = "camelCase")]
 struct McpServerView {
     id: String,
+    /// From the central list: IT changes it, the app only switches it on per project.
+    managed: bool,
     name: String,
     transport: McpTransport,
     command: String,
@@ -1414,6 +1610,27 @@ struct McpServerView {
     oauth_scopes: String,
     /// Names of the projects using this server.
     used_by: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpCatalogView {
+    url: String,
+    /// Unix time of the last successful fetch.
+    fetched_at: Option<i64>,
+    count: usize,
+    skipped: Vec<String>,
+    shadowed: Vec<String>,
+    problem: Option<String>,
+    loading: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeDesktopView {
+    profile_id: Option<String>,
+    applied: bool,
+    managed: bool,
 }
 
 #[derive(Serialize)]

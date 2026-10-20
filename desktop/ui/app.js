@@ -144,9 +144,10 @@ const PAGES = () => [
   ['profiles', t('Profile'), 'key'],
   ['projects', t('Projekte'), 'folder'],
   ['mcp', t('MCP-Server'), 'plug'],
+  view.claudeToolsEnabled && ['tools', t('Claude-Tools'), 'download'],
   ['settings', t('Claude-Einstellungen'), 'shield'],
   ['backup', t('Backup'), 'archive'],
-];
+].filter(Boolean);
 
 let page = 'profiles';
 try { page = localStorage.getItem('page') ?? page; } catch { /* storage unavailable */ }
@@ -157,6 +158,10 @@ function navigate(next) {
   if (next === 'settings') {
     settingsSelection = null;
     call('refresh_all');
+  }
+  if (next === 'tools') {
+    desktopSelection = null;
+    call('load_tools');
   }
   renderSidebar();
   renderMain();
@@ -171,11 +176,12 @@ function renderSidebar() {
   const badges = {
     profiles: [view.profiles.length || null],
     projects: attention ? [attention, 'warning'] : [view.bindings.length || null],
-    mcp: [view.mcpServers.length || null],
+    mcp: view.mcpCatalog?.problem ? ['!', 'warning'] : [view.mcpServers.length || null],
+    tools: [null],
     settings: settingsProblems ? [settingsProblems, 'warning'] : [null],
     backup: [null],
   };
-  const signature = JSON.stringify([page, view.language, view.disabled, badges, view.appVersion, view.updateCheckEnabled, view.platform]);
+  const signature = JSON.stringify([page, view.language, view.disabled, badges, view.appVersion, view.updateCheckEnabled, view.platform, view.claudeToolsEnabled]);
   if (signature === sidebarSignature) return;
   sidebarSignature = signature;
   const active = h('input', {
@@ -354,7 +360,7 @@ const contextMenu = (items) => (event) => {
 function renderMain() {
   const main = document.getElementById('main');
   const scroll = main.scrollTop;
-  const pages = { profiles: profilesPage, projects: projectsPage, mcp: mcpPage, settings: settingsPage, backup: backupPage };
+  const pages = { profiles: profilesPage, projects: projectsPage, mcp: mcpPage, tools: view.claudeToolsEnabled ? toolsPage : null, settings: settingsPage, backup: backupPage };
   main.replaceChildren(...[(pages[page] ?? profilesPage)()].flat(Infinity).filter(Boolean));
   main.scrollTop = scroll;
 }
@@ -1220,14 +1226,15 @@ function mcpServerCard(server) {
   };
   const template = MCP_TEMPLATES().find((tpl) => tpl.name === server.name);
   const menu = () => [[t('Bearbeiten'), () => mcpServerEditor(server), { iconName: 'pencil' }], '-', [t('Löschen'), remove, { iconName: 'trash', danger: true }]];
-  return h('section', { class: 'card', 'aria-label': server.name, oncontextmenu: contextMenu(menu) },
+  return h('section', { class: 'card', 'aria-label': server.name, oncontextmenu: server.managed ? null : contextMenu(menu) },
     h('div', { class: 'card-head' },
       h('span', { class: 'avatar', style: `--profile: ${template?.color ?? 'var(--accent-fill)'}`, 'aria-hidden': 'true' }, (template?.title ?? server.name).slice(0, 1).toUpperCase()),
       h('div', { class: 'card-title' },
-        h('h2', null, server.name, h('span', { class: 'badge' }, transportLabel(server.transport)), server.oauthClientId && h('span', { class: 'badge' }, 'OAuth')),
+        h('h2', null, server.name, h('span', { class: 'badge' }, transportLabel(server.transport)), server.oauthClientId && h('span', { class: 'badge' }, 'OAuth'),
+          server.managed && h('span', { class: 'badge', title: t('Von der IT über die zentrale Liste bereitgestellt; hier nicht änderbar.') }, t('Von IT verwaltet'))),
         h('div', { class: 'mono muted selectable', title: mcpSummary(server) }, mcpSummary(server))),
-      button(t('Bearbeiten'), () => mcpServerEditor(server), { iconName: 'pencil', iconOnly: true }),
-      menuButton(t('Weitere Aktionen'), menu)),
+      !server.managed && button(t('Bearbeiten'), () => mcpServerEditor(server), { iconName: 'pencil', iconOnly: true }),
+      !server.managed && menuButton(t('Weitere Aktionen'), menu)),
     view.bindings.length
       ? h('div', { class: 'toggle-row' }, h('span', { class: 'muted small' }, t('Aktiv in')),
         view.bindings.map((b) => toggleChip(b.name, b.mcpServerIds.includes(server.id), (on) => setProjectServer(b, server.id, on),
@@ -1241,6 +1248,7 @@ function mcpPage() {
   return [
     pageHeader(t('MCP-Server'), t('Zusätzliche Werkzeuge für Claude Code, z. B. GitHub, Datenbanken oder ein Browser. Je Projekt einschalten – KeyZapper schreibt sie in die .mcp.json des Repositorys und schaltet sie frei.'),
       button(t('Neuer Server'), () => mcpServerEditor(null), { iconName: 'plus', cls: 'primary' })),
+    mcpCatalogCard(),
     view.mcpServers.map(mcpServerCard),
     templates.length > 0 && h('section', { class: 'templates' },
       h('h3', null, view.mcpServers.length ? t('Weitere Vorlagen') : t('Mit einer Vorlage starten')),
@@ -1249,6 +1257,26 @@ function mcpPage() {
         h('span', { class: 'template-text' }, h('strong', null, tpl.title), h('span', { class: 'muted small' }, tpl.description)),
         h('span', { class: 'badge' }, transportLabel(tpl.transport)))))),
   ];
+}
+
+/** State of the central MCP server list IT sets with `ManagedMcpServersURL`. */
+function mcpCatalogCard() {
+  const c = view.mcpCatalog;
+  if (!c) return null;
+  const fetched = c.fetchedAt ? dateTimeText(new Date(c.fetchedAt * 1000)) : null;
+  const status = c.problem ? h('div', { class: 'finding orange' }, icon('warning'), h('span', { class: 'selectable' }, c.problem))
+    : fetched ? h('div', { class: 'finding green' }, icon('check'), t('%@ Server, Stand %@.', c.count, fetched))
+      : h('div', { class: 'finding muted' }, icon('info'), c.loading ? t('Wird geladen …') : t('Noch nicht geladen.'));
+  return h('section', { class: 'card' },
+    h('div', { class: 'card-head' },
+      h('span', { class: 'tile-icon', 'aria-hidden': 'true' }, icon('server')),
+      h('div', { class: 'card-title' }, h('h2', null, t('Zentrale MCP-Liste der IT')), h('div', { class: 'mono muted small selectable', title: c.url }, c.url)),
+      button(t('Neu laden'), () => call('reload_mcp_catalog'), { iconName: 'refresh', iconOnly: true, disabled: c.loading })),
+    status,
+    fetched && c.problem && h('div', { class: 'muted small' }, t('Es gilt weiter die Liste vom %@.', fetched)),
+    c.skipped.length > 0 && h('div', { class: 'finding orange' }, icon('warning'), t('Unvollständig oder ungültig, daher ausgelassen: %@', c.skipped.join(', '))),
+    c.shadowed.length > 0 && h('div', { class: 'finding orange' }, icon('warning'), t('Ausgelassen, weil ein eigener Server so heißt: %@', c.shadowed.join(', '))),
+    h('div', { class: 'section-note' }, t('Diese Server stellt die IT bereit und pflegt sie zentral; KeyZapper lädt die Liste beim Start und alle 10 Minuten. Je Projekt einschalten wie eigene Server.')));
 }
 
 /** Lines that are not `NAME=value` (environment) or `Name: value` (headers). */
@@ -1332,7 +1360,7 @@ function projectMcpDialog(binding) {
         h('h2', null, t('MCP-Server für „%@“', binding.name)),
         !view.mcpServers.length ? h('div', { class: 'muted' }, t('Noch keine MCP-Server eingerichtet.'))
           : h('div', { class: 'switch-list' }, view.mcpServers.map((s) => h('label', { class: 'switch-row' },
-            h('span', { class: 'switch-text' }, h('strong', null, s.name, h('span', { class: 'badge' }, transportLabel(s.transport))),
+            h('span', { class: 'switch-text' }, h('strong', null, s.name, h('span', { class: 'badge' }, transportLabel(s.transport)), s.managed && h('span', { class: 'badge' }, t('Von IT verwaltet'))),
               h('span', { class: 'mono muted small' }, mcpSummary(s))),
             h('input', { type: 'checkbox', role: 'switch', checked: current.mcpServerIds.includes(s.id),
               onchange: (e) => setProjectServer(current, s.id, e.target.checked) })))),
@@ -1342,6 +1370,87 @@ function projectMcpDialog(binding) {
       actions: [button(t('MCP-Server verwalten …'), () => { close(); navigate('mcp'); }, { cls: 'left' }), button(t('Fertig'), close, { cls: 'primary' })],
     };
   }, { live: true });
+}
+
+// MARK: Claude tools
+
+const TOOLS = () => [
+  { tool: 'cli', title: 'Claude Code', subtitle: t('Für das Terminal, auch von IntelliJ IDEA genutzt'), symbol: 'terminal', color: '#d97757' },
+  { tool: 'vsCode', title: t('Claude Code für VS Code'), subtitle: t('Erweiterung aus dem VS Code Marketplace'), symbol: 'plug', color: '#0066b8',
+    missing: t('Visual Studio Code wurde nicht gefunden.') },
+  { tool: 'intellij', title: t('Claude Code für IntelliJ IDEA'), subtitle: t('Plugin aus dem JetBrains Marketplace'), symbol: 'plug', color: '#fe2857',
+    missing: t('IntelliJ IDEA wurde nicht gefunden.') },
+  { tool: 'desktop', title: 'Claude Desktop', subtitle: t('App für Chat, Cowork und Code'), symbol: 'bolt', color: '#c96442' },
+];
+
+let desktopSelection = null;
+
+function toolCard(info, status, ...extra) {
+  const installing = view.installingTool === info.tool;
+  const installed = status?.version != null;
+  const text = !status ? t('Wird geprüft …')
+    : installed ? (status.version ? t('Installiert · Version %@', status.version) : t('Installiert'))
+      : !status.hostFound ? info.missing : t('Nicht installiert');
+  return h('section', { class: 'card', 'aria-label': info.title },
+    h('div', { class: 'card-head' },
+      h('span', { class: 'avatar', style: `--profile: ${info.color}`, 'aria-hidden': 'true' }, icon(info.symbol)),
+      h('div', { class: 'card-title' }, h('h2', null, info.title), h('div', { class: 'muted small' }, info.subtitle)),
+      status && !installed && status.hostFound && button(installing ? t('Wird installiert …') : t('Installieren'),
+        () => call('install_tool', { tool: info.tool }), { iconName: 'download', cls: 'primary', disabled: !!view.installingTool })),
+    h('div', { class: `finding ${installed ? 'green' : 'muted'}` }, icon(installed ? 'check' : 'info'), text,
+      installing && h('span', { class: 'spinner', role: 'status', 'aria-label': t('Wird installiert …') })),
+    extra);
+}
+
+/** Claude Desktop's third-party mode with a KeyZapper profile, or its normal sign-in. */
+function claudeDesktopSettings() {
+  const current = view.claudeDesktop.profileId ?? '';
+  if (desktopSelection === null) desktopSelection = current;
+  const selected = desktopSelection;
+  const configured = view.profiles.find((p) => p.id === view.claudeDesktop.profileId);
+  return h('fieldset', null, h('legend', null, t('Anmeldung')),
+    field(t('Profil'), h('select', { onchange: (e) => { desktopSelection = e.target.value; renderMain(); } },
+      h('option', { value: '', selected: !selected }, t('Normale Anmeldung (claude.ai)')),
+      view.profiles.filter((p) => !p.subscription).map((p) => h('option', { value: p.id, selected: p.id === selected }, profileLabel(p)))), 't-desktop-profile'),
+    configured && view.claudeDesktop.applied && h('div', { class: 'finding green' }, icon('check'), t('Claude Desktop nutzt „%@“ über das Gateway.', configured.name)),
+    configured && !view.claudeDesktop.applied && h('div', { class: 'finding orange' }, icon('warning'),
+      t('Für „%@“ eingerichtet, in Claude Desktop ist aber eine andere Konfiguration ausgewählt.', configured.name)),
+    view.claudeDesktop.managed && h('div', { class: 'finding orange' }, icon('warning'),
+      t('Claude Desktop wird auf diesem Rechner von der IT konfiguriert; deren Einstellungen haben Vorrang.')),
+    h('div', { class: 'line' }, h('span', { class: 'spacer' }),
+      button(t('Übernehmen'), async () => { if (!selected || await ensureLogin(selected)) call('set_claude_desktop_profile', { profileId: selected || null }); },
+        { cls: 'primary', disabled: selected === current && (!selected || view.claudeDesktop.applied) })),
+    h('div', { class: 'section-note' }, t('KeyZapper legt dafür eine Konfigurationsdatei für den Drittanbieter-Modus von Claude Desktop an: Anfragen gehen an das Gateway des Profils, Key oder SSO-Token holt Claude Desktop über den Helper – wie Claude Code. Danach Claude Desktop beenden, neu öffnen und auf dem Anmeldebildschirm den Start mit dieser Konfiguration wählen.')));
+}
+
+function toolsPage() {
+  const status = (tool) => view.tools?.find((s) => s.tool === tool);
+  const [cli, vscode, intellij, desktop] = TOOLS();
+  const cliPath = status('cli')?.path;
+  const globalProfile = view.profiles.find((p) => p.id === view.globalProfileId);
+  return [
+    pageHeader(t('Claude-Tools'), t('Claude Code und Claude Desktop aus den offiziellen Quellen von Anthropic installieren – ohne Administratorrechte – und mit deinen Profilen verbinden.'),
+      button(t('Erneut prüfen'), () => call('load_tools'), { iconName: 'refresh', iconOnly: true })),
+    toolCard(cli, status('cli'),
+      cliPath && h('div', { class: 'mono muted small selectable' }, cliPath),
+      h('div', { class: 'section-note' }, t('Offizieller Installer von Anthropic: installiert in dein Benutzerverzeichnis und aktualisiert sich selbst.'))),
+    toolCard(vscode, status('vsCode'),
+      status('vsCode')?.version != null && h('div', { class: 'line' },
+        h('span', { class: 'section-note spacer' }, t('Für Key- und SSO-Profile in VS Code „Disable Login Prompt“ einschalten, damit die Erweiterung keine Claude-Anmeldung verlangt. Mit einem Claude-Abo ausgeschaltet lassen.')),
+        button(t('Einstellung öffnen'), () => call('open_vscode_setting')))),
+    toolCard(intellij, status('intellij'),
+      h('div', { class: 'section-note' }, t('Das Plugin startet claude im Terminal von IntelliJ – dafür zuerst Claude Code installieren. IntelliJ IDEA vor der Installation beenden.')),
+      cliPath && status('intellij')?.version != null && h('div', { class: 'section-note' },
+        t('Findet IntelliJ claude nicht, unter Settings › Tools › Claude Code [Beta] als „Claude command“ eintragen: %@', cliPath))),
+    toolCard(desktop, status('desktop'), claudeDesktopSettings()),
+    h('section', { class: 'card' },
+      h('h2', null, t('Anmeldung in Claude Code')),
+      h('p', { class: 'muted', style: 'margin:0' }, t('Claude Code im Terminal, in VS Code und in IntelliJ nutzt in zugeordneten Projekten deren Profil, in allen übrigen Ordnern das Standardprofil – mit Key, SSO oder Claude-Abo, ohne eigene Anmeldung.')),
+      h('div', { class: 'line' },
+        h('span', { class: `finding ${globalProfile ? 'green' : 'muted'} spacer` }, icon(globalProfile ? 'check' : 'info'),
+          globalProfile ? t('Standardprofil: %@', globalProfile.name) : t('Kein Standardprofil gesetzt.')),
+        button(t('Standardprofil festlegen …'), () => navigate('settings')))),
+  ];
 }
 
 /** Once after an update: the highlights of the releases since the version last seen. */
@@ -1564,6 +1673,7 @@ async function start() {
   document.body.append(tooltip);
   english = await invoke('translations');
   setView(await invoke('get_view'));
+  if (page === 'tools') call('load_tools');
   await listen('changed', async () => setView(await invoke('get_view')));
   await listen('navigate', (e) => navigate(e.payload));
   await listen('tauri://drag-enter', (e) => markDrop(e.payload.position));

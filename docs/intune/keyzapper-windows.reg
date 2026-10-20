@@ -16,3 +16,5 @@ Windows Registry Editor Version 5.00
 "OneDriveBackup"=dword:00000001
 "UpdateCheckEnabled"=dword:00000000
 "AllowKeyExport"=dword:00000001
+"ManagedMcpServersURL"="https://sso.firma.example/keyzapper/mcp-servers.json"
+"ClaudeToolsEnabled"=dword:00000001

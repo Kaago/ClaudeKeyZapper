@@ -6,7 +6,8 @@ mod tray;
 
 use keyzapper_core::errors::Error;
 use keyzapper_core::gateway::CheckResult;
-use keyzapper_core::{agents, backup, clipboard, gateway, l, legacy_keychain, oidc, subscription, update};
+use keyzapper_core::tools::{self, Tool};
+use keyzapper_core::{agents, backup, claude_desktop, clipboard, gateway, l, legacy_keychain, mcp_catalog, oidc, subscription, update};
 use model::{McpServerInput, Model, ProfileInput, View};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -137,6 +138,29 @@ fn refresh_usage(app: &AppHandle) {
     refresh_subscription(app);
 }
 
+/// Loads the central MCP server list (`ManagedMcpServersURL`), if IT set one.
+fn refresh_mcp_catalog(app: &AppHandle) {
+    let Some((url, token)) = with_model(app, |m| m.mcp_catalog_request()) else { return };
+    changed(app);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let result = mcp_catalog::fetch(&url, token.as_deref(), Duration::from_secs(15));
+        with_model(&app, |m| m.take_mcp_catalog(result));
+        refresh(&app);
+    });
+}
+
+/// Which Claude tools are installed and what Claude Desktop is set to.
+fn refresh_tools(app: &AppHandle) {
+    let status = tools::status();
+    let desktop = claude_desktop::status(&claude_desktop::library_dir());
+    with_model(app, |m| {
+        m.tools = Some(status);
+        m.claude_desktop = desktop;
+    });
+    changed(app);
+}
+
 /// Stable releases only, unless `beta` was asked for or a beta is installed (testers get the next beta too).
 fn check_updates(app: &AppHandle, user_initiated: bool, beta: bool) {
     let (enabled, version) = with_model(app, |m| (m.config.update_check_enabled, m.app_version.clone()));
@@ -168,11 +192,13 @@ const BACKGROUND_REFRESH: Duration = Duration::from_secs(10 * 60);
 fn start_background(app: &AppHandle) {
     refresh(app);
     refresh_usage(app);
+    refresh_mcp_catalog(app);
     let handle = app.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(BACKGROUND_REFRESH);
         refresh(&handle);
         refresh_usage(&handle);
+        refresh_mcp_catalog(&handle);
     });
     let handle = app.clone();
     std::thread::spawn(move || check_updates(&handle, false, false));
@@ -391,6 +417,7 @@ async fn sso_login(app: AppHandle, profile_id: String) -> View {
             }
         });
         refresh(&app);
+        refresh_mcp_catalog(&app);
         view(&app)
     })
     .await
@@ -556,6 +583,66 @@ async fn set_project_mcp_servers(app: AppHandle, binding_id: String, server_ids:
         m.set_project_mcp_servers(&binding_id, server_ids);
     })
     .await
+}
+
+#[tauri::command]
+async fn reload_mcp_catalog(app: AppHandle) -> View {
+    blocking(move || {
+        refresh_mcp_catalog(&app);
+        view(&app)
+    })
+    .await
+}
+
+// MARK: Claude tools
+
+#[tauri::command]
+async fn load_tools(app: AppHandle) -> View {
+    blocking(move || {
+        refresh_tools(&app);
+        view(&app)
+    })
+    .await
+}
+
+/// Installs one tool from Anthropic's official sources; one at a time.
+#[tauri::command]
+async fn install_tool(app: AppHandle, tool: Tool) -> View {
+    blocking(move || {
+        let start = with_model(&app, |m| {
+            let free = m.config.claude_tools_enabled && m.installing_tool.is_none();
+            if free {
+                m.installing_tool = Some(tool);
+            }
+            free
+        });
+        if !start {
+            return view(&app);
+        }
+        changed(&app);
+        let result = tools::install(tool);
+        with_model(&app, |m| {
+            m.installing_tool = None;
+            match result {
+                Ok(()) => m.notice = Some(Model::tool_installed_message(tool)),
+                Err(e) => m.error = Some(l!("Installation fehlgeschlagen: %@", e)),
+            }
+        });
+        refresh_tools(&app);
+        view(&app)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_claude_desktop_profile(app: AppHandle, profile_id: Option<String>) -> View {
+    act(app, move |m| m.set_claude_desktop_profile(profile_id)).await
+}
+
+/// Opens VS Code's "Disable Login Prompt" setting of the Claude Code extension.
+#[tauri::command]
+fn open_vscode_setting(app: AppHandle) {
+    let _ = app.opener().open_url("vscode://settings/claudeCode.disableLoginPrompt", None::<&str>);
 }
 
 #[tauri::command]
@@ -826,6 +913,11 @@ fn main() {
             save_mcp_server,
             delete_mcp_server,
             set_project_mcp_servers,
+            reload_mcp_catalog,
+            load_tools,
+            install_tool,
+            set_claude_desktop_profile,
+            open_vscode_setting,
             set_global_profile,
             repair_user_settings,
             set_disabled,

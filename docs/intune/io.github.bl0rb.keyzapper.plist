@@ -54,3 +54,7 @@
 <false/>
 <key>AllowKeyExport</key>
 <true/>
+<key>ManagedMcpServersURL</key>
+<string>https://sso.firma.example/keyzapper/mcp-servers.json</string>
+<key>ClaudeToolsEnabled</key>
+<true/>

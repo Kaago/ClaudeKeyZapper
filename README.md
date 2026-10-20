@@ -35,6 +35,8 @@ in, so the costs land on the right project without anyone switching keys by hand
 * Status per project: active, differing, folder missing, key missing, conflicts with other settings. A summary shows what needs attention; *Repair all* writes the settings of every affected project again.
 * Drag project folders from Finder or Explorer onto a profile to assign them.
 * MCP servers (stdio, HTTP or SSE) defined once – or from templates such as GitHub, Notion or Sentry – and switched on per project. The app writes them into the repository's `.mcp.json` (excluded from Git) and approves them in `.claude/settings.local.json`, so Claude Code loads them there automatically. Remote servers with OAuth (e.g. Weave-MCP via Entra ID or Keycloak) take a client ID, callback port and scopes; Claude Code handles the browser sign-in.
+* Central MCP server list: IT publishes the MCP servers as one JSON file on its own server (e.g. the SSO server); KeyZapper loads it and offers the servers read-only for every project (see [Central MCP server list](#central-mcp-server-list)).
+* *Claude Tools* page: installs Claude Code (CLI), its VS Code extension and IntelliJ plugin and Claude Desktop from Anthropic's official sources and connects Claude Desktop to a key or SSO profile (see [Claude tools](#claude-tools)).
 * Test connection against LiteLLM (invalid or blocked key, rate limit, budget, gateway unreachable).
 * Remaining budget per key, as reported by LiteLLM (`/key/info`): a bar that turns orange from 70 % and red from 90 % used, amount left of the limit and next reset, or the spend for keys without a limit.
 * Claude subscription profiles: projects use your Claude Pro, Max, Team or Enterprise plan through Claude Code's own login instead of a gateway key (see below).
@@ -44,7 +46,7 @@ in, so the costs land on the right project without anyone switching keys by hand
 * Update check against the GitHub releases with one-click installation; the version is shown in the app and under “About KeyZapper”.
 * UI in English and German (follows the system language).
 * Encrypted backup and restore of profiles, assignments and keys (`.kzbackup`, password-protected).
-* Manageable via Intune: predefined profiles, gateway allowlist, defaults, minimum CLI version, OneDrive backup, update check.
+* Manageable via Intune: predefined profiles, gateway allowlist, defaults, minimum CLI version, OneDrive backup, update check, central MCP server list, Claude tools page.
 
 ## Requirements
 
@@ -199,6 +201,8 @@ outrank project settings; KeyZapper aborts binding on conflict.
 | `BackupDirectory` | String, `~` allowed | Explicit backup folder; enables the backup even without `OneDriveBackup` |
 | `UpdateCheckEnabled` | Bool (default `true`) | In-app update check. When distributing via Intune, set to `false`, otherwise Intune may overwrite a newer version that was installed by the user. |
 | `AllowKeyExport` | Bool (default `true`) | Whether keys may leave the key store via the app. `false`: no copying to the clipboard; backups contain profiles and assignments only. |
+| `ManagedMcpServersURL` | String (https URL) | Address of the central MCP server list (see [Central MCP server list](#central-mcp-server-list)). |
+| `ClaudeToolsEnabled` | Bool (default `true`) | Shows the *Claude Tools* page for installing Claude Code, its IDE plugins and Claude Desktop. |
 
 Test locally (user level; values managed via Intune take precedence):
 
@@ -213,6 +217,36 @@ A business account takes precedence over “OneDrive-Personal”. **Keys are nev
 to restore or discard the backup (“Restore” or “Discard”). Assignments are only applied for existing folders; the keys
 have to be entered again. As long as a found backup has been neither restored nor discarded, it is not overwritten.
 
+### Central MCP server list
+
+IT maintains the MCP servers in one JSON file on its own server and distributes only its address via Intune
+(`ManagedMcpServersURL`). The file uses Claude Code's `.mcp.json` format; template:
+[docs/intune/mcp-servers.example.json](docs/intune/mcp-servers.example.json).
+
+```json
+{
+  "mcpServers": {
+    "weave": { "type": "http", "url": "https://weave.firma.example/mcp",
+               "oauth": { "clientId": "c1abe…", "callbackPort": 8976, "scopes": "api://weave/mcp.read" } },
+    "wiki":  { "type": "http", "url": "https://wiki.firma.example/mcp", "headers": { "X-Tenant": "firma" } },
+    "fetch": { "type": "stdio", "command": "uvx", "args": ["mcp-server-fetch"] }
+  }
+}
+```
+
+* KeyZapper loads the list at startup, every 10 minutes, after an SSO sign-in and via *Reload* on the *MCP Servers* page.
+  The server answers `GET` with `200` and the JSON (at most 1 MB); `401`/`403` is shown as "sign-in required".
+* **Sign-in:** If an SSO profile is signed in whose gateway or identity provider has the same host as the list, KeyZapper
+  sends its token as `Authorization: Bearer …` (the token type of the profile). The server can thus answer per user or group.
+  The token only goes to hosts that receive it anyway.
+* The servers appear with the badge *Managed by IT*: developers switch them on per project but cannot edit or delete them.
+  Changes to the list are written into the projects using them; servers IT removes from the list leave the projects.
+* The last list fetched stays in `mcp-catalog.json` in the app data folder, so the servers keep working offline; a failed
+  fetch is shown on the page and the previous list stays in effect.
+* Only `https` addresses (plain http only for localhost), also for remote servers on the list. Entries with an invalid
+  name, without command or URL are left out and listed on the page; so is an entry with the name of a developer's own server.
+* Secrets do not belong in the file; use `${NAME}` references (Claude Code fills them from the environment) or OAuth.
+
 ## Claude settings check and default profile
 
 The *Claude settings* page in the sidebar checks `~/.claude/settings.json` for problems Claude Code accepts
@@ -224,6 +258,44 @@ model IDs instead of an alias. A banner shows problems at any time.
   created. Before every change KeyZapper saves a backup `settings.json.keyzapper-<time>.bak`.
 * **Default profile** writes a profile into `~/.claude/settings.json`, so Claude Code uses it in all folders without their
   own assignment instead of a plaintext key or the normal login. Assigned projects keep their own profile.
+
+## Claude tools
+
+The *Claude Tools* page (hidden with `ClaudeToolsEnabled = false`) shows what is installed and installs, without administrator rights:
+
+| Tool | Source | Installed to |
+|---|---|---|
+| Claude Code (CLI) | Anthropic's native installer (`curl -fsSL https://claude.ai/install.sh \| bash`, Windows `irm https://claude.ai/install.ps1 \| iex`) | `~/.local/bin/claude`, updates itself |
+| Claude Code for VS Code | `code --install-extension anthropic.claude-code` (VS Code Marketplace) | VS Code of the user |
+| Claude Code for IntelliJ IDEA | `idea installPlugins com.anthropic.code.plugin` (JetBrains Marketplace); IntelliJ must be closed | every IntelliJ IDEA found (also Toolbox installs) |
+| Claude Desktop | `.dmg` from `claude.ai/api/desktop/darwin/universal/dmg/latest/redirect` (macOS; checks Anthropic's Developer ID `Q6L2SF6YDW` before copying to `/Applications` or `~/Applications`), `.msix` via `Add-AppxPackage` (Windows) | Applications folder / current user |
+
+**Sign-in:** Claude Code in the terminal, in VS Code and in IntelliJ uses the profile of assigned projects and the default
+profile elsewhere (key, SSO or Claude subscription). For key and SSO profiles, turn on *Disable Login Prompt*
+(`claudeCode.disableLoginPrompt`) in VS Code; the page opens that setting. If IntelliJ does not find `claude`, enter the path
+shown on the page under *Settings › Tools › Claude Code [Beta] › Claude command*.
+
+**Claude Desktop with a profile:** Choose a key or SSO profile and *Apply*. KeyZapper writes one configuration file for
+Claude Desktop's third-party mode into its configuration library (`~/Library/Application Support/Claude-3p/configLibrary`,
+`%LOCALAPPDATA%\Claude-3p\configLibrary`) and selects it in `_meta.json`:
+
+```json
+{
+  "inferenceProvider": "gateway",
+  "inferenceGatewayBaseUrl": "https://litellm.firma.example",
+  "inferenceCredentialKind": "helper-script",
+  "inferenceCredentialHelper": "/Applications/KeyZapper.app/Contents/MacOS/keyzapper-helper",
+  "inferenceCredentialHelperArgs": ["credential", "--profile", "<UUID>"],
+  "inferenceCredentialHelperTtlSec": 300,
+  "inferenceModels": [{ "name": "eu.anthropic.claude-sonnet-5-team", "anthropicFamilyTier": "sonnet" }]
+}
+```
+
+Claude Desktop thus gets the key or SSO token from `keyzapper-helper`, like Claude Code; no key is in the file. The
+helper TTL follows `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` of the profile (default 300 s). Then quit and reopen Claude Desktop
+and choose to start with this configuration on the sign-in screen. *Normal sign-in (claude.ai)* removes the entry again.
+If the profile changes, KeyZapper updates the file. A Claude Desktop configuration IT deploys via MDM profile
+(`com.anthropic.claudefordesktop`) or registry (`HKLM\SOFTWARE\Policies\Claude`) takes precedence; the page points this out.
 
 ## Deactivating KeyZapper
 
