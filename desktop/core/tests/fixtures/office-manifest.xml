@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OfficeApp xmlns="http://schemas.microsoft.com/office/appforoffice/1.1" xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0" xsi:type="TaskPaneApp" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Id>4e2fd29d-dad0-40b3-af3c-a16e347a5ddc</Id>
+  <Version>1.0.0.12</Version>
+  <DefaultSettings>
+    <SourceLocation DefaultValue="https://pivot.claude.ai/?m=unified-1.0.0.12" />
+  </DefaultSettings>
+  <Resources>
+    <bt:Urls>
+      <bt:Url id="Taskpane.Url" DefaultValue="https://pivot.claude.ai/?m=unified-1.0.0.12"/>
+    </bt:Urls>
+  </Resources>
+</OfficeApp>

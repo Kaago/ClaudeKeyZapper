@@ -1,3 +1,4 @@
+use crate::claude_office::{OfficeApplied, OfficeClient};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -85,10 +86,36 @@ pub struct Profile {
     /// `access` (default) or `id`: the gateway expects the OIDC ID token instead of the access token.
     #[serde(default, skip_serializing_if = "OidcTokenType::is_access")]
     pub oidc_token_type: OidcTokenType,
+    /// Claude for Microsoft 365 behind this profile's company gateway (sideloaded add-in); None = not configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub office: Option<OfficeClient>,
 }
 
 fn placeholder_credential() -> CredentialReference {
     CredentialReference::for_id("")
+}
+
+/// Models of one tenant for a project binding; replaces the profile's model values, not helper or endpoint.
+/// Gateway model IDs of a multi-tenant gateway look like `<tenant>/<model>`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSelection {
+    pub tenant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opus_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sonnet_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub haiku_model: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model_alias: String,
+}
+
+impl ModelSelection {
+    /// The model whose spend the budget is asked for (`?model=`): Sonnet, else Opus, else Haiku.
+    pub fn budget_model(&self) -> Option<&str> {
+        [&self.sonnet_model, &self.opus_model, &self.haiku_model].into_iter().flatten().map(|m| m.trim()).find(|m| !m.is_empty())
+    }
 }
 
 /// Names that the extra environment must not set: credentials, endpoint, model fields and provider switches.
@@ -103,7 +130,7 @@ impl Profile {
         let credential = CredentialReference::for_id(&id);
         Self { id, name, endpoint, model_alias, opus_model: None, sonnet_model: None, haiku_model: None, environment: None, credential,
                auth_type: AuthType::ApiKey, oidc_issuer: None, oidc_client_id: None, oidc_scope: None,
-               oidc_token_type: OidcTokenType::Access }
+               oidc_token_type: OidcTokenType::Access, office: None }
     }
 
     pub fn is_sso(&self) -> bool {
@@ -125,11 +152,24 @@ impl Profile {
 
     /// Environment entries KeyZapper writes for the model settings (only non-empty values).
     pub fn model_environment(&self) -> BTreeMap<String, String> {
+        Self::model_pairs(&self.model_alias, self.opus_model.as_deref(), self.sonnet_model.as_deref(), self.haiku_model.as_deref())
+    }
+
+    /// Like `model_environment`, but with the models of a project's tenant selection instead of the profile's own.
+    /// Nothing of the profile's models is kept, so a tier the tenant lacks is not written at all.
+    pub fn model_environment_for(&self, selection: Option<&ModelSelection>) -> BTreeMap<String, String> {
+        match selection {
+            Some(s) => Self::model_pairs(&s.model_alias, s.opus_model.as_deref(), s.sonnet_model.as_deref(), s.haiku_model.as_deref()),
+            None => self.model_environment(),
+        }
+    }
+
+    fn model_pairs(alias: &str, opus: Option<&str>, sonnet: Option<&str>, haiku: Option<&str>) -> BTreeMap<String, String> {
         let pairs = [
-            ("ANTHROPIC_MODEL", Some(&self.model_alias)),
-            ("ANTHROPIC_DEFAULT_OPUS_MODEL", self.opus_model.as_ref()),
-            ("ANTHROPIC_DEFAULT_SONNET_MODEL", self.sonnet_model.as_ref()),
-            ("ANTHROPIC_DEFAULT_HAIKU_MODEL", self.haiku_model.as_ref()),
+            ("ANTHROPIC_MODEL", Some(alias)),
+            ("ANTHROPIC_DEFAULT_OPUS_MODEL", opus),
+            ("ANTHROPIC_DEFAULT_SONNET_MODEL", sonnet),
+            ("ANTHROPIC_DEFAULT_HAIKU_MODEL", haiku),
         ];
         pairs
             .into_iter()
@@ -138,6 +178,18 @@ impl Profile {
                 (!trimmed.is_empty()).then(|| (name.to_string(), trimmed.to_string()))
             })
             .collect()
+    }
+
+    /// The model whose spend the profile's own budget is asked for (`?model=`): like `ModelSelection::budget_model` Sonnet,
+    /// else Opus, else Haiku; failing those the default model, unless it is one of Claude Code's tier aliases (`opus`,
+    /// `sonnet[1m]`, …), which are no gateway IDs.
+    pub fn budget_model(&self) -> Option<&str> {
+        [&self.sonnet_model, &self.opus_model, &self.haiku_model]
+            .into_iter()
+            .flatten()
+            .map(|m| m.trim())
+            .find(|m| !m.is_empty())
+            .or_else(|| Some(self.model_alias.trim()).filter(|alias| !alias.is_empty() && !is_tier_alias(alias)))
     }
 
     /// All configured model names, used to verify them against the gateway.
@@ -184,6 +236,100 @@ pub fn suggest_models(models: &[String]) -> (Option<String>, Option<String>, Opt
         models.iter().filter(|m| m.to_lowercase().contains(tier)).max_by(|a, b| natural_cmp(a, b)).cloned()
     };
     (best("opus"), best("sonnet"), best("haiku"))
+}
+
+/// The tenants of a multi-tenant gateway: the distinct, non-empty prefixes before the first `/` of its model IDs
+/// (`<tenant>/<model>`), naturally sorted. IDs without `/` belong to no tenant.
+pub fn tenants_of(models: &[String]) -> Vec<String> {
+    let mut tenants: Vec<String> = models
+        .iter()
+        .filter_map(|id| id.split_once('/').map(|(tenant, _)| tenant))
+        .filter(|tenant| !tenant.is_empty())
+        .map(String::from)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    tenants.sort_by(|a, b| natural_cmp(a, b).then_with(|| a.cmp(b)));
+    tenants
+}
+
+/// One budget the gateway is asked for: the tenant it is shown under (None = the profile itself) and the model
+/// passed as `?model=` (None = the gateway decides).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BudgetTarget {
+    pub tenant: Option<String>,
+    pub model: Option<String>,
+}
+
+/// The budgets to load for `profile`. A key profile has one, without model. An SSO profile has one per distinct tenant
+/// of its bindings' model selections (asked for the selection's `budget_model()`, tenants sorted), plus one for the profile
+/// itself with its `budget_model()`; that one is left out when its model belongs to a tenant that is already listed (the
+/// tenant prefix `<tenant>/` is compared, not the model). Without any of them (no tenant entry, no model that can be asked
+/// for, e.g. only a tier alias as default model) the user's budget is asked for without a model, as before tenants existed.
+pub fn budget_targets(profile: &Profile, bindings: &[WorkspaceBinding]) -> Vec<BudgetTarget> {
+    let none = BudgetTarget { tenant: None, model: None };
+    if !profile.is_sso() {
+        return vec![none];
+    }
+    let mut tenants: Vec<(&str, &str)> = vec![];
+    for selection in bindings.iter().filter(|b| b.profile_id == profile.id).filter_map(|b| b.models.as_ref()) {
+        if let Some(model) = selection.budget_model().filter(|_| !tenants.iter().any(|(tenant, _)| *tenant == selection.tenant)) {
+            tenants.push((selection.tenant.as_str(), model));
+        }
+    }
+    tenants.sort_by(|a, b| natural_cmp(a.0, b.0).then_with(|| a.0.cmp(b.0)));
+    let mut targets: Vec<BudgetTarget> =
+        tenants.iter().map(|(tenant, model)| BudgetTarget { tenant: Some(tenant.to_string()), model: Some(model.to_string()) }).collect();
+    match profile.budget_model() {
+        Some(model) => {
+            let listed = model.split_once('/').is_some_and(|(tenant, _)| tenants.iter().any(|(t, _)| *t == tenant));
+            if !listed {
+                targets.push(BudgetTarget { tenant: None, model: Some(model.to_string()) });
+            }
+        }
+        None if targets.is_empty() => targets.push(none),
+        None => {}
+    }
+    targets
+}
+
+/// The profile's model values moved to `tenant`; None if no model ID starts with `<tenant>/`.
+/// Per tier the profile's value (`<x>/<name>` or `<name>`) becomes `<tenant>/<name>` when the tenant has that model,
+/// otherwise the tenant's newest-looking model of the tier is used (like `suggest_models`; none if it has none).
+/// The default model: empty stays empty, the tier aliases (`opus`, `sonnet`, `haiku`, `opusplan`, also with `[1m]`) stay,
+/// a model ID moves along if the tenant has it, else the Sonnet tier of the tenant is used.
+pub fn selection_for_tenant(models: &[String], tenant: &str, profile: &Profile) -> Option<ModelSelection> {
+    let prefix = format!("{tenant}/");
+    let names: Vec<&str> = models.iter().filter_map(|id| id.strip_prefix(prefix.as_str())).collect();
+    if tenant.is_empty() || names.is_empty() {
+        return None;
+    }
+    // Suggestions run over the names without prefix, so a tenant called e.g. "opus-lab" cannot be mistaken for a tier.
+    let (opus, sonnet, haiku) = suggest_models(&names.iter().map(|n| n.to_string()).collect::<Vec<_>>());
+    // `<x>/<name>` or `<name>` of the profile, found in the tenant (a name that itself contains `/` is tried as written too).
+    let moved = |value: &str| -> Option<String> {
+        let value = value.trim();
+        value.split_once('/').map(|(_, name)| name).into_iter().chain(Some(value)).find(|n| !n.is_empty() && names.contains(n)).map(String::from)
+    };
+    let tier = |value: &Option<String>, suggested: Option<String>| -> Option<String> {
+        value.as_deref().and_then(moved).or(suggested).map(|name| format!("{prefix}{name}"))
+    };
+    let (opus_model, sonnet_model, haiku_model) = (tier(&profile.opus_model, opus), tier(&profile.sonnet_model, sonnet), tier(&profile.haiku_model, haiku));
+    let alias = profile.model_alias.trim();
+    let model_alias = if alias.is_empty() {
+        String::new()
+    } else if is_tier_alias(alias) {
+        alias.to_string()
+    } else {
+        moved(alias).map(|name| format!("{prefix}{name}")).or_else(|| sonnet_model.clone()).unwrap_or_default()
+    };
+    Some(ModelSelection { tenant: tenant.to_string(), opus_model, sonnet_model, haiku_model, model_alias })
+}
+
+/// Claude Code's own model aliases, optionally with the 1M-context suffix: they resolve through the tier variables.
+fn is_tier_alias(alias: &str) -> bool {
+    let lower = alias.to_lowercase();
+    matches!(lower.strip_suffix("[1m]").unwrap_or(&lower), "opus" | "sonnet" | "haiku" | "opusplan")
 }
 
 /// Case-insensitive comparison with digit runs compared by value (like Finder's `localizedStandardCompare`).
@@ -403,12 +549,15 @@ pub struct WorkspaceBinding {
     pub mcp_managed: BTreeMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_git_exclude_entry: Option<String>,
+    /// Models of one tenant of a multi-tenant gateway instead of the profile's own; None = as in the profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<ModelSelection>,
 }
 
 impl WorkspaceBinding {
     pub fn new(path: String, profile_id: String) -> Self {
         Self { id: new_id(), path, profile_id, managed_values: BTreeMap::new(), git_exclude_entry: None, pooled: None,
-               mcp_server_ids: vec![], mcp_managed: BTreeMap::new(), mcp_git_exclude_entry: None }
+               mcp_server_ids: vec![], mcp_managed: BTreeMap::new(), mcp_git_exclude_entry: None, models: None }
     }
 
     pub fn is_pooled(&self) -> bool {
@@ -442,11 +591,28 @@ pub struct AppState {
     /// MCP servers that can be assigned to projects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServer>,
+    /// What KeyZapper last registered for Claude in Office on this machine; the sync compares against it and never reads
+    /// the Office containers. Machine-specific: a backup restore does not take it over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub office_applied: Option<OfficeApplied>,
+    /// Why the last registration or removal did not fully work. While set, the Office status shows it and only a repeated
+    /// request (settings change, refresh) tries the registration again, not every start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub office_error: Option<String>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
-        Self { schema_version: Self::CURRENT_SCHEMA_VERSION, profiles: vec![], bindings: vec![], global_binding: None, disabled: None, mcp_servers: vec![] }
+        Self {
+            schema_version: Self::CURRENT_SCHEMA_VERSION,
+            profiles: vec![],
+            bindings: vec![],
+            global_binding: None,
+            disabled: None,
+            mcp_servers: vec![],
+            office_applied: None,
+            office_error: None,
+        }
     }
 }
 

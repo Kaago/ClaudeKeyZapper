@@ -6,9 +6,10 @@ mod tray;
 
 use keyzapper_core::errors::Error;
 use keyzapper_core::gateway::CheckResult;
+use keyzapper_core::models::budget_targets;
 use keyzapper_core::tools::{self, Tool};
-use keyzapper_core::{agents, backup, claude_desktop, clipboard, gateway, l, legacy_keychain, mcp_catalog, oidc, subscription, update};
-use model::{McpServerInput, Model, ProfileInput, View};
+use keyzapper_core::{agents, backup, claude_desktop, claude_office, clipboard, gateway, l, legacy_keychain, mcp_catalog, oidc, subscription, update};
+use model::{McpServerInput, Model, ProfileInput, TenantBudget, View};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -88,26 +89,54 @@ fn refresh(app: &AppHandle) {
     });
 }
 
-/// Loads the budget of every stored key and signed-in SSO profile from the gateway (LiteLLM `/key/info`, `/user/info`).
+/// Loads the budgets of every stored key and signed-in SSO profile from the gateway (LiteLLM `/key/info`, `/user/info`):
+/// one per tenant of an SSO profile's projects (`?model=`), else one. The budgets are shown first; the model list follows,
+/// so a slow or unreachable `/v1/models` never delays them.
 fn refresh_budgets(app: &AppHandle, only: Option<&str>) {
     let profiles = with_model(app, |m| m.budget_profiles());
     for (profile, key) in profiles.into_iter().filter(|p| only.is_none_or(|o| o == p.0.id)) {
         let app = app.clone();
         std::thread::spawn(move || {
             let timeout = Duration::from_secs(10);
-            let budget = match key {
-                Some(key) => gateway::budget(&profile.endpoint, &key, timeout).ok(),
-                None => with_model(&app, |m| m.sso_token(&profile)).ok().and_then(|token| gateway::sso_budget(&profile.endpoint, &token, timeout).ok()),
+            let (secret, sso) = match key {
+                Some(key) => (Some(key), false),
+                None => (with_model(&app, |m| m.sso_token(&profile)).ok(), true),
             };
-            with_model(&app, |m| match budget {
-                Some(b) => {
-                    m.budgets.insert(profile.id, b);
-                }
-                None => {
+            let targets = with_model(&app, |m| budget_targets(&profile, &m.state.bindings));
+            // The tenants are asked in parallel; one that fails (no access there) does not hide the others.
+            let budgets: Vec<TenantBudget> = match secret.as_deref() {
+                Some(secret) => std::thread::scope(|scope| {
+                    let requests: Vec<_> = targets
+                        .iter()
+                        .map(|target| {
+                            let profile = &profile;
+                            scope.spawn(move || {
+                                let model = target.model.as_deref();
+                                if sso { gateway::sso_budget(&profile.endpoint, secret, model, timeout) } else { gateway::budget(&profile.endpoint, secret, model, timeout) }
+                                    .ok()
+                                    .map(|budget| TenantBudget { tenant: target.tenant.clone(), budget })
+                            })
+                        })
+                        .collect();
+                    requests.into_iter().filter_map(|request| request.join().ok().flatten()).collect()
+                }),
+                None => vec![],
+            };
+            with_model(&app, |m| {
+                if budgets.is_empty() {
                     m.budgets.remove(&profile.id);
+                } else {
+                    m.budgets.insert(profile.id.clone(), budgets);
                 }
             });
             changed(&app);
+            // The model list tells which tenants a project can choose; a failed reload keeps the last list. Only an SSO
+            // profile has tenants (its list follows the access its token has now); a key profile never asks for the list.
+            let Some(secret) = secret.filter(|_| profile.is_sso()) else { return };
+            if let Ok(models) = gateway::models(&profile.endpoint, &secret) {
+                with_model(&app, |m| m.gateway_models.insert(profile.id, models));
+                changed(&app);
+            }
         });
     }
 }
@@ -129,6 +158,29 @@ fn refresh_subscription(app: &AppHandle) {
         with_model(&app, |m| m.subscription = Some(status));
         changed(&app);
     });
+}
+
+/// One Claude in Office run at a time (a run decides under the model lock, but uses the network and the app folders outside it).
+static OFFICE_RUN: Mutex<()> = Mutex::new(());
+
+/// Brings Claude in Office in line with the profile that has it switched on, or removes it. Anthropic's template is only
+/// loaded while a manifest is to be written. `retry` writes again after an earlier failure; the start passes false, so a
+/// failure does not repeat on every launch.
+fn sync_office(app: &AppHandle, retry: bool) {
+    let _run = OFFICE_RUN.lock().unwrap_or_else(|e| e.into_inner());
+    let fetched = with_model(app, |m| m.office_wanted()).then(|| claude_office::fetch_template(Duration::from_secs(10)));
+    if let Some((job, sideload)) = with_model(app, |m| Some((m.plan_office(fetched, retry)?, m.office_sideload.clone()))) {
+        // The record is saved before the manifests are written, so a crash in between cannot leave unknown files.
+        let outcome = job.run(&sideload, &mut |interim| with_model(app, |m| m.record_office(interim)));
+        with_model(app, |m| m.finish_office(&job, outcome));
+    }
+    changed(app);
+}
+
+/// `sync_office` off the caller's thread: it may wait for the network, or for macOS to ask about the app folders.
+fn sync_office_later(app: &AppHandle, retry: bool) {
+    let app = app.clone();
+    std::thread::spawn(move || sync_office(&app, retry));
 }
 
 /// Everything the tray popover shows: key budgets and the subscription's limits.
@@ -200,6 +252,7 @@ fn start_background(app: &AppHandle) {
         refresh_usage(&handle);
         refresh_mcp_catalog(&handle);
     });
+    sync_office_later(app, false);
     let handle = app.clone();
     std::thread::spawn(move || check_updates(&handle, false, false));
     let handle = app.clone();
@@ -236,6 +289,10 @@ async fn refresh_all(app: AppHandle) -> View {
     blocking(move || {
         refresh(&app);
         refresh_usage(&app);
+        // An explicit refresh also tries Claude in Office again if it failed before.
+        if with_model(&app, |m| m.office_failed()) {
+            sync_office_later(&app, true);
+        }
         view(&app)
     })
     .await
@@ -270,6 +327,9 @@ async fn save_profile(app: AppHandle, input: ProfileInput) -> (bool, View) {
         refresh(&app);
         refresh_budgets(&app, None);
         refresh_subscription(&app);
+        if ok {
+            sync_office_later(&app, true);
+        }
         (ok, view(&app))
     })
     .await
@@ -288,7 +348,10 @@ async fn store_key(app: AppHandle, profile_id: String, key: String) -> View {
 
 #[tauri::command]
 async fn delete_profile(app: AppHandle, profile_id: String) -> View {
-    act(app, move |m| m.delete_profile(&profile_id)).await
+    let handle = app.clone();
+    let view = act(app, move |m| m.delete_profile(&profile_id)).await;
+    sync_office_later(&handle, true);
+    view
 }
 
 /// Copies the key marked as confidential and clears it after 60 s if unchanged.
@@ -496,6 +559,24 @@ async fn reapply_many(app: AppHandle, binding_ids: Vec<String>) -> View {
     act(app, move |m| m.reapply_many(&binding_ids)).await
 }
 
+/// The project uses the models of one tenant of its profile's gateway; `None` = as in the profile.
+#[tauri::command]
+async fn set_binding_tenant(app: AppHandle, binding_id: String, tenant: Option<String>) -> View {
+    blocking(move || {
+        let profile_id = with_model(&app, |m| {
+            m.set_binding_tenant(&binding_id, tenant);
+            m.state.bindings.iter().find(|b| b.id == binding_id).map(|b| b.profile_id.clone())
+        });
+        refresh(&app);
+        // The tenant of a project is one of the budgets shown for its profile.
+        if let Some(profile_id) = profile_id {
+            refresh_budgets(&app, Some(&profile_id));
+        }
+        view(&app)
+    })
+    .await
+}
+
 #[tauri::command]
 async fn toggle_pool(app: AppHandle, binding_id: String) -> View {
     act(app, move |m| m.toggle_pool(&binding_id)).await
@@ -657,12 +738,18 @@ async fn repair_user_settings(app: AppHandle) -> View {
 
 #[tauri::command]
 async fn set_disabled(app: AppHandle, disabled: bool) -> View {
-    act(app, move |m| m.set_disabled(disabled)).await
+    let handle = app.clone();
+    let view = act(app, move |m| m.set_disabled(disabled)).await;
+    sync_office_later(&handle, true);
+    view
 }
 
 #[tauri::command]
 async fn restore_from_backup(app: AppHandle) -> View {
-    act(app, |m| m.restore_from_backup()).await
+    let handle = app.clone();
+    let view = act(app, |m| m.restore_from_backup()).await;
+    sync_office_later(&handle, true);
+    view
 }
 
 #[tauri::command]
@@ -745,6 +832,7 @@ async fn import_backup(app: AppHandle, path: String, password: String) -> bool {
         });
         refresh(&app);
         refresh_budgets(&app, None);
+        sync_office_later(&app, true);
         ok
     })
     .await
@@ -905,6 +993,7 @@ fn main() {
             bind,
             reapply,
             reapply_many,
+            set_binding_tenant,
             toggle_pool,
             unbind,
             scan_repository,

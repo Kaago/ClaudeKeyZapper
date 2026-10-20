@@ -35,6 +35,23 @@
       <key>CLAUDE_CODE_API_KEY_HELPER_TTL_MS</key>
       <string>900000</string>
     </dict>
+    <key>Office</key>
+    <dict>
+      <key>Enabled</key>
+      <true/>
+      <key>AddinID</key>
+      <string>5c1d7e2a-8b3f-4e6d-9a0c-2f4b6d8e1a3c</string>
+      <key>GatewayURL</key>
+      <string>https://litellm.firma.example/api/x/desktop-gateway/office</string>
+      <key>EntraClientID</key>
+      <string>11111111-2222-4333-8444-555555555555</string>
+      <key>EntraScope</key>
+      <string>api://11111111-2222-4333-8444-555555555555/access_as_user</string>
+      <key>DisabledFeatures</key>
+      <array>
+        <string>web_search</string>
+      </array>
+    </dict>
   </dict>
 </array>
 <key>AllowedGatewayHosts</key>
