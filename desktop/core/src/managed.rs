@@ -2,6 +2,7 @@
 //! (read through CFPreferences, so `/Library/Managed Preferences` wins). Windows: registry policy values under
 //! `HKLM\SOFTWARE\Policies\KeyZapper` (or HKCU), same names; `ManagedProfiles` is a JSON string there.
 
+use crate::claude_office::OfficeClient;
 use crate::models::{AuthType, OidcTokenType};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -28,13 +29,16 @@ pub struct ManagedProfile {
     pub oidc_client_id: Option<String>,
     pub oidc_scope: Option<String>,
     pub oidc_token_type: OidcTokenType,
+    pub office: Option<OfficeClient>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ManagedConfig {
     /// `ManagedProfiles`: dicts with `Name`, `Endpoint`, optional `ModelAlias`, `OpusModel`, `SonnetModel`,
     /// `HaikuModel`, `Environment` (dict) and `ID` (UUID); `Type` (`apiKey` default | `oidc`) with
-    /// `OIDCIssuer`, `OIDCClientID` (both required for `oidc`), `OIDCScope` and `OIDCTokenType` (`access` default | `id`).
+    /// `OIDCIssuer`, `OIDCClientID` (both required for `oidc`), `OIDCScope` and `OIDCTokenType` (`access` default | `id`),
+    /// and an optional `Office` dict (Claude in Microsoft 365): `Enabled` (default on), `AddinID`, `GatewayURL`,
+    /// `EntraClientID`, `EntraScope`, `DisabledFeatures` (array or comma separated string).
     pub profiles: Vec<ManagedProfile>,
     /// `AllowedGatewayHosts`: exact hosts or `*.domain`; empty = no restriction.
     pub allowed_gateway_hosts: Vec<String>,
@@ -179,7 +183,27 @@ fn managed_profile(dict: &Map<String, Value>) -> Option<ManagedProfile> {
         oidc_client_id,
         oidc_scope,
         oidc_token_type,
+        office: dict.get("Office").and_then(Value::as_object).map(office_client),
     })
+}
+
+/// The `Office` dict of a managed profile. Missing or malformed values stay as they are (empty), so a broken block is kept
+/// and the sync reports `problems()` instead of the profile silently losing its Office setup.
+fn office_client(dict: &Map<String, Value>) -> OfficeClient {
+    let text = |key: &str| as_string(dict.get(key)).map(|v| v.trim().to_string()).unwrap_or_default();
+    let disabled_features = match dict.get("DisabledFeatures") {
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).map(String::from).collect(),
+        Some(Value::String(list)) => list.split(',').map(String::from).collect(),
+        _ => Vec::<String>::new(),
+    };
+    OfficeClient {
+        enabled: as_bool(dict.get("Enabled")).unwrap_or(true),
+        addin_id: text("AddinID"),
+        gateway_url: text("GatewayURL"),
+        entra_client_id: text("EntraClientID"),
+        entra_scope: text("EntraScope"),
+        disabled_features: disabled_features.into_iter().map(|f| f.trim().to_string()).filter(|f| !f.is_empty()).collect(),
+    }
 }
 
 /// Stable profile ID for a managed profile without explicit `ID`, so bindings survive app restarts

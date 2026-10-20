@@ -161,16 +161,26 @@ pub fn models(endpoint: &str, key: &str) -> Result<Vec<String>, CheckResult> {
 }
 
 /// LiteLLM's `GET /key/info` without `key` parameter describes the calling key: spend, limit and next reset.
-pub fn budget(endpoint: &str, key: &str, timeout: Duration) -> Result<KeyBudget, CheckResult> {
-    parse_budget(&get("key/info", endpoint, key, timeout)?, "info")
+/// With `model` (`<tenant>/<model>`) the gateway answers with the budget of that tenant's access (`?model=`).
+pub fn budget(endpoint: &str, key: &str, model: Option<&str>, timeout: Duration) -> Result<KeyBudget, CheckResult> {
+    parse_budget(&get(&with_model_query("key/info", model), endpoint, key, timeout)?, "info")
 }
 
 /// Budget for an SSO token: LiteLLM only finds a key for a JWT mapped to a virtual key; otherwise `/key/info` fails (404)
 /// and `GET /user/info` without `user_id` describes the signed-in user: spend, limit and next reset.
-pub fn sso_budget(endpoint: &str, token: &str, timeout: Duration) -> Result<KeyBudget, CheckResult> {
-    match budget(endpoint, token, timeout) {
-        Err(CheckResult::HttpError(_)) => parse_budget(&get("user/info", endpoint, token, timeout)?, "user_info"),
+/// `model` asks for the tenant of that model on both paths, like in `budget`.
+pub fn sso_budget(endpoint: &str, token: &str, model: Option<&str>, timeout: Duration) -> Result<KeyBudget, CheckResult> {
+    match budget(endpoint, token, model, timeout) {
+        Err(CheckResult::HttpError(_)) => parse_budget(&get(&with_model_query("user/info", model), endpoint, token, timeout)?, "user_info"),
         other => other,
+    }
+}
+
+/// `path` with `?model=<form-urlencoded>`; a missing or blank model leaves the path alone.
+fn with_model_query(path: &str, model: Option<&str>) -> String {
+    match model.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(model) => format!("{path}?model={}", url::form_urlencoded::byte_serialize(model.as_bytes()).collect::<String>()),
+        None => path.to_string(),
     }
 }
 
@@ -186,7 +196,7 @@ fn parse_budget(body: &str, field: &str) -> Result<KeyBudget, CheckResult> {
 
 /// Remaining budget for `keyzapper-helper pool`: None if unknown, 0 if exhausted, infinite without limit.
 pub fn remaining_budget(endpoint: &str, key: &str) -> Option<f64> {
-    match budget(endpoint, key, Duration::from_secs(5)) {
+    match budget(endpoint, key, None, Duration::from_secs(5)) {
         Ok(b) => Some(b.remaining()),
         Err(CheckResult::BudgetExceeded) => Some(0.0),
         Err(_) => None,

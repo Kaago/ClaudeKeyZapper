@@ -7,6 +7,7 @@ pub mod agents;
 pub mod audit;
 pub mod backup;
 pub mod backup_store;
+pub mod claude_office;
 pub mod cli;
 pub mod clipboard;
 pub mod errors;

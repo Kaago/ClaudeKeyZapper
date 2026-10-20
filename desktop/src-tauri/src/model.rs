@@ -4,12 +4,16 @@
 use keyzapper_core::audit::Finding;
 use keyzapper_core::backup::BackupPayload;
 use keyzapper_core::backup_store::BackupStore;
+use keyzapper_core::claude_office::{self, office_profile, plan_retry, plan_sync, DesiredOffice, OfficeClient, OfficeStatus, Outcome, Sideload, SyncAction, SyncJob};
 use keyzapper_core::gateway::KeyBudget;
 use keyzapper_core::keys::{masked_hint, KeyStore};
 use keyzapper_core::managed::{host_of, is_secure_endpoint, ManagedConfig};
 use keyzapper_core::metadata::MetadataStore;
-use keyzapper_core::models::{new_id, parse_id, AppState, AuthType, McpServer, McpTransport, OidcTokenType, Profile, WorkspaceBinding};
-use keyzapper_core::paths::{abbreviate_home, folder_name};
+use keyzapper_core::models::{
+    new_id, parse_id, selection_for_tenant, tenants_of, AppState, AuthType, McpServer, McpTransport, ModelSelection, OidcTokenType, Profile,
+    WorkspaceBinding,
+};
+use keyzapper_core::paths::{self, abbreviate_home, folder_name};
 use keyzapper_core::settings::{self, BindingHealth, BindingStatus, SettingsBinder};
 use keyzapper_core::update::ReleaseInfo;
 use keyzapper_core::tokens::TokenStore;
@@ -18,9 +22,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// A budget the gateway reported: for a tenant of a multi-tenant gateway, or None for the profile itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TenantBudget {
+    pub tenant: Option<String>,
+    pub budget: KeyBudget,
+}
+
 pub struct Model {
     pub state: AppState,
-    pub budgets: HashMap<String, KeyBudget>,
+    /// Per profile the budgets of `budget_targets`: one for a key, one per tenant of an SSO profile's projects.
+    pub budgets: HashMap<String, Vec<TenantBudget>>,
+    /// Model IDs the gateway lists per profile (`/v1/models`), loaded with the budgets. Their `<tenant>/` prefixes are the
+    /// tenants a project can choose; kept when a reload fails.
+    pub gateway_models: HashMap<String, Vec<String>>,
     pub available_update: Option<ReleaseInfo>,
     pub installing_update: bool,
     /// Highlights of the releases since the version last seen, shown once after an update.
@@ -40,6 +55,13 @@ pub struct Model {
     pub keychain_profiles: Vec<String>,
     pub error: Option<String>,
     pub notice: Option<String>,
+    /// Why Claude in Office cannot be set up right now (unusable settings, gateway not allowed, no template); nothing was
+    /// written then. Recomputed by every sync run.
+    office_problem: Option<String>,
+    /// Where Office keeps its manifests on this machine (tests point it into a temporary folder).
+    pub office_sideload: Sideload,
+    /// The last good copy of Anthropic's manifest template.
+    office_template: PathBuf,
     pub config: ManagedConfig,
     /// None for development builds.
     pub app_version: Option<String>,
@@ -81,6 +103,42 @@ pub struct ProfileInput {
     pub oidc_client_id: String,
     pub oidc_scope: String,
     pub oidc_token_type: OidcTokenType,
+    /// Claude in Office of the profile; None leaves it as it is (the editor sends none for subscription profiles).
+    #[serde(default)]
+    pub office: Option<OfficeInput>,
+}
+
+/// Editor input for the Claude in Office part of a profile.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficeInput {
+    pub enabled: bool,
+    pub addin_id: String,
+    pub gateway_url: String,
+    pub entra_client_id: String,
+    pub entra_scope: String,
+    /// Separated by commas, spaces or line breaks.
+    pub disabled_features: String,
+}
+
+impl OfficeInput {
+    /// The profile's Office settings; None when the switch is off and nothing is filled in.
+    fn into_client(self) -> Option<OfficeClient> {
+        let client = OfficeClient {
+            enabled: self.enabled,
+            addin_id: self.addin_id.trim().to_string(),
+            gateway_url: self.gateway_url.trim().to_string(),
+            entra_client_id: self.entra_client_id.trim().to_string(),
+            entra_scope: self.entra_scope.trim().to_string(),
+            disabled_features: self.disabled_features.split([',', ';', ' ', '\t', '\r', '\n']).filter(|f| !f.is_empty()).map(String::from).collect(),
+        };
+        let blank = client.addin_id.is_empty()
+            && client.gateway_url.is_empty()
+            && client.entra_client_id.is_empty()
+            && client.entra_scope.is_empty()
+            && client.disabled_features.is_empty();
+        (client.enabled || !blank).then_some(client)
+    }
 }
 
 /// Editor input for a new or changed MCP server.
@@ -119,12 +177,18 @@ pub fn valid_endpoint(text: &str) -> Option<String> {
 
 impl Model {
     pub fn load(version: Option<String>) -> Self {
-        let config = ManagedConfig::load();
+        Self::load_from(version, ManagedConfig::load(), paths::data_dir())
+    }
+
+    /// Loads from `data_dir` with the managed settings `config` as given. Tests pass an empty config and a temporary folder,
+    /// so they neither read the real managed preferences nor write the real data or backup folder.
+    fn load_from(version: Option<String>, config: ManagedConfig, data_dir: PathBuf) -> Self {
         let backup_dir = BackupStore::directory(&config);
-        let metadata = MetadataStore::default();
+        let metadata = MetadataStore::new(data_dir.join("state.json"), true);
         let mut model = Model {
             state: AppState::default(),
             budgets: HashMap::new(),
+            gateway_models: HashMap::new(),
             available_update: None,
             installing_update: false,
             whats_new: vec![],
@@ -138,10 +202,13 @@ impl Model {
             keychain_profiles: vec![],
             error: None,
             notice: None,
+            office_problem: None,
+            office_sideload: Sideload::system(),
+            office_template: claude_office::template_file_in(&data_dir),
             config,
             app_version: version,
-            keys: KeyStore::default(),
-            tokens: TokenStore::default(),
+            keys: KeyStore { file: data_dir.join("keys.json") },
+            tokens: TokenStore { file: data_dir.join("sso-tokens.json") },
             subscription: None,
             usage_refreshed_at: None,
             sso_expired: HashSet::new(),
@@ -263,6 +330,7 @@ impl Model {
             profile.oidc_client_id = managed.oidc_client_id.clone();
             profile.oidc_scope = managed.oidc_scope.clone();
             profile.oidc_token_type = managed.oidc_token_type;
+            profile.office = managed.office.clone();
             if self.state.profile(&managed.id) != Some(&profile) {
                 self.save_profile(profile, None);
             }
@@ -279,14 +347,14 @@ impl Model {
         let notice = self.notice.clone();
         for binding in self.state.bindings.clone() {
             let Some(profile) = self.profile(&binding.profile_id) else { continue };
-            let wanted = binder.desired_values(&profile, binding.is_pooled());
+            let wanted = binder.desired_values(&profile, binding.is_pooled(), binding.models.as_ref());
             if binding.managed_values.get("apiKeyHelper") != wanted.get("apiKeyHelper") && Path::new(&binding.path).is_dir() {
                 self.apply(&profile, &binding.path, Some(&binding), None);
             }
         }
         if let Some(global) = self.state.global_binding.clone() {
             if let Some(profile) = self.profile(&global.profile_id) {
-                if global.managed_values.get("apiKeyHelper") != binder.desired_values(&profile, false).get("apiKeyHelper") {
+                if global.managed_values.get("apiKeyHelper") != binder.desired_values(&profile, false, None).get("apiKeyHelper") {
                     self.apply_global(&profile, Some(&global));
                 }
             }
@@ -312,6 +380,16 @@ impl Model {
         if input.name.trim().is_empty() || !invalid.is_empty() {
             return false;
         }
+        // `Some(None)`: Office removed from the profile. `None`: an editor that sent nothing leaves it as it is.
+        let office: Option<Option<OfficeClient>> = if subscription { Some(None) } else { input.office.map(OfficeInput::into_client) };
+        let managed = existing.as_ref().is_some_and(|p| self.config.is_managed(&p.id));
+        // Office settings that are switched on must be usable; switched off they may stay half filled.
+        if let Some(Some(office)) = office.as_ref().filter(|_| !managed) {
+            if let Some(message) = office.enabled.then(|| self.office_blocker(office)).flatten() {
+                self.error = Some(message);
+                return false;
+            }
+        }
         if sso {
             if let Err(e) = oidc::validate_url(&input.oidc_issuer) {
                 self.error = Some(e.to_string());
@@ -336,6 +414,9 @@ impl Model {
             if subscription {
                 profile.auth_type = AuthType::Subscription;
             }
+            if let Some(office) = office {
+                profile.office = office;
+            }
             if sso {
                 profile.auth_type = AuthType::Oidc;
                 profile.oidc_issuer = Some(input.oidc_issuer.trim().to_string());
@@ -359,6 +440,10 @@ impl Model {
         match self.state.profiles.iter_mut().find(|p| p.id == profile.id) {
             Some(existing) => *existing = profile.clone(),
             None => self.state.profiles.push(profile.clone()),
+        }
+        // The cached model list belongs to the old gateway; the next refresh loads the new one.
+        if old.as_ref().is_some_and(|o| o.endpoint != profile.endpoint) {
+            self.gateway_models.remove(&profile.id);
         }
         if !self.persist() {
             return false;
@@ -422,6 +507,7 @@ impl Model {
         }
         self.state.profiles.retain(|p| p.id != id);
         self.budgets.remove(id);
+        self.gateway_models.remove(id);
         self.persist();
     }
 
@@ -511,6 +597,35 @@ impl Model {
         }
     }
 
+    /// Gives a project the models of one tenant of its profile's gateway (`Some`), or the profile's own models (`None`).
+    /// Only the four model keys change; helper and endpoint stay the same. Only SSO profiles have tenants: a key profile
+    /// (and a subscription) keeps its own models, as the UI offers no choice there.
+    pub fn set_binding_tenant(&mut self, binding_id: &str, tenant: Option<String>) {
+        let Some(binding) = self.binding(binding_id) else { return };
+        let Some(profile) = self.profile(&binding.profile_id).filter(|p| p.is_sso()) else { return };
+        let tenant = tenant.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        let selection = match &tenant {
+            None => None,
+            Some(tenant) => {
+                let models = self.gateway_models.get(&profile.id).map(Vec::as_slice).unwrap_or_default();
+                match selection_for_tenant(models, tenant, &profile) {
+                    Some(selection) => Some(selection),
+                    None => {
+                        self.error = Some(l!("Das Gateway meldet keine Modelle für den Tenant „%@“.", tenant));
+                        return;
+                    }
+                }
+            }
+        };
+        if self.apply_with(&profile, &binding.path, Some(&binding), None, selection) {
+            let folder = folder_name(&binding.path);
+            self.notice = Some(match tenant {
+                Some(tenant) => l!("„%@“ nutzt jetzt die Modelle von Tenant „%@“. Laufende Claude-Sitzungen in diesem Projekt bitte neu starten.", folder, tenant),
+                None => l!("„%@“ nutzt wieder die Modelle des Profils. Laufende Claude-Sitzungen in diesem Projekt bitte neu starten.", folder),
+            });
+        }
+    }
+
     /// What the tray menu shows; compared as a whole to skip rebuilding an unchanged menu.
     pub fn tray_info(&self) -> TrayInfo {
         let keys = self.keys.all().unwrap_or_default();
@@ -534,7 +649,11 @@ impl Model {
                     id: p.id.clone(),
                     name: p.name.clone(),
                     usable: usable(p),
-                    budget: self.budgets.get(&p.id).map(|b| (b.spend, b.max_budget)),
+                    budgets: self
+                        .budgets
+                        .get(&p.id)
+                        .map(|list| list.iter().map(|b| TrayBudget { tenant: b.tenant.clone(), spend: b.budget.spend, max: b.budget.max_budget }).collect())
+                        .unwrap_or_default(),
                 })
                 .collect(),
             projects: self
@@ -627,6 +746,17 @@ impl Model {
             return Err(self.not_allowed_message(&profile.endpoint));
         }
         let key = if profile.is_sso() { self.sso_token(&profile)? } else { self.keys.read(&profile.id).map_err(|e| e.to_string())? };
+        // The analysis is billed like the project's own sessions: with the models of its tenant, if it has chosen one.
+        let profile = match &binding.models {
+            Some(s) => Profile {
+                model_alias: s.model_alias.clone(),
+                opus_model: s.opus_model.clone(),
+                sonnet_model: s.sonnet_model.clone(),
+                haiku_model: s.haiku_model.clone(),
+                ..profile
+            },
+            None => profile,
+        };
         Ok((profile, binding.path, key))
     }
 
@@ -651,14 +781,21 @@ impl Model {
         }
     }
 
+    /// Writes a project's settings again; its stored tenant choice stays, unless the project moves to another profile
+    /// (the models belong to the old profile's gateway).
     fn apply(&mut self, profile: &Profile, folder: &str, previous: Option<&WorkspaceBinding>, pooled: Option<bool>) -> bool {
+        let selection = previous.filter(|p| p.profile_id == profile.id).and_then(|p| p.models.clone());
+        self.apply_with(profile, folder, previous, pooled, selection)
+    }
+
+    fn apply_with(&mut self, profile: &Profile, folder: &str, previous: Option<&WorkspaceBinding>, pooled: Option<bool>, selection: Option<ModelSelection>) -> bool {
         let Some(binder) = self.binder.clone() else { return false };
         if self.is_disabled() {
             self.error = Some(l!("KeyZapper ist deaktiviert. Bitte zuerst wieder aktivieren."));
             return false;
         }
         let pooled = pooled.unwrap_or_else(|| previous.is_some_and(|p| p.is_pooled()));
-        match binder.apply(profile, folder, previous, pooled) {
+        match binder.apply(profile, folder, previous, pooled, selection.as_ref()) {
             Ok(result) => {
                 let binding_id = result.binding.id.clone();
                 let has_mcp = !result.binding.mcp_server_ids.is_empty() || !result.binding.mcp_managed.is_empty();
@@ -927,6 +1064,8 @@ impl Model {
                 Some(existing) => {
                     if !managed && existing != profile {
                         *existing = profile.clone();
+                        // The cached model list belongs to the old gateway; the next refresh loads the new one.
+                        self.gateway_models.remove(&profile.id);
                         changed_profiles.push(profile.id.clone());
                     }
                 }
@@ -953,7 +1092,7 @@ impl Model {
                 continue;
             };
             let previous = self.state.bindings.iter().find(|b| b.path == binding.path).cloned().unwrap_or_else(|| binding.clone());
-            if self.apply(&profile, &binding.path, Some(&previous), None) {
+            if self.apply_with(&profile, &binding.path, Some(&previous), None, binding.models.clone()) {
                 project_count += 1;
             } else {
                 skipped += 1;
@@ -1117,6 +1256,102 @@ impl Model {
         }
     }
 
+    // MARK: Claude in Office
+
+    /// The profile Claude in Office is to be set up from: KeyZapper active and a profile with Office switched on, those
+    /// from IT first.
+    fn office_candidate(&self) -> Option<&Profile> {
+        if self.is_disabled() {
+            return None;
+        }
+        let managed: Vec<String> = self.config.profiles.iter().map(|p| p.id.clone()).collect();
+        office_profile(&self.state.profiles, &managed)
+    }
+
+    /// Why `office` cannot be used yet: unusable settings, or a gateway the company policy does not allow. None = usable.
+    fn office_blocker(&self, office: &OfficeClient) -> Option<String> {
+        let problems = office.problems();
+        if !problems.is_empty() {
+            return Some(problems.join(" "));
+        }
+        (!self.config.is_endpoint_allowed(&office.gateway_url)).then(|| self.not_allowed_message(&office.gateway_url))
+    }
+
+    /// True while a run would write a manifest, so the caller fetches Anthropic's current template first (outside the lock).
+    pub fn office_wanted(&self) -> bool {
+        self.office_candidate().and_then(|p| p.office.as_ref()).is_some_and(|o| self.office_blocker(o).is_none())
+    }
+
+    /// Something is wrong with Claude in Office; a refresh then tries again.
+    pub fn office_failed(&self) -> bool {
+        self.office_problem.is_some() || self.state.office_error.is_some()
+    }
+
+    /// Decides what a sync run does: compares what the Office profile asks for with the record of what was registered
+    /// (never with the app folders). `fetched` is Anthropic's template as just loaded, `None` if it was not tried. `retry`
+    /// (a settings change or refresh, not the start) writes again after a failed registration. Returns the job to run
+    /// outside the lock, or None when there is nothing to touch; then the status already tells why.
+    pub fn plan_office(&mut self, fetched: Option<Result<String, String>>, retry: bool) -> Option<SyncJob> {
+        self.office_problem = None;
+        let mut manifest = String::new();
+        let mut apps = vec![];
+        let candidate = self.office_candidate().and_then(|p| Some((p.id.clone(), p.office.clone()?)));
+        let desired = match candidate {
+            None => None,
+            Some((profile_id, office)) => {
+                let built = match self.office_blocker(&office) {
+                    Some(message) => Err(message),
+                    None => claude_office::manifest_from(&self.office_template, fetched, &office),
+                };
+                match built {
+                    Ok(xml) => {
+                        apps = self.office_sideload.apps();
+                        let desired = DesiredOffice::new(&profile_id, &office, &xml, &apps);
+                        manifest = xml;
+                        Some(desired)
+                    }
+                    // Nothing is written, and what is registered stays.
+                    Err(message) => {
+                        self.office_problem = Some(message);
+                        return None;
+                    }
+                }
+            }
+        };
+        let applied = self.state.office_applied.clone();
+        let action = if retry && self.state.office_error.is_some() {
+            plan_retry(desired.as_ref(), applied.as_ref())
+        } else {
+            plan_sync(desired.as_ref(), applied.as_ref())
+        };
+        if action == SyncAction::Nothing {
+            return None;
+        }
+        Some(SyncJob { action, desired, manifest, apps, previous: applied })
+    }
+
+    /// Saves `outcome` as the record of what is registered. A run saves its intended record this way before it writes (see
+    /// `SyncJob::run`); false if it could not be saved.
+    pub fn record_office(&mut self, outcome: &Outcome) -> bool {
+        self.state.office_applied = outcome.applied.clone();
+        self.state.office_error = outcome.error.clone();
+        self.persist()
+    }
+
+    /// Records what `job.run` left behind.
+    pub fn finish_office(&mut self, job: &SyncJob, outcome: Outcome) {
+        self.record_office(&outcome);
+        // A failed removal has no profile card to show it on (deactivated, or Office switched off).
+        if let (SyncAction::Remove { .. }, Some(error)) = (&job.action, outcome.error) {
+            self.error = Some(error);
+        }
+    }
+
+    fn office_view(&self) -> OfficeView {
+        let error = self.office_problem.as_deref().or(self.state.office_error.as_deref());
+        OfficeView { status: claude_office::status(self.state.office_applied.as_ref(), error), profile_id: self.office_candidate().map(|p| p.id.clone()) }
+    }
+
     // MARK: View for the web UI
 
     pub fn view(&self) -> View {
@@ -1162,13 +1397,27 @@ impl Model {
                         managed: self.config.is_managed(&p.id),
                         has_key: key.is_some(),
                         key_hint: key.map(|k| masked_hint(k)),
-                        budget: self.budgets.get(&p.id).filter(|_| if p.is_sso() { session.is_some() && !self.sso_expired.contains(&p.id) } else { key.is_some() }).map(|b| BudgetView {
-                            spend: b.spend,
-                            max_budget: b.max_budget,
-                            remaining: b.max_budget.map(|_| b.remaining()),
-                            reset_at: b.reset_at.clone(),
-                        }),
+                        budgets: self
+                            .budgets
+                            .get(&p.id)
+                            .filter(|_| if p.is_sso() { session.is_some() && !self.sso_expired.contains(&p.id) } else { key.is_some() })
+                            .map(|list| {
+                                list.iter()
+                                    .map(|b| BudgetView {
+                                        tenant: b.tenant.clone(),
+                                        spend: b.budget.spend,
+                                        max_budget: b.budget.max_budget,
+                                        remaining: b.budget.max_budget.map(|_| b.budget.remaining()),
+                                        reset_at: b.budget.reset_at.clone(),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         killers: self.budget_killers(p),
+                        // Only an SSO profile has tenants (its model list comes with the user's token). A key profile's
+                        // `<x>/<model>` IDs are providers of one gateway, not accounts to choose from.
+                        tenants: self.gateway_models.get(&p.id).filter(|_| p.is_sso()).map(|m| tenants_of(m)).unwrap_or_default(),
+                        office: p.office.clone(),
                     }
                 })
                 .collect(),
@@ -1183,6 +1432,7 @@ impl Model {
                     name: folder_name(&b.path),
                     profile_id: b.profile_id.clone(),
                     pooled: b.is_pooled(),
+                    tenant: b.models.as_ref().map(|m| m.tenant.clone()),
                     mcp_server_ids: b.mcp_server_ids.clone(),
                     mcp_names: b.mcp_server_ids.iter().filter_map(|id| self.state.mcp_server(id)).map(|s| s.name.clone()).collect(),
                     mcp_active: self.mcp_active.get(&b.id).copied().unwrap_or(true),
@@ -1212,6 +1462,7 @@ impl Model {
                 })
                 .collect(),
             subscription: self.subscription.clone().filter(|_| self.has_subscription_profile()),
+            office: self.office_view(),
             global_profile_id: self.state.global_binding.as_ref().map(|g| g.profile_id.clone()),
             global_health: self.global_health.as_ref().map(HealthView::from),
             global_findings: self.global_findings.clone(),
@@ -1293,6 +1544,7 @@ pub struct View {
     mcp_servers: Vec<McpServerView>,
     /// Plan and usage limits of the Claude subscription, shared by all subscription profiles.
     subscription: Option<subscription::Status>,
+    office: OfficeView,
     global_profile_id: Option<String>,
     global_health: Option<HealthView>,
     global_findings: Vec<Finding>,
@@ -1332,8 +1584,15 @@ pub struct TrayProfile {
     pub name: String,
     /// Key stored or signed in.
     pub usable: bool,
-    /// Spend and limit, if the gateway reported them.
-    pub budget: Option<(f64, Option<f64>)>,
+    /// Spend and limit as the gateway reported them, one per tenant (see `Model::budgets`).
+    pub budgets: Vec<TrayBudget>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct TrayBudget {
+    pub tenant: Option<String>,
+    pub spend: f64,
+    pub max: Option<f64>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1369,13 +1628,30 @@ struct ProfileView {
     managed: bool,
     has_key: bool,
     key_hint: Option<String>,
-    budget: Option<BudgetView>,
+    /// One per tenant of an SSO profile's projects, else at most one; empty while unknown.
+    budgets: Vec<BudgetView>,
     killers: Vec<String>,
+    /// Tenants the gateway lists for this profile (`<tenant>/<model>` IDs), sorted; empty until the models are loaded.
+    tenants: Vec<String>,
+    /// Claude in Office settings of the profile, None if never configured.
+    office: Option<OfficeClient>,
+}
+
+/// Claude in Office on this machine: `state` is `off`, `applied` or `error`; `apps` are the Office apps it is registered
+/// for; `profile_id` the profile it comes from (None while KeyZapper is deactivated or no profile has Office switched on).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfficeView {
+    #[serde(flatten)]
+    status: OfficeStatus,
+    profile_id: Option<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BudgetView {
+    /// None = the profile itself (its own models), not a project's tenant.
+    tenant: Option<String>,
     spend: f64,
     max_budget: Option<f64>,
     remaining: Option<f64>,
@@ -1391,6 +1667,8 @@ struct BindingView {
     name: String,
     profile_id: String,
     pooled: bool,
+    /// Tenant whose models the project uses; None = as in the profile.
+    tenant: Option<String>,
     mcp_server_ids: Vec<String>,
     mcp_names: Vec<String>,
     /// False if `.mcp.json` no longer contains what the app wrote.
@@ -1458,4 +1736,228 @@ struct UpdateView {
     version: String,
     prerelease: bool,
     page_url: String,
+}
+
+/// Office folders are real folders on macOS; on Windows the registry is used instead (see `claude_office`'s own test).
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+    use keyzapper_core::claude_office::OfficeState;
+
+    const TEMPLATE: &str = include_str!("../../core/tests/fixtures/office-manifest.xml");
+    const ID: &str = "5c1d7e2a-8b3f-4e6d-9a0c-2f4b6d8e1a3c";
+
+    fn office() -> OfficeClient {
+        OfficeClient {
+            enabled: true,
+            addin_id: ID.into(),
+            gateway_url: "https://llm-gateway.example/api/x/desktop-gateway/office".into(),
+            entra_client_id: "11111111-2222-4333-8444-555555555555".into(),
+            entra_scope: "api://11111111-2222-4333-8444-555555555555/access_as_user".into(),
+            disabled_features: vec![],
+        }
+    }
+
+    /// A model that keeps its files and Office folders below `root` and has no managed settings: it reads nothing from this
+    /// machine's Intune values and writes nothing outside `root`.
+    fn model_in(root: &Path) -> Model {
+        let mut model = Model::load_from(None, ManagedConfig::default(), root.join("data"));
+        assert!(model.backup_dir.is_none(), "an empty config has no backup folder");
+        model.office_sideload = Sideload {
+            containers_dir: root.join("Containers"),
+            applications_dir: root.join("Applications"),
+            manifest_dir: root.join("office"),
+            registry_key: r"SOFTWARE\KeyZapperTest".into(),
+        };
+        model
+    }
+
+    /// Plans with `TEMPLATE` as the fetched one and runs the job, like `sync_office` in main.rs.
+    fn sync(model: &mut Model, retry: bool) -> Option<SyncAction> {
+        sync_checked(model, retry, |_| {})
+    }
+
+    /// Like `sync`; `at_checkpoint` runs right after the intended record was saved, before any manifest is written.
+    fn sync_checked(model: &mut Model, retry: bool, mut at_checkpoint: impl FnMut(&Model)) -> Option<SyncAction> {
+        let job = model.plan_office(Some(Ok(TEMPLATE.into())), retry)?;
+        let sideload = model.office_sideload.clone();
+        let outcome = job.run(&sideload, &mut |interim| {
+            let saved = model.record_office(interim);
+            at_checkpoint(model);
+            saved
+        });
+        let action = job.action.clone();
+        model.finish_office(&job, outcome);
+        Some(action)
+    }
+
+    /// The model IDs of a plain LiteLLM gateway: provider prefixes, not tenants.
+    fn prefixed_models() -> Vec<String> {
+        ["bedrock/claude-sonnet-5-5", "bedrock/claude-opus-5", "azure/gpt-5"].map(String::from).to_vec()
+    }
+
+    fn sso_profile(name: &str) -> Profile {
+        let mut profile = Profile::new(new_id(), name.into(), "https://llm-gateway.example/api/x/desktop-gateway/code".into(), String::new());
+        profile.auth_type = AuthType::Oidc;
+        profile.oidc_issuer = Some("https://login.example.test/00000000-0000-4000-8000-000000000000/v2.0".into());
+        profile.oidc_client_id = Some("11111111-2222-4333-8444-555555555555".into());
+        profile
+    }
+
+    fn model_with_binder(root: &Path) -> Model {
+        let mut model = model_in(root);
+        model.binder = Some(SettingsBinder {
+            helper_path: root.join("keyzapper-helper").to_string_lossy().into_owned(),
+            managed_settings_paths: vec![],
+            user_settings_path: root.join("user-settings.json").to_string_lossy().into_owned(),
+        });
+        model
+    }
+
+    #[test]
+    fn only_an_sso_profile_offers_tenants_and_takes_a_tenant_choice() {
+        let root = std::env::temp_dir().join(format!("kz-tenants-model-{}", new_id()));
+        let mut model = model_with_binder(&root);
+        let key = Profile::new(new_id(), "Key".into(), "https://litellm.example.test".into(), String::new());
+        let sso = sso_profile("Company");
+        assert!(model.save_profile(key.clone(), Some("sk-test".into())) && model.save_profile(sso.clone(), None));
+        // Whatever the gateway lists is cached for both, as if loaded.
+        for id in [&key.id, &sso.id] {
+            model.gateway_models.insert(id.clone(), prefixed_models());
+        }
+        // A key profile has no tenants: `bedrock/…` and `azure/…` are providers of one gateway, not accounts to choose from.
+        let tenants = |model: &Model, id: &str| model.view().profiles.into_iter().find(|p| p.id == id).unwrap().tenants;
+        assert!(tenants(&model, &key.id).is_empty());
+        assert_eq!(tenants(&model, &sso.id), ["azure", "bedrock"]);
+
+        // The project of a key profile stays on the profile's own models, whatever is asked for.
+        let mut projects = vec![];
+        for profile in [&key, &sso] {
+            let folder = root.join(format!("project-{}", profile.name));
+            std::fs::create_dir_all(&folder).unwrap();
+            model.bind(&folder.to_string_lossy(), &profile.id);
+            projects.push((model.state.bindings.iter().find(|b| b.profile_id == profile.id).cloned().expect("bound"), folder));
+        }
+        let (key_project, key_folder) = &projects[0];
+        let settings_of_key_project = std::fs::read_to_string(key_folder.join(".claude/settings.local.json")).unwrap();
+        model.error = None;
+        model.set_binding_tenant(&key_project.id, Some("bedrock".into()));
+        assert!(model.error.is_none(), "{:?}", model.error);
+        assert!(model.state.bindings.iter().find(|b| b.id == key_project.id).unwrap().models.is_none());
+        assert_eq!(std::fs::read_to_string(key_folder.join(".claude/settings.local.json")).unwrap(), settings_of_key_project);
+
+        // An SSO profile's project takes the tenant.
+        let (sso_project, sso_folder) = &projects[1];
+        model.set_binding_tenant(&sso_project.id, Some("bedrock".into()));
+        assert!(model.error.is_none(), "{:?}", model.error);
+        let chosen = model.state.bindings.iter().find(|b| b.id == sso_project.id).unwrap().models.clone();
+        assert_eq!(chosen.map(|m| m.tenant), Some("bedrock".to_string()));
+        assert!(std::fs::read_to_string(sso_folder.join(".claude/settings.local.json")).unwrap().contains("bedrock/claude-sonnet-5-5"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_profile_replaced_by_an_import_drops_the_model_list_of_its_old_gateway() {
+        let root = std::env::temp_dir().join(format!("kz-import-model-{}", new_id()));
+        let mut model = model_with_binder(&root);
+        let (changing, unchanged) = (sso_profile("Changing"), sso_profile("Unchanged"));
+        assert!(model.save_profile(changing.clone(), None) && model.save_profile(unchanged.clone(), None));
+        for id in [&changing.id, &unchanged.id] {
+            model.gateway_models.insert(id.clone(), prefixed_models());
+        }
+        let mut replaced = changing.clone();
+        replaced.endpoint = "https://other-gateway.example/api/x/desktop-gateway/code".into();
+        let payload = BackupPayload {
+            created_at: "2026-10-20T00:00:00Z".into(),
+            app_version: None,
+            state: AppState { profiles: vec![replaced.clone(), unchanged.clone()], ..AppState::default() },
+            keys: BTreeMap::new(),
+        };
+        assert!(model.import_payload(payload));
+        assert_eq!(model.state.profile(&changing.id).map(|p| p.endpoint.as_str()), Some(replaced.endpoint.as_str()));
+        assert!(!model.gateway_models.contains_key(&changing.id), "the list belongs to the old gateway; the next refresh loads the new one");
+        assert!(model.gateway_models.contains_key(&unchanged.id), "a profile the import left as it was keeps its list");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_in_office_follows_the_profile_and_a_failed_registration_is_not_repeated_on_every_start() {
+        let root = std::env::temp_dir().join(format!("kz-office-model-{}", new_id()));
+        let wef = |bundle: &str| root.join("Containers").join(bundle).join("Data/Documents/wef");
+        let word_manifest = wef("com.microsoft.Word").join(format!("{ID}.manifest.xml"));
+        for app in ["Microsoft Excel.app", "Microsoft Word.app"] {
+            std::fs::create_dir_all(root.join("Applications").join(app)).unwrap();
+        }
+        // Excel's wef folder is blocked by a file: Excel fails, Word works.
+        std::fs::create_dir_all(wef("com.microsoft.Excel").parent().unwrap()).unwrap();
+        std::fs::write(wef("com.microsoft.Excel"), "not a folder").unwrap();
+
+        let mut model = model_in(&root);
+        let mut profile = Profile::new(new_id(), "Own".into(), "https://litellm.example.test".into(), String::new());
+        profile.office = Some(office());
+        assert!(model.save_profile(profile.clone(), Some("sk-test".into())));
+        assert_eq!(model.office_view().status.state, OfficeState::Off);
+
+        // The first run registers; Excel fails, and the failure is recorded together with what was intended.
+        assert_eq!(sync(&mut model, false), Some(SyncAction::Apply));
+        assert!(word_manifest.exists());
+        let status = model.office_view().status;
+        assert_eq!((status.state, status.apps.clone()), (OfficeState::Error, vec!["excel".to_string(), "word".to_string()]));
+        assert!(status.message.is_some() && model.office_failed());
+        assert_eq!(model.office_view().profile_id.as_deref(), Some(profile.id.as_str()));
+
+        // A new start (state read from disk, no retry requested) writes nothing and still shows the error.
+        let mut model = model_in(&root);
+        assert!(model.state.office_error.is_some() && model.state.office_applied.is_some());
+        std::fs::remove_file(&word_manifest).unwrap();
+        assert_eq!(sync(&mut model, false), None);
+        assert!(!word_manifest.exists());
+        assert_eq!(model.office_view().status.state, OfficeState::Error);
+
+        // A request of the user tries again; with Excel fixed everything is registered and the error is gone.
+        std::fs::remove_file(wef("com.microsoft.Excel")).unwrap();
+        assert_eq!(sync(&mut model, true), Some(SyncAction::Apply));
+        assert!(word_manifest.exists() && wef("com.microsoft.Excel").join(format!("{ID}.manifest.xml")).exists());
+        assert_eq!(model.office_view().status.state, OfficeState::Applied);
+        assert!(!model.office_failed());
+        assert_eq!(sync(&mut model, true), None, "nothing changed, nothing is written");
+
+        // Unusable settings write nothing and leave the registered manifest in place.
+        model.state.profiles[0].office.as_mut().unwrap().gateway_url = "https://localhost/office".into();
+        assert_eq!(sync(&mut model, false), None);
+        assert!(word_manifest.exists());
+        let status = model.office_view().status;
+        assert_eq!((status.state, status.apps.len()), (OfficeState::Error, 2));
+        // A gateway the company policy does not allow is no different.
+        model.state.profiles[0].office = Some(office());
+        model.config.allowed_gateway_hosts = vec!["other.example".into()];
+        assert_eq!(sync(&mut model, false), None);
+        assert_eq!(model.office_view().status.state, OfficeState::Error);
+        model.config = ManagedConfig::default();
+
+        // Deactivating removes the manifests; only KeyZapper's own files go.
+        std::fs::write(wef("com.microsoft.Word").join("foreign.manifest.xml"), "x").unwrap();
+        model.state.disabled = Some(true);
+        assert_eq!(sync(&mut model, false), Some(SyncAction::Remove { addin_id: ID.into() }));
+        assert!(!word_manifest.exists() && wef("com.microsoft.Word").join("foreign.manifest.xml").exists());
+        assert_eq!((model.office_view().status.state, model.office_view().profile_id), (OfficeState::Off, None));
+        // Activating registers again. The record is on disk before the first manifest is written, so a crash in between
+        // cannot leave a manifest the record does not know.
+        model.state.disabled = None;
+        let state_file = root.join("data/state.json");
+        let mut checked = false;
+        assert_eq!(
+            sync_checked(&mut model, false, |_| {
+                let on_disk = MetadataStore::new(state_file.clone(), true).load().unwrap();
+                assert_eq!(on_disk.office_applied.as_ref().map(|a| a.addin_id.as_str()), Some(ID));
+                assert!(on_disk.office_error.is_some(), "marked unfinished until the run is done");
+                assert!(!word_manifest.exists());
+                checked = true;
+            }),
+            Some(SyncAction::Apply)
+        );
+        assert!(checked && word_manifest.exists());
+        assert_eq!(model.office_view().status.state, OfficeState::Applied);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
