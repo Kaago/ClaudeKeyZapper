@@ -615,7 +615,7 @@ function officeRow(profile) {
   }
   if (office.state === 'error') return line('orange', 'warning', t('Claude in Office: %@', office.message ?? ''));
   if (office.state === 'off') return line('muted', 'info', t('Claude in Office wird eingerichtet …'));
-  if (!office.apps.length) return line('muted', 'info', t('Claude in Office: Microsoft Office wurde nicht gefunden.'));
+  if (!office.apps.length) return line('muted', 'info', t('Claude in Office: Excel, Word oder PowerPoint wurde nicht gefunden oder noch nie gestartet. Nach dem ersten Start „Status aktualisieren“ wählen.'));
   return line('green', 'check', t('Claude in Office: eingerichtet für %@ – Office einmal neu starten und über „Einfügen → Meine Add-ins“ öffnen',
     office.apps.map((app) => OFFICE_APP_NAMES[app] ?? app).join(', ')));
 }

@@ -398,10 +398,14 @@ impl Sideload {
         }
     }
 
-    /// The apps a manifest is registered for: those installed below `/Applications` (macOS), all three (Windows, where
-    /// one registry value serves every app).
+    /// The apps a manifest is registered for: on macOS those installed below `/Applications` that were started once (their
+    /// container folder exists; KeyZapper only checks that it is there and never creates it), on Windows all three (one
+    /// registry value serves every app).
     pub fn apps(&self) -> Vec<OfficeApp> {
-        if cfg!(windows) { OfficeApp::ALL.to_vec() } else { installed_apps(&self.applications_dir) }
+        if cfg!(windows) {
+            return OfficeApp::ALL.to_vec();
+        }
+        installed_apps(&self.applications_dir).into_iter().filter(|app| self.containers_dir.join(app.bundle_id()).is_dir()).collect()
     }
 
     #[cfg(not(windows))]

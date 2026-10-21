@@ -142,7 +142,7 @@
  "Claude in Office konnte nicht entfernt werden: %@": "Claude in Office could not be removed: %@",
  "Claude in Office wird eingerichtet …": "Claude in Office is being set up …",
  "Claude in Office: %@": "Claude in Office: %@",
- "Claude in Office: Microsoft Office wurde nicht gefunden.": "Claude in Office: Microsoft Office was not found.",
+ "Claude in Office: Excel, Word oder PowerPoint wurde nicht gefunden oder noch nie gestartet. Nach dem ersten Start „Status aktualisieren“ wählen.": "Claude in Office: Excel, Word or PowerPoint was not found or never started. Choose “Refresh status” after the first start.",
  "Claude in Office: aus, solange KeyZapper deaktiviert ist.": "Claude in Office: off while KeyZapper is deactivated.",
  "Claude in Office: eingerichtet für %@ – Office einmal neu starten und über „Einfügen → Meine Add-ins“ öffnen": "Claude in Office: set up for %@ – restart Office once and open it via “Insert → My Add-ins”",
  "Claude in Office: nicht aktiv, das Profil „%@“ hat Vorrang.": "Claude in Office: not active, the profile “%@” takes precedence.",

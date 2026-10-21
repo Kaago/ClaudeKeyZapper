@@ -134,7 +134,10 @@ fn refresh_budgets(app: &AppHandle, only: Option<&str>) {
             // profile has tenants (its list follows the access its token has now); a key profile never asks for the list.
             let Some(secret) = secret.filter(|_| profile.is_sso()) else { return };
             if let Ok(models) = gateway::models(&profile.endpoint, &secret) {
-                with_model(&app, |m| m.gateway_models.insert(profile.id, models));
+                with_model(&app, |m| {
+                    m.gateway_models.insert(profile.id.clone(), models);
+                    m.follow_tenants(&profile.id);
+                });
                 changed(&app);
             }
         });

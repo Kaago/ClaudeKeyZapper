@@ -812,8 +812,34 @@ impl Model {
     /// Writes a project's settings again; its stored tenant choice stays, unless the project moves to another profile
     /// (the models belong to the old profile's gateway).
     fn apply(&mut self, profile: &Profile, folder: &str, previous: Option<&WorkspaceBinding>, pooled: Option<bool>) -> bool {
-        let selection = previous.filter(|p| p.profile_id == profile.id).and_then(|p| p.models.clone());
+        let selection = previous.filter(|p| p.profile_id == profile.id).and_then(|p| self.tenant_selection(profile, p.models.as_ref()));
         self.apply_with(profile, folder, previous, pooled, selection)
+    }
+
+    /// The tenant models a project keeps when its settings are written again, derived anew from the profile as it is now,
+    /// so a change of the profile's models (also by IT) reaches the project. Only an SSO profile has tenants. Without the
+    /// gateway's model list (not loaded yet), or when the tenant is no longer listed, the stored models stay: the project is
+    /// never moved to another tenant's budget silently.
+    fn tenant_selection(&self, profile: &Profile, stored: Option<&ModelSelection>) -> Option<ModelSelection> {
+        let stored = stored.filter(|_| profile.is_sso())?;
+        let models = self.gateway_models.get(&profile.id);
+        models.and_then(|models| selection_for_tenant(models, &stored.tenant, profile)).or_else(|| Some(stored.clone()))
+    }
+
+    /// Writes again the projects of `profile_id` whose tenant models no longer follow the profile, once the gateway's model
+    /// list is loaded (after a profile change, or at start after IT changed a managed profile).
+    pub fn follow_tenants(&mut self, profile_id: &str) {
+        let Some(profile) = self.profile(profile_id) else { return };
+        if self.is_disabled() {
+            return;
+        }
+        let notice = self.notice.clone();
+        for binding in self.state.bindings.clone().iter().filter(|b| b.profile_id == profile_id && b.models.is_some()) {
+            if self.tenant_selection(&profile, binding.models.as_ref()) != binding.models && Path::new(&binding.path).is_dir() {
+                self.apply(&profile, &binding.path, Some(binding), None);
+            }
+        }
+        self.notice = notice;
     }
 
     fn apply_with(&mut self, profile: &Profile, folder: &str, previous: Option<&WorkspaceBinding>, pooled: Option<bool>, selection: Option<ModelSelection>) -> bool {
@@ -1262,7 +1288,8 @@ impl Model {
                 continue;
             };
             let previous = self.state.bindings.iter().find(|b| b.path == binding.path).cloned().unwrap_or_else(|| binding.clone());
-            if self.apply_with(&profile, &binding.path, Some(&previous), None, binding.models.clone()) {
+            let selection = self.tenant_selection(&profile, binding.models.as_ref());
+            if self.apply_with(&profile, &binding.path, Some(&previous), None, selection) {
                 project_count += 1;
             } else {
                 skipped += 1;
@@ -1452,9 +1479,10 @@ impl Model {
         self.office_candidate().and_then(|p| p.office.as_ref()).is_some_and(|o| self.office_blocker(o).is_none())
     }
 
-    /// Something is wrong with Claude in Office; a refresh then tries again.
+    /// Something is wrong with Claude in Office, or no Office app could take the manifest yet (none started once); a
+    /// refresh then tries again.
     pub fn office_failed(&self) -> bool {
-        self.office_problem.is_some() || self.state.office_error.is_some()
+        self.office_problem.is_some() || self.state.office_error.is_some() || self.state.office_applied.as_ref().is_some_and(|a| a.apps.is_empty())
     }
 
     /// Decides what a sync run does: compares what the Office profile asks for with the record of what was registered
@@ -1468,6 +1496,11 @@ impl Model {
         let candidate = self.office_candidate().and_then(|p| Some((p.id.clone(), p.office.clone()?)));
         let desired = match candidate {
             None => None,
+            // A gateway the company policy does not allow (any more): nothing is written, and what is registered goes.
+            Some((_, office)) if office.problems().is_empty() && !self.config.is_endpoint_allowed(&office.gateway_url) => {
+                self.office_problem = Some(self.not_allowed_message(&office.gateway_url));
+                None
+            }
             Some((profile_id, office)) => {
                 let built = match self.office_blocker(&office) {
                     Some(message) => Err(message),
@@ -2074,6 +2107,46 @@ mod tests {
     }
 
     #[test]
+    fn a_tenant_choice_follows_the_profiles_models() {
+        let root = std::env::temp_dir().join(format!("kz-tenant-follow-{}", new_id()));
+        let mut model = model_with_binder(&root);
+        let mut profile = sso_profile("Company");
+        profile.sonnet_model = Some("claude-sonnet-5".into());
+        assert!(model.save_profile(profile.clone(), None));
+        let models: Vec<String> = ["acme/claude-sonnet-5", "acme/claude-sonnet-5-5", "globex/claude-sonnet-5"].map(String::from).to_vec();
+        model.gateway_models.insert(profile.id.clone(), models.clone());
+        let folder = root.join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        model.bind(&folder.to_string_lossy(), &profile.id);
+        let binding_id = model.state.bindings[0].id.clone();
+        model.set_binding_tenant(&binding_id, Some("acme".into()));
+        let settings = || std::fs::read_to_string(folder.join(".claude/settings.local.json")).unwrap();
+        assert!(settings().contains("\"acme/claude-sonnet-5\""), "{}", settings());
+
+        // The profile moves to a newer Sonnet: the project follows, within its tenant.
+        profile.sonnet_model = Some("claude-sonnet-5-5".into());
+        assert!(model.save_profile(profile.clone(), None));
+        assert!(settings().contains("\"acme/claude-sonnet-5-5\""), "{}", settings());
+        assert_eq!(model.state.bindings[0].models.as_ref().map(|m| m.tenant.as_str()), Some("acme"));
+
+        // Without the gateway's list the stored models stay; once it is loaded, the project follows.
+        model.gateway_models.remove(&profile.id);
+        profile.sonnet_model = Some("claude-sonnet-5".into());
+        assert!(model.save_profile(profile.clone(), None));
+        assert!(settings().contains("\"acme/claude-sonnet-5-5\""));
+        model.gateway_models.insert(profile.id.clone(), models);
+        model.follow_tenants(&profile.id);
+        assert!(settings().contains("\"acme/claude-sonnet-5\""), "{}", settings());
+
+        // A profile that is no longer SSO has no tenants: the project returns to the profile's own models.
+        profile.auth_type = AuthType::ApiKey;
+        assert!(model.save_profile(profile.clone(), Some("sk-test".into())));
+        assert!(model.state.bindings[0].models.is_none());
+        assert!(settings().contains("\"claude-sonnet-5\"") && !settings().contains("acme/"), "{}", settings());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_profile_replaced_by_an_import_drops_the_model_list_of_its_old_gateway() {
         let root = std::env::temp_dir().join(format!("kz-import-model-{}", new_id()));
         let mut model = model_with_binder(&root);
@@ -2102,9 +2175,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("kz-office-model-{}", new_id()));
         let wef = |bundle: &str| root.join("Containers").join(bundle).join("Data/Documents/wef");
         let word_manifest = wef("com.microsoft.Word").join(format!("{ID}.manifest.xml"));
-        for app in ["Microsoft Excel.app", "Microsoft Word.app"] {
+        for app in ["Microsoft Excel.app", "Microsoft Word.app", "Microsoft PowerPoint.app"] {
             std::fs::create_dir_all(root.join("Applications").join(app)).unwrap();
         }
+        // PowerPoint was never started: it has no container, and KeyZapper does not create one.
+        std::fs::create_dir_all(root.join("Containers/com.microsoft.Word")).unwrap();
         // Excel's wef folder is blocked by a file: Excel fails, Word works.
         std::fs::create_dir_all(wef("com.microsoft.Excel").parent().unwrap()).unwrap();
         std::fs::write(wef("com.microsoft.Excel"), "not a folder").unwrap();
@@ -2118,6 +2193,7 @@ mod tests {
         // The first run registers; Excel fails, and the failure is recorded together with what was intended.
         assert_eq!(sync(&mut model, false), Some(SyncAction::Apply));
         assert!(word_manifest.exists());
+        assert!(!root.join("Containers/com.microsoft.Powerpoint").exists(), "no container is created for an app never started");
         let status = model.office_view().status;
         assert_eq!((status.state, status.apps.clone()), (OfficeState::Error, vec!["excel".to_string(), "word".to_string()]));
         assert!(status.message.is_some() && model.office_failed());
@@ -2145,12 +2221,15 @@ mod tests {
         assert!(word_manifest.exists());
         let status = model.office_view().status;
         assert_eq!((status.state, status.apps.len()), (OfficeState::Error, 2));
-        // A gateway the company policy does not allow is no different.
+        // A gateway the company policy does not allow is removed: an add-in must not keep using it.
         model.state.profiles[0].office = Some(office());
         model.config.allowed_gateway_hosts = vec!["other.example".into()];
-        assert_eq!(sync(&mut model, false), None);
+        assert_eq!(sync(&mut model, false), Some(SyncAction::Remove { addin_id: ID.into() }));
+        assert!(!word_manifest.exists());
         assert_eq!(model.office_view().status.state, OfficeState::Error);
         model.config = ManagedConfig::default();
+        assert_eq!(sync(&mut model, false), Some(SyncAction::Apply));
+        assert!(word_manifest.exists());
 
         // Deactivating removes the manifests; only KeyZapper's own files go.
         std::fs::write(wef("com.microsoft.Word").join("foreign.manifest.xml"), "x").unwrap();
