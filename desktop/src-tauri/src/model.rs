@@ -330,6 +330,20 @@ impl Model {
         self.state.is_disabled()
     }
 
+    /// Update checks include beta releases: as switched in the app, else while a beta is installed (testers get the next).
+    pub fn beta_updates(&self) -> bool {
+        self.state.beta_updates.unwrap_or_else(|| self.app_version.as_deref().is_some_and(update::is_prerelease))
+    }
+
+    /// Switches beta releases for update checks on or off; switched off, an offered beta is no longer shown.
+    pub fn set_beta_updates(&mut self, enabled: bool) {
+        self.state.beta_updates = Some(enabled);
+        if !enabled {
+            self.available_update = self.available_update.take().filter(|release| !release.prerelease);
+        }
+        self.persist();
+    }
+
     pub fn minimum_cli_version(&self) -> String {
         self.config.minimum_claude_code_version.clone().unwrap_or_else(|| cli::MINIMUM_TESTED_VERSION.into())
     }
@@ -1801,6 +1815,7 @@ impl Model {
             error: self.error.clone(),
             allow_key_export: self.config.allow_key_export,
             update_check_enabled: self.config.update_check_enabled,
+            beta_updates: self.beta_updates(),
             allowed_hosts: self.config.allowed_gateway_hosts.clone(),
             default_endpoint: self.config.default_endpoint.clone(),
             default_model_alias: self.config.default_model_alias.clone(),
@@ -1885,6 +1900,8 @@ pub struct View {
     error: Option<String>,
     allow_key_export: bool,
     update_check_enabled: bool,
+    /// Update checks include beta releases.
+    beta_updates: bool,
     allowed_hosts: Vec<String>,
     default_endpoint: Option<String>,
     default_model_alias: Option<String>,
@@ -2200,6 +2217,26 @@ mod tests {
         let chosen = model.state.bindings.iter().find(|b| b.id == sso_project.id).unwrap().models.clone();
         assert_eq!(chosen.map(|m| m.tenant), Some("bedrock".to_string()));
         assert!(std::fs::read_to_string(sso_folder.join(".claude/settings.local.json")).unwrap().contains("bedrock/claude-sonnet-5-5"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_beta_switch_is_kept_and_defaults_to_on_only_for_an_installed_beta() {
+        let root = std::env::temp_dir().join(format!("kz-beta-{}", new_id()));
+        let load = |version: &str| Model::load_from(Some(version.into()), ManagedConfig::default(), root.join("data"));
+        assert!(!load("1.5.0").beta_updates());
+        assert!(load("1.5.0-beta.1").beta_updates(), "testers get the next beta");
+
+        // Switched off, an offered beta goes; the choice is saved and wins over the installed version.
+        let mut model = load("1.5.0-beta.1");
+        let beta = ReleaseInfo { version: "1.5.0-beta.2".into(), prerelease: true, page_url: String::new(), package_url: None, package_sha256: None, signature_url: None };
+        model.available_update = Some(beta.clone());
+        model.set_beta_updates(false);
+        assert!(model.available_update.is_none() && !model.beta_updates());
+        assert!(!load("1.5.0-beta.1").beta_updates());
+        // Switched on, it stays on for a stable version too.
+        model.set_beta_updates(true);
+        assert!(load("1.5.0").beta_updates());
         let _ = std::fs::remove_dir_all(&root);
     }
 

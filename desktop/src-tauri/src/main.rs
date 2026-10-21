@@ -217,9 +217,9 @@ fn refresh_tools(app: &AppHandle) {
     changed(app);
 }
 
-/// Stable releases only, unless `beta` was asked for or a beta is installed (testers get the next beta too).
-fn check_updates(app: &AppHandle, user_initiated: bool, beta: bool) {
-    let (enabled, version) = with_model(app, |m| (m.config.update_check_enabled, m.app_version.clone()));
+/// Stable releases only, unless beta releases are switched on (by default while a beta is installed).
+fn check_updates(app: &AppHandle, user_initiated: bool) {
+    let (enabled, version, beta) = with_model(app, |m| (m.config.update_check_enabled, m.app_version.clone(), m.beta_updates()));
     let notice = |text: String| {
         if user_initiated {
             with_model(app, |m| m.notice = Some(text));
@@ -229,7 +229,7 @@ fn check_updates(app: &AppHandle, user_initiated: bool, beta: bool) {
         return notice(l!("Updates werden von der IT verteilt; die Update-Prüfung ist abgeschaltet."));
     }
     let Some(version) = version else { return notice(l!("Entwicklungsversion – keine Update-Prüfung.")) };
-    match update::latest_release(beta || update::is_prerelease(&version)) {
+    match update::latest_release(beta) {
         Ok(release) if update::is_newer(&release.version, &version) => with_model(app, |m| m.available_update = Some(release)),
         Ok(_) => notice(l!("KeyZapper %@ ist aktuell.", version)),
         Err(e) => {
@@ -258,7 +258,7 @@ fn start_background(app: &AppHandle) {
     });
     sync_office_later(app, false);
     let handle = app.clone();
-    std::thread::spawn(move || check_updates(&handle, false, false));
+    std::thread::spawn(move || check_updates(&handle, false));
     let handle = app.clone();
     std::thread::spawn(move || {
         let minimum = with_model(&handle, |m| m.minimum_cli_version());
@@ -843,9 +843,22 @@ async fn import_backup(app: AppHandle, path: String, password: String) -> bool {
 }
 
 #[tauri::command]
-async fn check_for_updates(app: AppHandle, beta: bool) -> View {
+async fn check_for_updates(app: AppHandle) -> View {
     blocking(move || {
-        check_updates(&app, true, beta);
+        check_updates(&app, true);
+        view(&app)
+    })
+    .await
+}
+
+/// Beta releases on or off for update checks; switched on, KeyZapper looks for one right away.
+#[tauri::command]
+async fn set_beta_updates(app: AppHandle, enabled: bool) -> View {
+    blocking(move || {
+        with_model(&app, |m| m.set_beta_updates(enabled));
+        if enabled {
+            check_updates(&app, true);
+        }
         view(&app)
     })
     .await
@@ -1021,6 +1034,7 @@ fn main() {
             pick_backup_file,
             import_backup,
             check_for_updates,
+            set_beta_updates,
             install_update,
             dismiss_whats_new,
             fit_usage_popover,

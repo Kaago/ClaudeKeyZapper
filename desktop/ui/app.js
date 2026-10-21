@@ -181,7 +181,7 @@ function renderSidebar() {
     settings: settingsProblems ? [settingsProblems, 'warning'] : [null],
     backup: [null],
   };
-  const signature = JSON.stringify([page, view.language, view.disabled, badges, view.appVersion, view.updateCheckEnabled, view.platform, view.claudeToolsEnabled]);
+  const signature = JSON.stringify([page, view.language, view.disabled, badges, view.appVersion, view.updateCheckEnabled, view.betaUpdates, view.platform, view.claudeToolsEnabled]);
   if (signature === sidebarSignature) return;
   sidebarSignature = signature;
   const active = h('input', {
@@ -194,7 +194,10 @@ function renderSidebar() {
         t('Deaktivieren'))) call('set_disabled', { disabled: true });
     },
   });
-  const checkUpdates = (beta) => call('check_for_updates', { beta });
+  const beta = h('input', {
+    type: 'checkbox', role: 'switch', checked: view.betaUpdates,
+    onchange: (event) => call('set_beta_updates', { enabled: event.target.checked }),
+  });
   document.getElementById('sidebar').replaceChildren(
     h('div', { class: 'brand', 'data-tauri-drag-region': '' }, h('span', { class: 'logo' }, icon('bolt')), 'KeyZapper'),
     ...PAGES().map(([id, label, symbol]) => {
@@ -204,12 +207,12 @@ function renderSidebar() {
     }),
     h('div', { class: 'sidebar-footer' },
       h('label', { class: 'switch', title: t('KeyZapper vorübergehend deaktivieren: Projekte nutzen dann die normale Claude-Anmeldung') }, active, t('KeyZapper aktiv')),
+      view.updateCheckEnabled && view.appVersion && h('label', { class: 'switch', title: t('Bei der Update-Suche auch Beta-Versionen anbieten. Beta-Versionen sind zum Testen gedacht.') }, beta, t('Beta-Versionen')),
       button(t('So funktioniert’s'), howItWorksDialog, { iconName: 'info', cls: 'link' }),
       h('div', { class: 'version' },
         view.appVersion ? `KeyZapper ${view.appVersion}` : t('KeyZapper Entwicklungsversion'),
         view.updateCheckEnabled
-          ? [button(t('Nach Updates suchen'), () => checkUpdates(false), { cls: 'link' }),
-            button(t('Beta-Version suchen'), () => checkUpdates(true), { cls: 'link' })]
+          ? button(t('Nach Updates suchen'), () => call('check_for_updates'), { cls: 'link' })
           : h('span', null, t('Updates über die IT')),
         button(t('Projektseite'), () => call('open_url', { url: view.projectUrl }), { cls: 'link' }))),
   );

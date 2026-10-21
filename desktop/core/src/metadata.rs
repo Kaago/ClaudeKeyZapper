@@ -100,6 +100,9 @@ pub fn restoring_dropped_fields(state: AppState, mirror: &AppState) -> AppState 
     if result.disabled.is_none() {
         result.disabled = mirror.disabled;
     }
+    if result.beta_updates.is_none() {
+        result.beta_updates = mirror.beta_updates;
+    }
     if result.office_applied.is_none() {
         result.office_applied = mirror.office_applied.clone();
     }

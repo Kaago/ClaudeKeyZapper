@@ -455,7 +455,8 @@ Ein Tag im Format `X.Y.Z` startet [.github/workflows/release.yml](.github/workfl
 Tests aus, baut `KeyZapper-X.Y.Z.pkg` (macOS) und `KeyZapper-X.Y.Z.msi` (Windows), signiert beide mit minisign und veröffentlicht sie
 mit ihren `.minisig`-Dateien in einem GitHub-Release. Zum Signieren braucht es das Repository-Secret `MINISIGN_SECRET_KEY` (der geheime
 Schlüssel zu `desktop/update-key.pub`); ohne Secret bricht der Workflow ab, statt unsignierte Installer zu veröffentlichen.
-Ein Tag wie `X.Y.Z-beta.N` erzeugt ein Pre-Release, das nur installierten Betas und über „Beta-Version suchen“ angeboten wird.
+Ein Tag wie `X.Y.Z-beta.N` erzeugt ein Pre-Release, das nur mit dem Schalter *Beta-Versionen* in der Seitenleiste angeboten
+wird (Standard: an, solange eine Beta installiert ist).
 
 ```bash
 git tag 1.0.0

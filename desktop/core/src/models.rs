@@ -592,6 +592,9 @@ pub struct AppState {
     /// True while KeyZapper is deactivated: assignments stay saved, their settings are removed from the files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
+    /// Update checks offer beta releases too (switch in the app). None = only while a beta is installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beta_updates: Option<bool>,
     /// MCP servers that can be assigned to projects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServer>,
@@ -617,6 +620,7 @@ impl Default for AppState {
             bindings: vec![],
             global_binding: None,
             disabled: None,
+            beta_updates: None,
             mcp_servers: vec![],
             office_applied: None,
             office_error: None,

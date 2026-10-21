@@ -450,7 +450,8 @@ A tag in the format `X.Y.Z` starts [.github/workflows/release.yml](.github/workf
 tests, builds `KeyZapper-X.Y.Z.pkg` (macOS) and `KeyZapper-X.Y.Z.msi` (Windows), signs both with minisign and publishes them with
 their `.minisig` files in one GitHub release. Signing needs the repository secret `MINISIGN_SECRET_KEY` (the secret key matching
 `desktop/update-key.pub`); without it the workflow stops instead of publishing unsigned installers.
-A tag like `X.Y.Z-beta.N` creates a pre-release, which is only offered to installed betas and via “Check for beta”.
+A tag like `X.Y.Z-beta.N` creates a pre-release, which is only offered with the *Beta versions* switch in the sidebar
+(on by default while a beta is installed).
 
 ```bash
 git tag 1.0.0
