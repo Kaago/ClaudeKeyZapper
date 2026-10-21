@@ -101,11 +101,15 @@ fn tooltip(info: &TrayInfo) -> String {
 fn build_menu(app: &AppHandle, info: &TrayInfo) -> tauri::Result<Menu<tauri::Wry>> {
     let menu = Menu::new(app)?;
     for profile in &info.profiles {
-        if let Some(budget) = profile.budget {
-            menu.append(&MenuItem::new(app, budget_text(&profile.name, budget), false, None::<&str>)?)?;
+        for budget in &profile.budgets {
+            let name = match &budget.tenant {
+                Some(tenant) => format!("{} · {tenant}", profile.name),
+                None => profile.name.clone(),
+            };
+            menu.append(&MenuItem::new(app, budget_text(&name, (budget.spend, budget.max)), false, None::<&str>)?)?;
         }
     }
-    if info.profiles.iter().any(|p| p.budget.is_some()) {
+    if info.profiles.iter().any(|p| !p.budgets.is_empty()) {
         menu.append(&PredefinedMenuItem::separator(app)?)?;
     }
     if info.disabled {

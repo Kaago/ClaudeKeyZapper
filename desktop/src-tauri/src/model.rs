@@ -4,23 +4,41 @@
 use keyzapper_core::audit::Finding;
 use keyzapper_core::backup::BackupPayload;
 use keyzapper_core::backup_store::BackupStore;
+use keyzapper_core::claude_desktop::{BearerTokenType, DesktopSso};
+use keyzapper_core::claude_office::{self, office_profile, plan_retry, plan_sync, DesiredOffice, OfficeClient, OfficeStatus, Outcome, Sideload, SyncAction, SyncJob};
 use keyzapper_core::gateway::KeyBudget;
 use keyzapper_core::keys::{masked_hint, KeyStore};
 use keyzapper_core::managed::{host_of, is_secure_endpoint, ManagedConfig};
 use keyzapper_core::metadata::MetadataStore;
-use keyzapper_core::models::{new_id, parse_id, AppState, AuthType, McpServer, McpTransport, OidcTokenType, Profile, WorkspaceBinding};
-use keyzapper_core::paths::{abbreviate_home, folder_name};
+use keyzapper_core::models::{
+    new_id, parse_id, selection_for_tenant, tenants_of, AppState, AuthType, McpServer, McpTransport, ModelSelection, OidcTokenType, Profile,
+    WorkspaceBinding,
+};
+use keyzapper_core::paths::{self, abbreviate_home, folder_name};
 use keyzapper_core::settings::{self, BindingHealth, BindingStatus, SettingsBinder};
 use keyzapper_core::update::ReleaseInfo;
 use keyzapper_core::tokens::TokenStore;
-use keyzapper_core::{agents, cli, helper, l, legacy_keychain, mcp, oidc, subscription, update, whats_new};
+use keyzapper_core::mcp_catalog::{Catalog, FetchError};
+use keyzapper_core::tools::{Tool, ToolStatus};
+use keyzapper_core::{agents, claude_desktop, cli, helper, l, legacy_keychain, mcp, mcp_catalog, oidc, subscription, update, whats_new};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// A budget the gateway reported: for a tenant of a multi-tenant gateway, or None for the profile itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TenantBudget {
+    pub tenant: Option<String>,
+    pub budget: KeyBudget,
+}
+
 pub struct Model {
     pub state: AppState,
-    pub budgets: HashMap<String, KeyBudget>,
+    /// Per profile the budgets of `budget_targets`: one for a key, one per tenant of an SSO profile's projects.
+    pub budgets: HashMap<String, Vec<TenantBudget>>,
+    /// Model IDs the gateway lists per profile (`/v1/models`), loaded with the budgets. Their `<tenant>/` prefixes are the
+    /// tenants a project can choose; kept when a reload fails.
+    pub gateway_models: HashMap<String, Vec<String>>,
     pub available_update: Option<ReleaseInfo>,
     pub installing_update: bool,
     /// Highlights of the releases since the version last seen, shown once after an update.
@@ -40,6 +58,13 @@ pub struct Model {
     pub keychain_profiles: Vec<String>,
     pub error: Option<String>,
     pub notice: Option<String>,
+    /// Why Claude in Office cannot be set up right now (unusable settings, gateway not allowed, no template); nothing was
+    /// written then. Recomputed by every sync run.
+    office_problem: Option<String>,
+    /// Where Office keeps its manifests on this machine (tests point it into a temporary folder).
+    pub office_sideload: Sideload,
+    /// The last good copy of Anthropic's manifest template.
+    office_template: PathBuf,
     pub config: ManagedConfig,
     /// None for development builds.
     pub app_version: Option<String>,
@@ -57,6 +82,15 @@ pub struct Model {
     pub refresh_generation: u64,
     /// True if the window got the system's translucent material (macOS vibrancy, Windows 11 Mica).
     pub vibrancy: bool,
+    /// Central MCP server list (`ManagedMcpServersURL`) as last fetched; its servers are managed by IT.
+    pub mcp_catalog: Option<Catalog>,
+    pub mcp_catalog_problem: Option<String>,
+    pub mcp_catalog_loading: bool,
+    /// Installed Claude tools; None until checked.
+    pub tools: Option<Vec<ToolStatus>>,
+    pub installing_tool: Option<Tool>,
+    /// KeyZapper's entry in Claude Desktop's configuration library.
+    pub claude_desktop: claude_desktop::Status,
     backup_dir: Option<PathBuf>,
     metadata: MetadataStore,
     /// Set when metadata could not be read (e.g. newer schema); saving is blocked to avoid data loss.
@@ -81,6 +115,70 @@ pub struct ProfileInput {
     pub oidc_client_id: String,
     pub oidc_scope: String,
     pub oidc_token_type: OidcTokenType,
+    /// Claude in Office of the profile; None leaves it as it is (the editor sends none for subscription profiles).
+    #[serde(default)]
+    pub office: Option<OfficeInput>,
+    /// Claude Desktop's own sign-in for the profile; None leaves it as it is (the editor sends none for subscriptions).
+    #[serde(default)]
+    pub claude_desktop: Option<DesktopSsoInput>,
+}
+
+/// Editor input for Claude Desktop's own sign-in with the gateway's OIDC client.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopSsoInput {
+    pub enabled: bool,
+    pub gateway_url: String,
+    pub oidc_issuer: String,
+    pub oidc_client_id: String,
+    pub scopes: String,
+    pub bearer_token_type: BearerTokenType,
+}
+
+impl DesktopSsoInput {
+    /// The profile's block; None when the switch is off (Claude Desktop then uses the helper).
+    fn into_sso(self) -> Option<DesktopSso> {
+        self.enabled.then(|| DesktopSso {
+            gateway_url: self.gateway_url.trim().to_string(),
+            oidc_issuer: self.oidc_issuer.trim().to_string(),
+            oidc_client_id: self.oidc_client_id.trim().to_string(),
+            scopes: self.scopes.trim().to_string(),
+            bearer_token_type: self.bearer_token_type,
+        })
+    }
+}
+
+/// Editor input for the Claude in Office part of a profile.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficeInput {
+    pub enabled: bool,
+    pub addin_id: String,
+    pub gateway_url: String,
+    pub entra_client_id: String,
+    pub entra_scope: String,
+    /// Separated by commas, spaces or line breaks.
+    pub disabled_features: String,
+}
+
+impl OfficeInput {
+    /// The profile's Office settings; None when the switch is off and nothing is filled in.
+    fn into_client(self) -> Option<OfficeClient> {
+        let client = OfficeClient {
+            enabled: self.enabled,
+            addin_id: self.addin_id.trim().to_string(),
+            gateway_url: self.gateway_url.trim().to_string(),
+            entra_client_id: self.entra_client_id.trim().to_string(),
+            entra_scope: self.entra_scope.trim().to_string(),
+            disabled_features: self.disabled_features.split([',', ';', ' ', '\t', '\r', '\n']).filter(|f| !f.is_empty()).map(String::from).collect(),
+        };
+        let blank = client.addin_id.is_empty()
+            && client.gateway_url.is_empty()
+            && client.entra_client_id.is_empty()
+            && client.entra_scope.is_empty()
+            && client.disabled_features.is_empty();
+        (client.enabled || !blank).then_some(client)
+    }
 }
 
 /// Editor input for a new or changed MCP server.
@@ -119,12 +217,18 @@ pub fn valid_endpoint(text: &str) -> Option<String> {
 
 impl Model {
     pub fn load(version: Option<String>) -> Self {
-        let config = ManagedConfig::load();
+        Self::load_from(version, ManagedConfig::load(), paths::data_dir())
+    }
+
+    /// Loads from `data_dir` with the managed settings `config` as given. Tests pass an empty config and a temporary folder,
+    /// so they neither read the real managed preferences nor write the real data or backup folder.
+    fn load_from(version: Option<String>, config: ManagedConfig, data_dir: PathBuf) -> Self {
         let backup_dir = BackupStore::directory(&config);
-        let metadata = MetadataStore::default();
+        let metadata = MetadataStore::new(data_dir.join("state.json"), true);
         let mut model = Model {
             state: AppState::default(),
             budgets: HashMap::new(),
+            gateway_models: HashMap::new(),
             available_update: None,
             installing_update: false,
             whats_new: vec![],
@@ -138,10 +242,13 @@ impl Model {
             keychain_profiles: vec![],
             error: None,
             notice: None,
+            office_problem: None,
+            office_sideload: Sideload::system(),
+            office_template: claude_office::template_file_in(&data_dir),
             config,
             app_version: version,
-            keys: KeyStore::default(),
-            tokens: TokenStore::default(),
+            keys: KeyStore { file: data_dir.join("keys.json") },
+            tokens: TokenStore { file: data_dir.join("sso-tokens.json") },
             subscription: None,
             usage_refreshed_at: None,
             sso_expired: HashSet::new(),
@@ -149,6 +256,12 @@ impl Model {
             binder: None,
             refresh_generation: 0,
             vibrancy: false,
+            mcp_catalog: None,
+            mcp_catalog_problem: None,
+            mcp_catalog_loading: false,
+            tools: None,
+            installing_tool: None,
+            claude_desktop: claude_desktop::Status::default(),
             backup_dir,
             metadata,
             metadata_unreadable: false,
@@ -184,6 +297,10 @@ impl Model {
         }
         model.sync_managed_profiles();
         model.migrate_helper_path();
+        if let Some(url) = model.config.managed_mcp_servers_url.clone() {
+            model.mcp_catalog = mcp_catalog::load_cache(&url);
+            model.sync_managed_mcp_servers(None);
+        }
         model
     }
 
@@ -211,6 +328,20 @@ impl Model {
 
     pub fn is_disabled(&self) -> bool {
         self.state.is_disabled()
+    }
+
+    /// Update checks include beta releases: as switched in the app, else while a beta is installed (testers get the next).
+    pub fn beta_updates(&self) -> bool {
+        self.state.beta_updates.unwrap_or_else(|| self.app_version.as_deref().is_some_and(update::is_prerelease))
+    }
+
+    /// Switches beta releases for update checks on or off; switched off, an offered beta is no longer shown.
+    pub fn set_beta_updates(&mut self, enabled: bool) {
+        self.state.beta_updates = Some(enabled);
+        if !enabled {
+            self.available_update = self.available_update.take().filter(|release| !release.prerelease);
+        }
+        self.persist();
     }
 
     pub fn minimum_cli_version(&self) -> String {
@@ -263,6 +394,8 @@ impl Model {
             profile.oidc_client_id = managed.oidc_client_id.clone();
             profile.oidc_scope = managed.oidc_scope.clone();
             profile.oidc_token_type = managed.oidc_token_type;
+            profile.office = managed.office.clone();
+            profile.claude_desktop = managed.claude_desktop.clone();
             if self.state.profile(&managed.id) != Some(&profile) {
                 self.save_profile(profile, None);
             }
@@ -279,14 +412,14 @@ impl Model {
         let notice = self.notice.clone();
         for binding in self.state.bindings.clone() {
             let Some(profile) = self.profile(&binding.profile_id) else { continue };
-            let wanted = binder.desired_values(&profile, binding.is_pooled());
+            let wanted = binder.desired_values(&profile, binding.is_pooled(), binding.models.as_ref());
             if binding.managed_values.get("apiKeyHelper") != wanted.get("apiKeyHelper") && Path::new(&binding.path).is_dir() {
                 self.apply(&profile, &binding.path, Some(&binding), None);
             }
         }
         if let Some(global) = self.state.global_binding.clone() {
             if let Some(profile) = self.profile(&global.profile_id) {
-                if global.managed_values.get("apiKeyHelper") != binder.desired_values(&profile, false).get("apiKeyHelper") {
+                if global.managed_values.get("apiKeyHelper") != binder.desired_values(&profile, false, None).get("apiKeyHelper") {
                     self.apply_global(&profile, Some(&global));
                 }
             }
@@ -312,6 +445,27 @@ impl Model {
         if input.name.trim().is_empty() || !invalid.is_empty() {
             return false;
         }
+        // `Some(None)`: Office removed from the profile. `None`: an editor that sent nothing leaves it as it is.
+        let office: Option<Option<OfficeClient>> = if subscription { Some(None) } else { input.office.map(OfficeInput::into_client) };
+        let managed = existing.as_ref().is_some_and(|p| self.config.is_managed(&p.id));
+        // Office settings that are switched on must be usable; switched off they may stay half filled.
+        if let Some(Some(office)) = office.as_ref().filter(|_| !managed) {
+            if let Some(message) = office.enabled.then(|| self.office_blocker(office)).flatten() {
+                self.error = Some(message);
+                return false;
+            }
+        }
+        let desktop: Option<Option<DesktopSso>> = if subscription { Some(None) } else { input.claude_desktop.map(DesktopSsoInput::into_sso) };
+        if let Some(Some(desktop)) = desktop.as_ref().filter(|_| !managed) {
+            let mut problems = desktop.problems();
+            if problems.is_empty() && !desktop.gateway_url.is_empty() && !self.config.is_endpoint_allowed(&desktop.gateway_url) {
+                problems.push(self.not_allowed_message(&desktop.gateway_url));
+            }
+            if !problems.is_empty() {
+                self.error = Some(problems.join(" "));
+                return false;
+            }
+        }
         if sso {
             if let Err(e) = oidc::validate_url(&input.oidc_issuer) {
                 self.error = Some(e.to_string());
@@ -335,6 +489,12 @@ impl Model {
             profile.environment = (!environment.is_empty()).then_some(environment);
             if subscription {
                 profile.auth_type = AuthType::Subscription;
+            }
+            if let Some(office) = office {
+                profile.office = office;
+            }
+            if let Some(desktop) = desktop {
+                profile.claude_desktop = desktop;
             }
             if sso {
                 profile.auth_type = AuthType::Oidc;
@@ -360,6 +520,10 @@ impl Model {
             Some(existing) => *existing = profile.clone(),
             None => self.state.profiles.push(profile.clone()),
         }
+        // The cached model list belongs to the old gateway; the next refresh loads the new one.
+        if old.as_ref().is_some_and(|o| o.endpoint != profile.endpoint) {
+            self.gateway_models.remove(&profile.id);
+        }
         if !self.persist() {
             return false;
         }
@@ -375,6 +539,9 @@ impl Model {
                 if let Some(global) = self.state.global_binding.clone().filter(|g| g.profile_id == profile.id) {
                     self.apply_global(&profile, Some(&global));
                 }
+            }
+            if self.desktop_status().profile_id.as_deref() == Some(profile.id.as_str()) {
+                self.apply_claude_desktop(&profile);
             }
         }
         true
@@ -420,8 +587,16 @@ impl Model {
             }
             self.state.global_binding = None;
         }
+        if self.desktop_status().profile_id.as_deref() == Some(id) {
+            let _ = claude_desktop::remove(&claude_desktop::library_dir());
+        }
+        if self.state.claude_desktop_profile_id.as_deref() == Some(id) {
+            self.state.claude_desktop_profile_id = None;
+        }
+        self.claude_desktop = self.desktop_status();
         self.state.profiles.retain(|p| p.id != id);
         self.budgets.remove(id);
+        self.gateway_models.remove(id);
         self.persist();
     }
 
@@ -511,6 +686,35 @@ impl Model {
         }
     }
 
+    /// Gives a project the models of one tenant of its profile's gateway (`Some`), or the profile's own models (`None`).
+    /// Only the four model keys change; helper and endpoint stay the same. Only SSO profiles have tenants: a key profile
+    /// (and a subscription) keeps its own models, as the UI offers no choice there.
+    pub fn set_binding_tenant(&mut self, binding_id: &str, tenant: Option<String>) {
+        let Some(binding) = self.binding(binding_id) else { return };
+        let Some(profile) = self.profile(&binding.profile_id).filter(|p| p.is_sso()) else { return };
+        let tenant = tenant.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        let selection = match &tenant {
+            None => None,
+            Some(tenant) => {
+                let models = self.gateway_models.get(&profile.id).map(Vec::as_slice).unwrap_or_default();
+                match selection_for_tenant(models, tenant, &profile) {
+                    Some(selection) => Some(selection),
+                    None => {
+                        self.error = Some(l!("Das Gateway meldet keine Modelle für den Tenant „%@“.", tenant));
+                        return;
+                    }
+                }
+            }
+        };
+        if self.apply_with(&profile, &binding.path, Some(&binding), None, selection) {
+            let folder = folder_name(&binding.path);
+            self.notice = Some(match tenant {
+                Some(tenant) => l!("„%@“ nutzt jetzt die Modelle von Tenant „%@“. Laufende Claude-Sitzungen in diesem Projekt bitte neu starten.", folder, tenant),
+                None => l!("„%@“ nutzt wieder die Modelle des Profils. Laufende Claude-Sitzungen in diesem Projekt bitte neu starten.", folder),
+            });
+        }
+    }
+
     /// What the tray menu shows; compared as a whole to skip rebuilding an unchanged menu.
     pub fn tray_info(&self) -> TrayInfo {
         let keys = self.keys.all().unwrap_or_default();
@@ -534,7 +738,11 @@ impl Model {
                     id: p.id.clone(),
                     name: p.name.clone(),
                     usable: usable(p),
-                    budget: self.budgets.get(&p.id).map(|b| (b.spend, b.max_budget)),
+                    budgets: self
+                        .budgets
+                        .get(&p.id)
+                        .map(|list| list.iter().map(|b| TrayBudget { tenant: b.tenant.clone(), spend: b.budget.spend, max: b.budget.max_budget }).collect())
+                        .unwrap_or_default(),
                 })
                 .collect(),
             projects: self
@@ -627,6 +835,17 @@ impl Model {
             return Err(self.not_allowed_message(&profile.endpoint));
         }
         let key = if profile.is_sso() { self.sso_token(&profile)? } else { self.keys.read(&profile.id).map_err(|e| e.to_string())? };
+        // The analysis is billed like the project's own sessions: with the models of its tenant, if it has chosen one.
+        let profile = match &binding.models {
+            Some(s) => Profile {
+                model_alias: s.model_alias.clone(),
+                opus_model: s.opus_model.clone(),
+                sonnet_model: s.sonnet_model.clone(),
+                haiku_model: s.haiku_model.clone(),
+                ..profile
+            },
+            None => profile,
+        };
         Ok((profile, binding.path, key))
     }
 
@@ -651,14 +870,47 @@ impl Model {
         }
     }
 
+    /// Writes a project's settings again; its stored tenant choice stays, unless the project moves to another profile
+    /// (the models belong to the old profile's gateway).
     fn apply(&mut self, profile: &Profile, folder: &str, previous: Option<&WorkspaceBinding>, pooled: Option<bool>) -> bool {
+        let selection = previous.filter(|p| p.profile_id == profile.id).and_then(|p| self.tenant_selection(profile, p.models.as_ref()));
+        self.apply_with(profile, folder, previous, pooled, selection)
+    }
+
+    /// The tenant models a project keeps when its settings are written again, derived anew from the profile as it is now,
+    /// so a change of the profile's models (also by IT) reaches the project. Only an SSO profile has tenants. Without the
+    /// gateway's model list (not loaded yet), or when the tenant is no longer listed, the stored models stay: the project is
+    /// never moved to another tenant's budget silently.
+    fn tenant_selection(&self, profile: &Profile, stored: Option<&ModelSelection>) -> Option<ModelSelection> {
+        let stored = stored.filter(|_| profile.is_sso())?;
+        let models = self.gateway_models.get(&profile.id);
+        models.and_then(|models| selection_for_tenant(models, &stored.tenant, profile)).or_else(|| Some(stored.clone()))
+    }
+
+    /// Writes again the projects of `profile_id` whose tenant models no longer follow the profile, once the gateway's model
+    /// list is loaded (after a profile change, or at start after IT changed a managed profile).
+    pub fn follow_tenants(&mut self, profile_id: &str) {
+        let Some(profile) = self.profile(profile_id) else { return };
+        if self.is_disabled() {
+            return;
+        }
+        let notice = self.notice.clone();
+        for binding in self.state.bindings.clone().iter().filter(|b| b.profile_id == profile_id && b.models.is_some()) {
+            if self.tenant_selection(&profile, binding.models.as_ref()) != binding.models && Path::new(&binding.path).is_dir() {
+                self.apply(&profile, &binding.path, Some(binding), None);
+            }
+        }
+        self.notice = notice;
+    }
+
+    fn apply_with(&mut self, profile: &Profile, folder: &str, previous: Option<&WorkspaceBinding>, pooled: Option<bool>, selection: Option<ModelSelection>) -> bool {
         let Some(binder) = self.binder.clone() else { return false };
         if self.is_disabled() {
             self.error = Some(l!("KeyZapper ist deaktiviert. Bitte zuerst wieder aktivieren."));
             return false;
         }
         let pooled = pooled.unwrap_or_else(|| previous.is_some_and(|p| p.is_pooled()));
-        match binder.apply(profile, folder, previous, pooled) {
+        match binder.apply(profile, folder, previous, pooled, selection.as_ref()) {
             Ok(result) => {
                 let binding_id = result.binding.id.clone();
                 let has_mcp = !result.binding.mcp_server_ids.is_empty() || !result.binding.mcp_managed.is_empty();
@@ -703,9 +955,18 @@ impl Model {
         self.state.mcp_server(id).cloned()
     }
 
+    /// Server of the central list; IT changes it there, not in the app.
+    fn is_managed_mcp(&self, id: &str) -> bool {
+        self.mcp_catalog.as_ref().is_some_and(|c| c.servers.iter().any(|s| s.id == id))
+    }
+
     pub fn save_mcp_server(&mut self, input: McpServerInput) -> bool {
         let name = input.name.trim().to_string();
         let existing = input.id.as_deref().and_then(parse_id).and_then(|id| self.mcp_server(&id));
+        if existing.as_ref().is_some_and(|e| self.is_managed_mcp(&e.id)) {
+            self.error = Some(l!("Dieser MCP-Server wird von der IT verwaltet und kann nicht geändert werden."));
+            return false;
+        }
         if !McpServer::is_valid_name(&name) {
             self.error = Some(l!("Der Servername darf nur Buchstaben, Ziffern, „-“, „_“ und „.“ enthalten."));
             return false;
@@ -780,6 +1041,10 @@ impl Model {
 
     pub fn delete_mcp_server(&mut self, id: &str) {
         let Some(server) = self.mcp_server(id) else { return };
+        if self.is_managed_mcp(id) {
+            self.error = Some(l!("Dieser MCP-Server wird von der IT verwaltet und kann nicht geändert werden."));
+            return;
+        }
         for binding in self.state.bindings.clone().iter().filter(|b| b.mcp_server_ids.contains(&server.id)) {
             let ids = binding.mcp_server_ids.iter().filter(|i| **i != server.id).cloned().collect();
             if !self.set_project_mcp_servers(&binding.id, ids) {
@@ -836,12 +1101,177 @@ impl Model {
         }
     }
 
-    /// Takes over MCP servers from a backup (new ones added, known ones updated).
+    /// Takes over MCP servers from a backup (new ones added, known ones updated; those of the central list stay as IT set them).
     fn merge_mcp_servers(&mut self, servers: &[McpServer]) {
         for server in servers {
+            if self.is_managed_mcp(&server.id) {
+                continue;
+            }
             match self.state.mcp_servers.iter_mut().find(|s| s.id == server.id) {
                 Some(existing) => *existing = server.clone(),
                 None => self.state.mcp_servers.push(server.clone()),
+            }
+        }
+    }
+
+    // MARK: Central MCP server list
+
+    /// Address of the central list and the token of an SSO profile signed in at its host (gateway or identity
+    /// provider), so the server can answer per user. Only hosts that get this token anyway receive it.
+    pub fn mcp_catalog_request(&mut self) -> Option<(String, Option<String>)> {
+        let url = self.config.managed_mcp_servers_url.clone()?;
+        let host = host_of(&url);
+        let now = oidc::unix_now();
+        let token = self
+            .state
+            .profiles
+            .iter()
+            .filter(|p| p.is_sso() && host.is_some() && [host_of(&p.endpoint), p.oidc_issuer.as_deref().and_then(host_of)].contains(&host))
+            .find_map(|p| oidc::access_token(p, &self.tokens, now).ok());
+        self.mcp_catalog_loading = true;
+        Some((url, token))
+    }
+
+    pub fn take_mcp_catalog(&mut self, result: Result<Catalog, FetchError>) {
+        self.mcp_catalog_loading = false;
+        match result {
+            Ok(catalog) => {
+                if let Err(e) = mcp_catalog::save_cache(&catalog) {
+                    eprintln!("KeyZapper: MCP list not cached: {e}");
+                }
+                let previous = self.mcp_catalog.replace(catalog);
+                self.mcp_catalog_problem = None;
+                self.sync_managed_mcp_servers(previous.as_ref());
+            }
+            Err(e) => self.mcp_catalog_problem = Some(e.to_string()),
+        }
+    }
+
+    /// Takes over the central list: new servers are added, changed ones rewritten in the projects using them, and
+    /// those IT took off the list (compared with `previous`) leave the projects. A server of your own with the same
+    /// name keeps its place; the list's entry is then left out.
+    fn sync_managed_mcp_servers(&mut self, previous: Option<&Catalog>) {
+        let Some(catalog) = self.mcp_catalog.clone() else { return };
+        let notice = self.notice.clone();
+        let (mut added, mut changed) = (false, Vec::new());
+        for server in &catalog.servers {
+            if self.state.mcp_servers.iter().any(|s| s.name == server.name && s.id != server.id) {
+                continue;
+            }
+            match self.state.mcp_servers.iter_mut().find(|s| s.id == server.id) {
+                Some(existing) if existing == server => {}
+                Some(existing) => {
+                    *existing = server.clone();
+                    changed.push(server.id.clone());
+                }
+                None => {
+                    self.state.mcp_servers.push(server.clone());
+                    added = true;
+                }
+            }
+        }
+        if added || !changed.is_empty() {
+            self.persist();
+        }
+        for binding in self.state.bindings.clone().iter().filter(|b| b.mcp_server_ids.iter().any(|id| changed.contains(id))) {
+            self.apply_mcp(&binding.id, true);
+        }
+        for gone in previous.into_iter().flat_map(|p| p.servers.iter()).filter(|s| !catalog.servers.iter().any(|c| c.id == s.id)) {
+            self.delete_mcp_server(&gone.id);
+        }
+        self.notice = notice;
+    }
+
+    /// Names on the central list that were left out because a server of your own has that name.
+    fn shadowed_mcp_names(&self) -> Vec<String> {
+        let Some(catalog) = &self.mcp_catalog else { return vec![] };
+        catalog.servers.iter().filter(|c| self.state.mcp_server(&c.id).is_none()).map(|c| c.name.clone()).collect()
+    }
+
+    // MARK: Claude tools
+
+    pub fn tool_installed_message(tool: Tool) -> String {
+        match tool {
+            Tool::Cli => l!("Claude Code ist installiert. Neue Terminal-Fenster finden den Befehl claude."),
+            Tool::VsCode => l!("Claude Code für VS Code ist installiert. Bitte das VS Code-Fenster neu laden."),
+            Tool::Intellij => l!("Das Claude Code-Plugin ist installiert. Bitte IntelliJ IDEA neu starten."),
+            Tool::Desktop => l!("Claude Desktop ist installiert."),
+        }
+    }
+
+    /// Lets Claude Desktop use a profile's gateway (key or SSO via the helper, or its own sign-in with the profile's
+    /// `DesktopSso` block); None restores its normal sign-in.
+    pub fn set_claude_desktop_profile(&mut self, profile_id: Option<String>) {
+        if self.is_disabled() {
+            self.error = Some(l!("KeyZapper ist deaktiviert. Bitte zuerst wieder aktivieren."));
+            return;
+        }
+        let profile = match profile_id {
+            Some(id) => match self.profile(&id) {
+                Some(profile) => Some(profile),
+                None => {
+                    self.error = Some(l!("Unbekanntes Profil: %@", id));
+                    return;
+                }
+            },
+            None => None,
+        };
+        match profile {
+            Some(profile) if profile.is_subscription() => {
+                self.error = Some(l!("Mit einem Claude-Abo meldet sich Claude Desktop selbst an. Bitte „Normale Anmeldung“ wählen."));
+            }
+            Some(profile) if !self.is_allowed(&profile) => self.error = Some(self.not_allowed_message(&profile.endpoint)),
+            Some(profile) => {
+                if self.apply_claude_desktop(&profile) {
+                    self.notice = Some(l!("Claude Desktop nutzt jetzt „%@“. Bitte Claude Desktop beenden und neu öffnen.", profile.name));
+                }
+            }
+            None => match claude_desktop::remove(&claude_desktop::library_dir()) {
+                Ok(()) => {
+                    self.state.claude_desktop_profile_id = None;
+                    self.persist();
+                    self.notice = Some(l!("KeyZapper-Konfiguration aus Claude Desktop entfernt. Nach einem Neustart meldet sich Claude Desktop wieder normal an."));
+                }
+                Err(e) => self.error = Some(l!("Claude Desktop konnte nicht eingerichtet werden: %@", e)),
+            },
+        }
+        self.claude_desktop = self.desktop_status();
+    }
+
+    /// What Claude Desktop is set to; the record names the profile of the sign-in variant, whose entry does not.
+    fn desktop_status(&self) -> claude_desktop::Status {
+        claude_desktop::status(&claude_desktop::library_dir(), self.state.claude_desktop_profile_id.as_deref())
+    }
+
+    /// Writes KeyZapper's entry for `profile` and records it. Not while IT configures Claude Desktop: its settings win,
+    /// and an entry of KeyZapper would only mislead.
+    fn apply_claude_desktop(&mut self, profile: &Profile) -> bool {
+        let Some(helper) = self.binder.as_ref().map(|b| b.helper_path.clone()) else { return false };
+        if self.desktop_status().managed {
+            self.error = Some(l!("Claude Desktop wird auf diesem Rechner von der IT konfiguriert; KeyZapper richtet es deshalb nicht ein."));
+            return false;
+        }
+        if let Some(sso) = &profile.claude_desktop {
+            let mut problems = sso.problems();
+            if problems.is_empty() && !self.config.is_endpoint_allowed(sso.gateway(profile)) {
+                problems.push(self.not_allowed_message(sso.gateway(profile)));
+            }
+            if !problems.is_empty() {
+                self.error = Some(l!("Claude Desktop konnte nicht eingerichtet werden: %@", problems.join(" ")));
+                return false;
+            }
+        }
+        match claude_desktop::apply(&claude_desktop::library_dir(), profile, &helper) {
+            Ok(()) => {
+                if self.state.claude_desktop_profile_id.as_deref() != Some(profile.id.as_str()) {
+                    self.state.claude_desktop_profile_id = Some(profile.id.clone());
+                    self.persist();
+                }
+                true
+            }
+            Err(e) => {
+                self.error = Some(l!("Claude Desktop konnte nicht eingerichtet werden: %@", e));
+                false
             }
         }
     }
@@ -927,6 +1357,8 @@ impl Model {
                 Some(existing) => {
                     if !managed && existing != profile {
                         *existing = profile.clone();
+                        // The cached model list belongs to the old gateway; the next refresh loads the new one.
+                        self.gateway_models.remove(&profile.id);
                         changed_profiles.push(profile.id.clone());
                     }
                 }
@@ -953,7 +1385,8 @@ impl Model {
                 continue;
             };
             let previous = self.state.bindings.iter().find(|b| b.path == binding.path).cloned().unwrap_or_else(|| binding.clone());
-            if self.apply(&profile, &binding.path, Some(&previous), None) {
+            let selection = self.tenant_selection(&profile, binding.models.as_ref());
+            if self.apply_with(&profile, &binding.path, Some(&previous), None, selection) {
                 project_count += 1;
             } else {
                 skipped += 1;
@@ -1068,8 +1501,15 @@ impl Model {
             if let Some(global) = &self.state.global_binding {
                 let _ = binder.revert_global(global);
             }
+            // Claude Desktop goes back to its normal sign-in too; the record stays for the activation.
+            if self.state.claude_desktop_profile_id.is_some() {
+                if let Err(e) = claude_desktop::remove(&claude_desktop::library_dir()) {
+                    self.error = Some(l!("Claude Desktop konnte nicht eingerichtet werden: %@", e));
+                }
+            }
             self.state.disabled = Some(true);
             self.persist();
+            self.claude_desktop = self.desktop_status();
             self.notice = Some(l!("KeyZapper ist deaktiviert. Claude Code nutzt jetzt überall die normale Anmeldung; laufende Sitzungen bitte neu starten."));
             if !failed.is_empty() {
                 self.error = Some(l!("Diese Projekte konnten nicht zurückgesetzt werden: %@", failed.join(", ")));
@@ -1086,6 +1526,10 @@ impl Model {
                 if let Some(profile) = self.profile(&global.profile_id) {
                     self.apply_global(&profile, Some(&global));
                 }
+            }
+            if let Some(profile) = self.state.claude_desktop_profile_id.clone().and_then(|id| self.profile(&id)) {
+                self.apply_claude_desktop(&profile);
+                self.claude_desktop = self.desktop_status();
             }
             self.notice = Some(l!("KeyZapper ist wieder aktiv. Laufende Claude-Sitzungen bitte neu starten."));
         }
@@ -1115,6 +1559,108 @@ impl Model {
         } else {
             self.error = Some(l!("%@ Key(s) konnten nicht aus dem Schlüsselbund gelesen werden. Bitte über „Key hinterlegen“ neu eintragen.", self.keychain_profiles.len()));
         }
+    }
+
+    // MARK: Claude in Office
+
+    /// The profile Claude in Office is to be set up from: KeyZapper active and a profile with Office switched on, those
+    /// from IT first.
+    fn office_candidate(&self) -> Option<&Profile> {
+        if self.is_disabled() {
+            return None;
+        }
+        let managed: Vec<String> = self.config.profiles.iter().map(|p| p.id.clone()).collect();
+        office_profile(&self.state.profiles, &managed)
+    }
+
+    /// Why `office` cannot be used yet: unusable settings, or a gateway the company policy does not allow. None = usable.
+    fn office_blocker(&self, office: &OfficeClient) -> Option<String> {
+        let problems = office.problems();
+        if !problems.is_empty() {
+            return Some(problems.join(" "));
+        }
+        (!self.config.is_endpoint_allowed(&office.gateway_url)).then(|| self.not_allowed_message(&office.gateway_url))
+    }
+
+    /// True while a run would write a manifest, so the caller fetches Anthropic's current template first (outside the lock).
+    pub fn office_wanted(&self) -> bool {
+        self.office_candidate().and_then(|p| p.office.as_ref()).is_some_and(|o| self.office_blocker(o).is_none())
+    }
+
+    /// Something is wrong with Claude in Office, or no Office app could take the manifest yet (none started once); a
+    /// refresh then tries again.
+    pub fn office_failed(&self) -> bool {
+        self.office_problem.is_some() || self.state.office_error.is_some() || self.state.office_applied.as_ref().is_some_and(|a| a.apps.is_empty())
+    }
+
+    /// Decides what a sync run does: compares what the Office profile asks for with the record of what was registered
+    /// (never with the app folders). `fetched` is Anthropic's template as just loaded, `None` if it was not tried. `retry`
+    /// (a settings change or refresh, not the start) writes again after a failed registration. Returns the job to run
+    /// outside the lock, or None when there is nothing to touch; then the status already tells why.
+    pub fn plan_office(&mut self, fetched: Option<Result<String, String>>, retry: bool) -> Option<SyncJob> {
+        self.office_problem = None;
+        let mut manifest = String::new();
+        let mut apps = vec![];
+        let candidate = self.office_candidate().and_then(|p| Some((p.id.clone(), p.office.clone()?)));
+        let desired = match candidate {
+            None => None,
+            // A gateway the company policy does not allow (any more): nothing is written, and what is registered goes.
+            Some((_, office)) if office.problems().is_empty() && !self.config.is_endpoint_allowed(&office.gateway_url) => {
+                self.office_problem = Some(self.not_allowed_message(&office.gateway_url));
+                None
+            }
+            Some((profile_id, office)) => {
+                let built = match self.office_blocker(&office) {
+                    Some(message) => Err(message),
+                    None => claude_office::manifest_from(&self.office_template, fetched, &office),
+                };
+                match built {
+                    Ok(xml) => {
+                        apps = self.office_sideload.apps();
+                        let desired = DesiredOffice::new(&profile_id, &office, &xml, &apps);
+                        manifest = xml;
+                        Some(desired)
+                    }
+                    // Nothing is written, and what is registered stays.
+                    Err(message) => {
+                        self.office_problem = Some(message);
+                        return None;
+                    }
+                }
+            }
+        };
+        let applied = self.state.office_applied.clone();
+        let action = if retry && self.state.office_error.is_some() {
+            plan_retry(desired.as_ref(), applied.as_ref())
+        } else {
+            plan_sync(desired.as_ref(), applied.as_ref())
+        };
+        if action == SyncAction::Nothing {
+            return None;
+        }
+        Some(SyncJob { action, desired, manifest, apps, previous: applied })
+    }
+
+    /// Saves `outcome` as the record of what is registered. A run saves its intended record this way before it writes (see
+    /// `SyncJob::run`); false if it could not be saved.
+    pub fn record_office(&mut self, outcome: &Outcome) -> bool {
+        self.state.office_applied = outcome.applied.clone();
+        self.state.office_error = outcome.error.clone();
+        self.persist()
+    }
+
+    /// Records what `job.run` left behind.
+    pub fn finish_office(&mut self, job: &SyncJob, outcome: Outcome) {
+        self.record_office(&outcome);
+        // A failed removal has no profile card to show it on (deactivated, or Office switched off).
+        if let (SyncAction::Remove { .. }, Some(error)) = (&job.action, outcome.error) {
+            self.error = Some(error);
+        }
+    }
+
+    fn office_view(&self) -> OfficeView {
+        let error = self.office_problem.as_deref().or(self.state.office_error.as_deref());
+        OfficeView { status: claude_office::status(self.state.office_applied.as_ref(), error), profile_id: self.office_candidate().map(|p| p.id.clone()) }
     }
 
     // MARK: View for the web UI
@@ -1162,13 +1708,28 @@ impl Model {
                         managed: self.config.is_managed(&p.id),
                         has_key: key.is_some(),
                         key_hint: key.map(|k| masked_hint(k)),
-                        budget: self.budgets.get(&p.id).filter(|_| if p.is_sso() { session.is_some() && !self.sso_expired.contains(&p.id) } else { key.is_some() }).map(|b| BudgetView {
-                            spend: b.spend,
-                            max_budget: b.max_budget,
-                            remaining: b.max_budget.map(|_| b.remaining()),
-                            reset_at: b.reset_at.clone(),
-                        }),
+                        budgets: self
+                            .budgets
+                            .get(&p.id)
+                            .filter(|_| if p.is_sso() { session.is_some() && !self.sso_expired.contains(&p.id) } else { key.is_some() })
+                            .map(|list| {
+                                list.iter()
+                                    .map(|b| BudgetView {
+                                        tenant: b.tenant.clone(),
+                                        spend: b.budget.spend,
+                                        max_budget: b.budget.max_budget,
+                                        remaining: b.budget.max_budget.map(|_| b.budget.remaining()),
+                                        reset_at: b.budget.reset_at.clone(),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         killers: self.budget_killers(p),
+                        // Only an SSO profile has tenants (its model list comes with the user's token). A key profile's
+                        // `<x>/<model>` IDs are providers of one gateway, not accounts to choose from.
+                        tenants: self.gateway_models.get(&p.id).filter(|_| p.is_sso()).map(|m| tenants_of(m)).unwrap_or_default(),
+                        office: p.office.clone(),
+                        claude_desktop: p.claude_desktop.clone(),
                     }
                 })
                 .collect(),
@@ -1183,6 +1744,7 @@ impl Model {
                     name: folder_name(&b.path),
                     profile_id: b.profile_id.clone(),
                     pooled: b.is_pooled(),
+                    tenant: b.models.as_ref().map(|m| m.tenant.clone()),
                     mcp_server_ids: b.mcp_server_ids.clone(),
                     mcp_names: b.mcp_server_ids.iter().filter_map(|id| self.state.mcp_server(id)).map(|s| s.name.clone()).collect(),
                     mcp_active: self.mcp_active.get(&b.id).copied().unwrap_or(true),
@@ -1197,6 +1759,7 @@ impl Model {
                 .mcp_servers
                 .iter()
                 .map(|s| McpServerView {
+                    managed: self.is_managed_mcp(&s.id),
                     id: s.id.clone(),
                     name: s.name.clone(),
                     transport: s.transport,
@@ -1211,7 +1774,25 @@ impl Model {
                     used_by: self.state.bindings.iter().filter(|b| b.mcp_server_ids.contains(&s.id)).map(|b| folder_name(&b.path)).collect(),
                 })
                 .collect(),
+            mcp_catalog: self.config.managed_mcp_servers_url.as_ref().map(|url| McpCatalogView {
+                url: url.clone(),
+                fetched_at: self.mcp_catalog.as_ref().map(|c| c.fetched_at),
+                count: self.mcp_catalog.as_ref().map_or(0, |c| c.servers.len()),
+                skipped: self.mcp_catalog.as_ref().map(|c| c.skipped.clone()).unwrap_or_default(),
+                shadowed: self.shadowed_mcp_names(),
+                problem: self.mcp_catalog_problem.clone(),
+                loading: self.mcp_catalog_loading,
+            }),
+            claude_tools_enabled: self.config.claude_tools_enabled,
+            tools: self.tools.clone(),
+            installing_tool: self.installing_tool,
+            claude_desktop: ClaudeDesktopView {
+                profile_id: self.claude_desktop.profile_id.clone(),
+                applied: self.claude_desktop.applied,
+                managed: self.claude_desktop.managed,
+            },
             subscription: self.subscription.clone().filter(|_| self.has_subscription_profile()),
+            office: self.office_view(),
             global_profile_id: self.state.global_binding.as_ref().map(|g| g.profile_id.clone()),
             global_health: self.global_health.as_ref().map(HealthView::from),
             global_findings: self.global_findings.clone(),
@@ -1234,6 +1815,7 @@ impl Model {
             error: self.error.clone(),
             allow_key_export: self.config.allow_key_export,
             update_check_enabled: self.config.update_check_enabled,
+            beta_updates: self.beta_updates(),
             allowed_hosts: self.config.allowed_gateway_hosts.clone(),
             default_endpoint: self.config.default_endpoint.clone(),
             default_model_alias: self.config.default_model_alias.clone(),
@@ -1291,8 +1873,15 @@ pub struct View {
     profiles: Vec<ProfileView>,
     bindings: Vec<BindingView>,
     mcp_servers: Vec<McpServerView>,
+    /// Present if IT set `ManagedMcpServersURL`.
+    mcp_catalog: Option<McpCatalogView>,
+    claude_tools_enabled: bool,
+    tools: Option<Vec<ToolStatus>>,
+    installing_tool: Option<Tool>,
+    claude_desktop: ClaudeDesktopView,
     /// Plan and usage limits of the Claude subscription, shared by all subscription profiles.
     subscription: Option<subscription::Status>,
+    office: OfficeView,
     global_profile_id: Option<String>,
     global_health: Option<HealthView>,
     global_findings: Vec<Finding>,
@@ -1311,6 +1900,8 @@ pub struct View {
     error: Option<String>,
     allow_key_export: bool,
     update_check_enabled: bool,
+    /// Update checks include beta releases.
+    beta_updates: bool,
     allowed_hosts: Vec<String>,
     default_endpoint: Option<String>,
     default_model_alias: Option<String>,
@@ -1332,8 +1923,15 @@ pub struct TrayProfile {
     pub name: String,
     /// Key stored or signed in.
     pub usable: bool,
-    /// Spend and limit, if the gateway reported them.
-    pub budget: Option<(f64, Option<f64>)>,
+    /// Spend and limit as the gateway reported them, one per tenant (see `Model::budgets`).
+    pub budgets: Vec<TrayBudget>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct TrayBudget {
+    pub tenant: Option<String>,
+    pub spend: f64,
+    pub max: Option<f64>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1369,13 +1967,32 @@ struct ProfileView {
     managed: bool,
     has_key: bool,
     key_hint: Option<String>,
-    budget: Option<BudgetView>,
+    /// One per tenant of an SSO profile's projects, else at most one; empty while unknown.
+    budgets: Vec<BudgetView>,
     killers: Vec<String>,
+    /// Tenants the gateway lists for this profile (`<tenant>/<model>` IDs), sorted; empty until the models are loaded.
+    tenants: Vec<String>,
+    /// Claude in Office settings of the profile, None if never configured.
+    office: Option<OfficeClient>,
+    /// Claude Desktop's own sign-in, None = via the helper.
+    claude_desktop: Option<DesktopSso>,
+}
+
+/// Claude in Office on this machine: `state` is `off`, `applied` or `error`; `apps` are the Office apps it is registered
+/// for; `profile_id` the profile it comes from (None while KeyZapper is deactivated or no profile has Office switched on).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfficeView {
+    #[serde(flatten)]
+    status: OfficeStatus,
+    profile_id: Option<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BudgetView {
+    /// None = the profile itself (its own models), not a project's tenant.
+    tenant: Option<String>,
     spend: f64,
     max_budget: Option<f64>,
     remaining: Option<f64>,
@@ -1391,6 +2008,8 @@ struct BindingView {
     name: String,
     profile_id: String,
     pooled: bool,
+    /// Tenant whose models the project uses; None = as in the profile.
+    tenant: Option<String>,
     mcp_server_ids: Vec<String>,
     mcp_names: Vec<String>,
     /// False if `.mcp.json` no longer contains what the app wrote.
@@ -1402,6 +2021,8 @@ struct BindingView {
 #[serde(rename_all = "camelCase")]
 struct McpServerView {
     id: String,
+    /// From the central list: IT changes it, the app only switches it on per project.
+    managed: bool,
     name: String,
     transport: McpTransport,
     command: String,
@@ -1414,6 +2035,27 @@ struct McpServerView {
     oauth_scopes: String,
     /// Names of the projects using this server.
     used_by: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpCatalogView {
+    url: String,
+    /// Unix time of the last successful fetch.
+    fetched_at: Option<i64>,
+    count: usize,
+    skipped: Vec<String>,
+    shadowed: Vec<String>,
+    problem: Option<String>,
+    loading: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeDesktopView {
+    profile_id: Option<String>,
+    applied: bool,
+    managed: bool,
 }
 
 #[derive(Serialize)]
@@ -1458,4 +2100,294 @@ struct UpdateView {
     version: String,
     prerelease: bool,
     page_url: String,
+}
+
+/// Office folders are real folders on macOS; on Windows the registry is used instead (see `claude_office`'s own test).
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+    use keyzapper_core::claude_office::OfficeState;
+
+    const TEMPLATE: &str = include_str!("../../core/tests/fixtures/office-manifest.xml");
+    const ID: &str = "5c1d7e2a-8b3f-4e6d-9a0c-2f4b6d8e1a3c";
+
+    fn office() -> OfficeClient {
+        OfficeClient {
+            enabled: true,
+            addin_id: ID.into(),
+            gateway_url: "https://llm-gateway.example/api/x/desktop-gateway/office".into(),
+            entra_client_id: "11111111-2222-4333-8444-555555555555".into(),
+            entra_scope: "api://11111111-2222-4333-8444-555555555555/access_as_user".into(),
+            disabled_features: vec![],
+        }
+    }
+
+    /// A model that keeps its files and Office folders below `root` and has no managed settings: it reads nothing from this
+    /// machine's Intune values and writes nothing outside `root`.
+    fn model_in(root: &Path) -> Model {
+        let mut model = Model::load_from(None, ManagedConfig::default(), root.join("data"));
+        assert!(model.backup_dir.is_none(), "an empty config has no backup folder");
+        model.office_sideload = Sideload {
+            containers_dir: root.join("Containers"),
+            applications_dir: root.join("Applications"),
+            manifest_dir: root.join("office"),
+            registry_key: r"SOFTWARE\KeyZapperTest".into(),
+        };
+        model
+    }
+
+    /// Plans with `TEMPLATE` as the fetched one and runs the job, like `sync_office` in main.rs.
+    fn sync(model: &mut Model, retry: bool) -> Option<SyncAction> {
+        sync_checked(model, retry, |_| {})
+    }
+
+    /// Like `sync`; `at_checkpoint` runs right after the intended record was saved, before any manifest is written.
+    fn sync_checked(model: &mut Model, retry: bool, mut at_checkpoint: impl FnMut(&Model)) -> Option<SyncAction> {
+        let job = model.plan_office(Some(Ok(TEMPLATE.into())), retry)?;
+        let sideload = model.office_sideload.clone();
+        let outcome = job.run(&sideload, &mut |interim| {
+            let saved = model.record_office(interim);
+            at_checkpoint(model);
+            saved
+        });
+        let action = job.action.clone();
+        model.finish_office(&job, outcome);
+        Some(action)
+    }
+
+    /// The model IDs of a plain LiteLLM gateway: provider prefixes, not tenants.
+    fn prefixed_models() -> Vec<String> {
+        ["bedrock/claude-sonnet-5-5", "bedrock/claude-opus-5", "azure/gpt-5"].map(String::from).to_vec()
+    }
+
+    fn sso_profile(name: &str) -> Profile {
+        let mut profile = Profile::new(new_id(), name.into(), "https://llm-gateway.example/api/x/desktop-gateway/code".into(), String::new());
+        profile.auth_type = AuthType::Oidc;
+        profile.oidc_issuer = Some("https://login.example.test/00000000-0000-4000-8000-000000000000/v2.0".into());
+        profile.oidc_client_id = Some("11111111-2222-4333-8444-555555555555".into());
+        profile
+    }
+
+    fn model_with_binder(root: &Path) -> Model {
+        let mut model = model_in(root);
+        model.binder = Some(SettingsBinder {
+            helper_path: root.join("keyzapper-helper").to_string_lossy().into_owned(),
+            managed_settings_paths: vec![],
+            user_settings_path: root.join("user-settings.json").to_string_lossy().into_owned(),
+        });
+        model
+    }
+
+    #[test]
+    fn only_an_sso_profile_offers_tenants_and_takes_a_tenant_choice() {
+        let root = std::env::temp_dir().join(format!("kz-tenants-model-{}", new_id()));
+        let mut model = model_with_binder(&root);
+        let key = Profile::new(new_id(), "Key".into(), "https://litellm.example.test".into(), String::new());
+        let sso = sso_profile("Company");
+        assert!(model.save_profile(key.clone(), Some("sk-test".into())) && model.save_profile(sso.clone(), None));
+        // Whatever the gateway lists is cached for both, as if loaded.
+        for id in [&key.id, &sso.id] {
+            model.gateway_models.insert(id.clone(), prefixed_models());
+        }
+        // A key profile has no tenants: `bedrock/…` and `azure/…` are providers of one gateway, not accounts to choose from.
+        let tenants = |model: &Model, id: &str| model.view().profiles.into_iter().find(|p| p.id == id).unwrap().tenants;
+        assert!(tenants(&model, &key.id).is_empty());
+        assert_eq!(tenants(&model, &sso.id), ["azure", "bedrock"]);
+
+        // The project of a key profile stays on the profile's own models, whatever is asked for.
+        let mut projects = vec![];
+        for profile in [&key, &sso] {
+            let folder = root.join(format!("project-{}", profile.name));
+            std::fs::create_dir_all(&folder).unwrap();
+            model.bind(&folder.to_string_lossy(), &profile.id);
+            projects.push((model.state.bindings.iter().find(|b| b.profile_id == profile.id).cloned().expect("bound"), folder));
+        }
+        let (key_project, key_folder) = &projects[0];
+        let settings_of_key_project = std::fs::read_to_string(key_folder.join(".claude/settings.local.json")).unwrap();
+        model.error = None;
+        model.set_binding_tenant(&key_project.id, Some("bedrock".into()));
+        assert!(model.error.is_none(), "{:?}", model.error);
+        assert!(model.state.bindings.iter().find(|b| b.id == key_project.id).unwrap().models.is_none());
+        assert_eq!(std::fs::read_to_string(key_folder.join(".claude/settings.local.json")).unwrap(), settings_of_key_project);
+
+        // An SSO profile's project takes the tenant.
+        let (sso_project, sso_folder) = &projects[1];
+        model.set_binding_tenant(&sso_project.id, Some("bedrock".into()));
+        assert!(model.error.is_none(), "{:?}", model.error);
+        let chosen = model.state.bindings.iter().find(|b| b.id == sso_project.id).unwrap().models.clone();
+        assert_eq!(chosen.map(|m| m.tenant), Some("bedrock".to_string()));
+        assert!(std::fs::read_to_string(sso_folder.join(".claude/settings.local.json")).unwrap().contains("bedrock/claude-sonnet-5-5"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_beta_switch_is_kept_and_defaults_to_on_only_for_an_installed_beta() {
+        let root = std::env::temp_dir().join(format!("kz-beta-{}", new_id()));
+        let load = |version: &str| Model::load_from(Some(version.into()), ManagedConfig::default(), root.join("data"));
+        assert!(!load("1.5.0").beta_updates());
+        assert!(load("1.5.0-beta.1").beta_updates(), "testers get the next beta");
+
+        // Switched off, an offered beta goes; the choice is saved and wins over the installed version.
+        let mut model = load("1.5.0-beta.1");
+        let beta = ReleaseInfo { version: "1.5.0-beta.2".into(), prerelease: true, page_url: String::new(), package_url: None, package_sha256: None, signature_url: None };
+        model.available_update = Some(beta.clone());
+        model.set_beta_updates(false);
+        assert!(model.available_update.is_none() && !model.beta_updates());
+        assert!(!load("1.5.0-beta.1").beta_updates());
+        // Switched on, it stays on for a stable version too.
+        model.set_beta_updates(true);
+        assert!(load("1.5.0").beta_updates());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_tenant_choice_follows_the_profiles_models() {
+        let root = std::env::temp_dir().join(format!("kz-tenant-follow-{}", new_id()));
+        let mut model = model_with_binder(&root);
+        let mut profile = sso_profile("Company");
+        profile.sonnet_model = Some("claude-sonnet-5".into());
+        assert!(model.save_profile(profile.clone(), None));
+        let models: Vec<String> = ["acme/claude-sonnet-5", "acme/claude-sonnet-5-5", "globex/claude-sonnet-5"].map(String::from).to_vec();
+        model.gateway_models.insert(profile.id.clone(), models.clone());
+        let folder = root.join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        model.bind(&folder.to_string_lossy(), &profile.id);
+        let binding_id = model.state.bindings[0].id.clone();
+        model.set_binding_tenant(&binding_id, Some("acme".into()));
+        let settings = || std::fs::read_to_string(folder.join(".claude/settings.local.json")).unwrap();
+        assert!(settings().contains("\"acme/claude-sonnet-5\""), "{}", settings());
+
+        // The profile moves to a newer Sonnet: the project follows, within its tenant.
+        profile.sonnet_model = Some("claude-sonnet-5-5".into());
+        assert!(model.save_profile(profile.clone(), None));
+        assert!(settings().contains("\"acme/claude-sonnet-5-5\""), "{}", settings());
+        assert_eq!(model.state.bindings[0].models.as_ref().map(|m| m.tenant.as_str()), Some("acme"));
+
+        // Without the gateway's list the stored models stay; once it is loaded, the project follows.
+        model.gateway_models.remove(&profile.id);
+        profile.sonnet_model = Some("claude-sonnet-5".into());
+        assert!(model.save_profile(profile.clone(), None));
+        assert!(settings().contains("\"acme/claude-sonnet-5-5\""));
+        model.gateway_models.insert(profile.id.clone(), models);
+        model.follow_tenants(&profile.id);
+        assert!(settings().contains("\"acme/claude-sonnet-5\""), "{}", settings());
+
+        // A profile that is no longer SSO has no tenants: the project returns to the profile's own models.
+        profile.auth_type = AuthType::ApiKey;
+        assert!(model.save_profile(profile.clone(), Some("sk-test".into())));
+        assert!(model.state.bindings[0].models.is_none());
+        assert!(settings().contains("\"claude-sonnet-5\"") && !settings().contains("acme/"), "{}", settings());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_profile_replaced_by_an_import_drops_the_model_list_of_its_old_gateway() {
+        let root = std::env::temp_dir().join(format!("kz-import-model-{}", new_id()));
+        let mut model = model_with_binder(&root);
+        let (changing, unchanged) = (sso_profile("Changing"), sso_profile("Unchanged"));
+        assert!(model.save_profile(changing.clone(), None) && model.save_profile(unchanged.clone(), None));
+        for id in [&changing.id, &unchanged.id] {
+            model.gateway_models.insert(id.clone(), prefixed_models());
+        }
+        let mut replaced = changing.clone();
+        replaced.endpoint = "https://other-gateway.example/api/x/desktop-gateway/code".into();
+        let payload = BackupPayload {
+            created_at: "2026-10-20T00:00:00Z".into(),
+            app_version: None,
+            state: AppState { profiles: vec![replaced.clone(), unchanged.clone()], ..AppState::default() },
+            keys: BTreeMap::new(),
+        };
+        assert!(model.import_payload(payload));
+        assert_eq!(model.state.profile(&changing.id).map(|p| p.endpoint.as_str()), Some(replaced.endpoint.as_str()));
+        assert!(!model.gateway_models.contains_key(&changing.id), "the list belongs to the old gateway; the next refresh loads the new one");
+        assert!(model.gateway_models.contains_key(&unchanged.id), "a profile the import left as it was keeps its list");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_in_office_follows_the_profile_and_a_failed_registration_is_not_repeated_on_every_start() {
+        let root = std::env::temp_dir().join(format!("kz-office-model-{}", new_id()));
+        let wef = |bundle: &str| root.join("Containers").join(bundle).join("Data/Documents/wef");
+        let word_manifest = wef("com.microsoft.Word").join(format!("{ID}.manifest.xml"));
+        for app in ["Microsoft Excel.app", "Microsoft Word.app", "Microsoft PowerPoint.app"] {
+            std::fs::create_dir_all(root.join("Applications").join(app)).unwrap();
+        }
+        // PowerPoint was never started: it has no container, and KeyZapper does not create one.
+        std::fs::create_dir_all(root.join("Containers/com.microsoft.Word")).unwrap();
+        // Excel's wef folder is blocked by a file: Excel fails, Word works.
+        std::fs::create_dir_all(wef("com.microsoft.Excel").parent().unwrap()).unwrap();
+        std::fs::write(wef("com.microsoft.Excel"), "not a folder").unwrap();
+
+        let mut model = model_in(&root);
+        let mut profile = Profile::new(new_id(), "Own".into(), "https://litellm.example.test".into(), String::new());
+        profile.office = Some(office());
+        assert!(model.save_profile(profile.clone(), Some("sk-test".into())));
+        assert_eq!(model.office_view().status.state, OfficeState::Off);
+
+        // The first run registers; Excel fails, and the failure is recorded together with what was intended.
+        assert_eq!(sync(&mut model, false), Some(SyncAction::Apply));
+        assert!(word_manifest.exists());
+        assert!(!root.join("Containers/com.microsoft.Powerpoint").exists(), "no container is created for an app never started");
+        let status = model.office_view().status;
+        assert_eq!((status.state, status.apps.clone()), (OfficeState::Error, vec!["excel".to_string(), "word".to_string()]));
+        assert!(status.message.is_some() && model.office_failed());
+        assert_eq!(model.office_view().profile_id.as_deref(), Some(profile.id.as_str()));
+
+        // A new start (state read from disk, no retry requested) writes nothing and still shows the error.
+        let mut model = model_in(&root);
+        assert!(model.state.office_error.is_some() && model.state.office_applied.is_some());
+        std::fs::remove_file(&word_manifest).unwrap();
+        assert_eq!(sync(&mut model, false), None);
+        assert!(!word_manifest.exists());
+        assert_eq!(model.office_view().status.state, OfficeState::Error);
+
+        // A request of the user tries again; with Excel fixed everything is registered and the error is gone.
+        std::fs::remove_file(wef("com.microsoft.Excel")).unwrap();
+        assert_eq!(sync(&mut model, true), Some(SyncAction::Apply));
+        assert!(word_manifest.exists() && wef("com.microsoft.Excel").join(format!("{ID}.manifest.xml")).exists());
+        assert_eq!(model.office_view().status.state, OfficeState::Applied);
+        assert!(!model.office_failed());
+        assert_eq!(sync(&mut model, true), None, "nothing changed, nothing is written");
+
+        // Unusable settings write nothing and leave the registered manifest in place.
+        model.state.profiles[0].office.as_mut().unwrap().gateway_url = "https://localhost/office".into();
+        assert_eq!(sync(&mut model, false), None);
+        assert!(word_manifest.exists());
+        let status = model.office_view().status;
+        assert_eq!((status.state, status.apps.len()), (OfficeState::Error, 2));
+        // A gateway the company policy does not allow is removed: an add-in must not keep using it.
+        model.state.profiles[0].office = Some(office());
+        model.config.allowed_gateway_hosts = vec!["other.example".into()];
+        assert_eq!(sync(&mut model, false), Some(SyncAction::Remove { addin_id: ID.into() }));
+        assert!(!word_manifest.exists());
+        assert_eq!(model.office_view().status.state, OfficeState::Error);
+        model.config = ManagedConfig::default();
+        assert_eq!(sync(&mut model, false), Some(SyncAction::Apply));
+        assert!(word_manifest.exists());
+
+        // Deactivating removes the manifests; only KeyZapper's own files go.
+        std::fs::write(wef("com.microsoft.Word").join("foreign.manifest.xml"), "x").unwrap();
+        model.state.disabled = Some(true);
+        assert_eq!(sync(&mut model, false), Some(SyncAction::Remove { addin_id: ID.into() }));
+        assert!(!word_manifest.exists() && wef("com.microsoft.Word").join("foreign.manifest.xml").exists());
+        assert_eq!((model.office_view().status.state, model.office_view().profile_id), (OfficeState::Off, None));
+        // Activating registers again. The record is on disk before the first manifest is written, so a crash in between
+        // cannot leave a manifest the record does not know.
+        model.state.disabled = None;
+        let state_file = root.join("data/state.json");
+        let mut checked = false;
+        assert_eq!(
+            sync_checked(&mut model, false, |_| {
+                let on_disk = MetadataStore::new(state_file.clone(), true).load().unwrap();
+                assert_eq!(on_disk.office_applied.as_ref().map(|a| a.addin_id.as_str()), Some(ID));
+                assert!(on_disk.office_error.is_some(), "marked unfinished until the run is done");
+                assert!(!word_manifest.exists());
+                checked = true;
+            }),
+            Some(SyncAction::Apply)
+        );
+        assert!(checked && word_manifest.exists());
+        assert_eq!(model.office_view().status.state, OfficeState::Applied);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

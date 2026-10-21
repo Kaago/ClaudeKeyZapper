@@ -144,9 +144,10 @@ const PAGES = () => [
   ['profiles', t('Profile'), 'key'],
   ['projects', t('Projekte'), 'folder'],
   ['mcp', t('MCP-Server'), 'plug'],
+  view.claudeToolsEnabled && ['tools', t('Claude-Tools'), 'download'],
   ['settings', t('Claude-Einstellungen'), 'shield'],
   ['backup', t('Backup'), 'archive'],
-];
+].filter(Boolean);
 
 let page = 'profiles';
 try { page = localStorage.getItem('page') ?? page; } catch { /* storage unavailable */ }
@@ -157,6 +158,10 @@ function navigate(next) {
   if (next === 'settings') {
     settingsSelection = null;
     call('refresh_all');
+  }
+  if (next === 'tools') {
+    desktopSelection = null;
+    call('load_tools');
   }
   renderSidebar();
   renderMain();
@@ -171,11 +176,12 @@ function renderSidebar() {
   const badges = {
     profiles: [view.profiles.length || null],
     projects: attention ? [attention, 'warning'] : [view.bindings.length || null],
-    mcp: [view.mcpServers.length || null],
+    mcp: view.mcpCatalog?.problem ? ['!', 'warning'] : [view.mcpServers.length || null],
+    tools: [null],
     settings: settingsProblems ? [settingsProblems, 'warning'] : [null],
     backup: [null],
   };
-  const signature = JSON.stringify([page, view.language, view.disabled, badges, view.appVersion, view.updateCheckEnabled, view.platform]);
+  const signature = JSON.stringify([page, view.language, view.disabled, badges, view.appVersion, view.updateCheckEnabled, view.betaUpdates, view.platform, view.claudeToolsEnabled]);
   if (signature === sidebarSignature) return;
   sidebarSignature = signature;
   const active = h('input', {
@@ -188,7 +194,10 @@ function renderSidebar() {
         t('Deaktivieren'))) call('set_disabled', { disabled: true });
     },
   });
-  const checkUpdates = (beta) => call('check_for_updates', { beta });
+  const beta = h('input', {
+    type: 'checkbox', role: 'switch', checked: view.betaUpdates,
+    onchange: (event) => call('set_beta_updates', { enabled: event.target.checked }),
+  });
   document.getElementById('sidebar').replaceChildren(
     h('div', { class: 'brand', 'data-tauri-drag-region': '' }, h('span', { class: 'logo' }, icon('bolt')), 'KeyZapper'),
     ...PAGES().map(([id, label, symbol]) => {
@@ -198,12 +207,12 @@ function renderSidebar() {
     }),
     h('div', { class: 'sidebar-footer' },
       h('label', { class: 'switch', title: t('KeyZapper vorübergehend deaktivieren: Projekte nutzen dann die normale Claude-Anmeldung') }, active, t('KeyZapper aktiv')),
+      view.updateCheckEnabled && view.appVersion && h('label', { class: 'switch', title: t('Bei der Update-Suche auch Beta-Versionen anbieten. Beta-Versionen sind zum Testen gedacht.') }, beta, t('Beta-Versionen')),
       button(t('So funktioniert’s'), howItWorksDialog, { iconName: 'info', cls: 'link' }),
       h('div', { class: 'version' },
         view.appVersion ? `KeyZapper ${view.appVersion}` : t('KeyZapper Entwicklungsversion'),
         view.updateCheckEnabled
-          ? [button(t('Nach Updates suchen'), () => checkUpdates(false), { cls: 'link' }),
-            button(t('Beta-Version suchen'), () => checkUpdates(true), { cls: 'link' })]
+          ? button(t('Nach Updates suchen'), () => call('check_for_updates'), { cls: 'link' })
           : h('span', null, t('Updates über die IT')),
         button(t('Projektseite'), () => call('open_url', { url: view.projectUrl }), { cls: 'link' }))),
   );
@@ -354,7 +363,7 @@ const contextMenu = (items) => (event) => {
 function renderMain() {
   const main = document.getElementById('main');
   const scroll = main.scrollTop;
-  const pages = { profiles: profilesPage, projects: projectsPage, mcp: mcpPage, settings: settingsPage, backup: backupPage };
+  const pages = { profiles: profilesPage, projects: projectsPage, mcp: mcpPage, tools: view.claudeToolsEnabled ? toolsPage : null, settings: settingsPage, backup: backupPage };
   main.replaceChildren(...[(pages[page] ?? profilesPage)()].flat(Infinity).filter(Boolean));
   main.scrollTop = scroll;
 }
@@ -481,13 +490,17 @@ function relativeTime(date) {
 
 const dateTimeText = (date) => new Intl.DateTimeFormat(locale(), { dateStyle: 'medium', timeStyle: 'short' }).format(date);
 
-/** Budget bar: shrinks to what is left; green below 70 % used, orange below 90 %, red above. */
-function budgetMeter(budget) {
+/** What a budget bar is labeled with: its tenant, or the profile's own models when the profile shows several; nothing for a single one. */
+const budgetLabel = (budget, count) => budget.tenant ?? (count > 1 ? t('Modelle des Profils') : null);
+
+/** Budget bar: shrinks to what is left; green below 70 % used, orange below 90 %, red above. `label` names its tenant. */
+function budgetMeter(budget, label) {
   const reset = budget.resetAt && parseResetDate(budget.resetAt);
   const resetText = reset && relativeTime(reset);
   const resetInfo = resetText && h('span', { class: 'muted small', title: dateTimeText(reset) }, t('Reset %@', resetText));
+  const title = label && h('div', { class: 'muted small' }, label);
   if (budget.maxBudget == null) {
-    return h('div', { class: 'budget' }, h('div', { class: 'budget-text' },
+    return h('div', { class: 'budget' }, title, h('div', { class: 'budget-text' },
       h('strong', null, t('%@ verbraucht', money(budget.spend))), h('span', { class: 'muted' }, t('Kein Budgetlimit')),
       h('span', { class: 'spacer' }), resetInfo));
   }
@@ -495,13 +508,14 @@ function budgetMeter(budget) {
   const tone = used >= 0.9 ? 'red' : used >= 0.7 ? 'orange' : 'green';
   const percent = Math.round(used * 100);
   return h('div', { class: 'budget' },
+    title,
     h('div', { class: 'budget-text' },
       h('strong', { class: tone }, t('%@ übrig', money(budget.remaining ?? 0))),
       h('span', { class: 'muted' }, t('von %@', money(budget.maxBudget))),
       h('span', { class: 'spacer' }),
       h('span', { class: 'muted small' }, t('%@ % verbraucht', percent)),
       resetInfo && h('span', { class: 'muted small' }, '·'), resetInfo),
-    h('div', { class: 'meter', role: 'meter', 'aria-label': t('Budget verbraucht'), 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': percent },
+    h('div', { class: 'meter', role: 'meter', 'aria-label': label ? `${t('Budget verbraucht')} · ${label}` : t('Budget verbraucht'), 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': percent },
       h('div', { class: `meter-fill ${tone}`, style: `width: ${((1 - used) * 100).toFixed(1)}%` })));
 }
 
@@ -591,6 +605,24 @@ function credentialRow(profile, testConnection, check) {
       : button(t('Key hinterlegen'), () => replaceKeyDialog(profile), { iconName: 'key', cls: 'primary' })));
 }
 
+const OFFICE_APP_NAMES = { excel: 'Excel', word: 'Word', powerpoint: 'PowerPoint' };
+
+/** Claude in Office of a profile: what is set up, or why not. Nothing for a profile without Office switched on. */
+function officeRow(profile) {
+  if (!profile.office?.enabled) return null;
+  const office = view.office;
+  const line = (tone, iconName, text) => h('div', { class: `line ${tone} small` }, icon(iconName), h('span', { class: 'selectable' }, text));
+  if (view.disabled) return line('muted', 'pause', t('Claude in Office: aus, solange KeyZapper deaktiviert ist.'));
+  if (office.profileId !== profile.id) {
+    return line('muted', 'info', t('Claude in Office: nicht aktiv, das Profil „%@“ hat Vorrang.', office.profileId ? profileName(office.profileId) : ''));
+  }
+  if (office.state === 'error') return line('orange', 'warning', t('Claude in Office: %@', office.message ?? ''));
+  if (office.state === 'off') return line('muted', 'info', t('Claude in Office wird eingerichtet …'));
+  if (!office.apps.length) return line('muted', 'info', t('Claude in Office: Excel, Word oder PowerPoint wurde nicht gefunden oder noch nie gestartet. Nach dem ersten Start „Status aktualisieren“ wählen.'));
+  return line('green', 'check', t('Claude in Office: eingerichtet für %@ – Office einmal neu starten und über „Einfügen → Meine Add-ins“ öffnen',
+    office.apps.map((app) => OFFICE_APP_NAMES[app] ?? app).join(', ')));
+}
+
 function profileCard(profile) {
   const bindings = view.bindings.filter((b) => b.profileId === profile.id);
   const check = checks.get(profile.id) ?? {};
@@ -614,8 +646,9 @@ function profileCard(profile) {
         tierModels(profile) && h('div', { class: 'mono muted' }, tierModels(profile))),
       menuButton(t('Weitere Aktionen'), menu)),
     credentialRow(profile, testConnection, check),
-    profile.budget && budgetMeter(profile.budget),
+    profile.budgets.map((budget) => budgetMeter(budget, budgetLabel(budget, profile.budgets.length))),
     profile.subscription && subscriptionUsage(),
+    officeRow(profile),
     profile.hasKey && profile.killers.length > 0 && h('div', { class: 'line orange small' }, icon('flame'),
       t('Wird vom Budget-Killer in „%@“ verbrannt', profile.killers.join(', '))),
     check.result && h('div', { class: `check-result ${check.result.success ? 'green' : 'orange'}` },
@@ -690,6 +723,14 @@ function projectRow(binding, profile) {
       else renderMain();
     },
   }, view.profiles.map((p) => h('option', { value: p.id, selected: p.id === binding.profileId }, profileLabel(p))));
+  // SSO gateways with several tenants (model IDs `<tenant>/<model>` in the user's model list): the project picks the models
+  // of one tenant. A key profile has no tenants; its `<x>/<model>` IDs are providers of one gateway.
+  const tenants = [...(profile.tenants ?? []), ...(binding.tenant && !profile.tenants?.includes(binding.tenant) ? [binding.tenant] : [])];
+  const tenantSelect = profile.sso && (tenants.length >= 2 || binding.tenant) && h('select', {
+    'aria-label': t('Tenant'), title: t('Modelle eines Tenants für dieses Projekt wählen'), disabled: view.disabled,
+    onchange: (e) => call('set_binding_tenant', { bindingId: binding.id, tenant: e.target.value || null }),
+  }, h('option', { value: '', selected: !binding.tenant }, t('Wie im Profil')),
+  tenants.map((name) => h('option', { value: name, selected: name === binding.tenant }, name)));
   const confirmUnbind = async () => {
     if (await confirmDialog(t('Zuordnung für „%@“ entfernen?', binding.name),
       t('Nur die von der App gesetzten Einträge werden aus .claude/settings.local.json entfernt. Andere Einstellungen bleiben erhalten.'),
@@ -701,6 +742,7 @@ function projectRow(binding, profile) {
         h('div', { class: 'line' }, h('strong', null, binding.name), pill),
         h('span', { class: 'mono', title: binding.path }, `‎${binding.displayPath}‎`)),
       select,
+      tenantSelect,
       h('div', { class: 'row-actions' },
         button(t('Für Agenten optimieren'), () => agentsDialog(binding, profile),
           { iconName: 'sparkles', iconOnly: true, disabled: folderMissing || profile.subscription,
@@ -876,6 +918,46 @@ function isHostAllowed(host) {
   return view.allowedHosts.some((p) => (p.startsWith('*.') ? host.endsWith(p.slice(1)) : host === p));
 }
 
+const MARKETPLACE_ADDIN_ID = '4e2fd29d-dad0-40b3-af3c-a16e347a5ddc';
+const GUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/** Functions of the add-in to switch off: separated by commas, spaces or line breaks. */
+const officeFeatures = (text) => text.split(/[\s,;]+/).filter(Boolean);
+
+/** What keeps the Office settings from being used, as [field, message]; the same checks as the app's Rust side. */
+function officeProblems(o) {
+  const problems = [];
+  const addin = o.addinId.trim();
+  if (!GUID.test(addin) || addin !== addin.toLowerCase()) problems.push(['addinId', t('Die Add-in-ID muss eine GUID in Kleinbuchstaben sein.')]);
+  else if (addin === MARKETPLACE_ADDIN_ID) problems.push(['addinId', t('Die Add-in-ID darf nicht die des Marketplace-Add-ins sein.')]);
+  let url = null;
+  try { url = new URL(o.gatewayUrl.trim()); } catch { /* reported below */ }
+  if (!url || url.protocol !== 'https:' || !url.hostname) problems.push(['gatewayUrl', t('Die Gateway-URL muss eine https-URL mit Host sein.')]);
+  else if (/^(localhost|.*\.localhost|127(\.\d+){3}|\[::1\])$/.test(url.hostname.replace(/\.$/, '').toLowerCase())) problems.push(['gatewayUrl', t('Die Gateway-URL darf nicht auf diesen Rechner zeigen.')]);
+  else if (url.username || url.password) problems.push(['gatewayUrl', t('Die Gateway-URL darf keine Zugangsdaten enthalten.')]);
+  else if (!isHostAllowed(url.hostname.toLowerCase())) problems.push(['gatewayUrl', t('Host nicht freigegeben. Erlaubt: %@', view.allowedHosts.join(', '))]);
+  if (!GUID.test(o.entraClientId.trim())) problems.push(['entraClientId', t('Die Entra-Client-ID muss eine GUID sein.')]);
+  const scope = o.entraScope.trim();
+  if (!scope || /\s/.test(scope)) problems.push(['entraScope', t('Der Entra-Scope darf nicht leer sein und keine Leerzeichen enthalten.')]);
+  for (const feature of officeFeatures(o.disabledFeatures)) {
+    if (!/^[a-z][a-z_.]*$/.test(feature)) problems.push(['disabledFeatures', t('Ungültige Funktion in der Liste der deaktivierten Funktionen: %@', feature)]);
+  }
+  return problems;
+}
+
+/** What keeps Claude Desktop's own sign-in from being used, as messages; the same checks as the app's Rust side. */
+function desktopSsoProblems(d) {
+  const problems = [];
+  const https = (text) => { try { const u = new URL(text); return u.protocol === 'https:' && !!u.hostname && !u.username && !u.password; } catch { return false; } };
+  const gateway = d.gatewayUrl.trim();
+  if (gateway && !https(gateway)) problems.push(t('Die Gateway-URL für Claude Desktop muss eine https-URL mit Host sein.'));
+  else if (gateway && !isHostAllowed(new URL(gateway).hostname.toLowerCase())) problems.push(t('Host nicht freigegeben. Erlaubt: %@', view.allowedHosts.join(', ')));
+  if (!https(d.oidcIssuer.trim()) || d.oidcIssuer.includes('/.well-known/')) problems.push(t('Der OIDC-Issuer für Claude Desktop muss eine https-URL ohne /.well-known/… sein.'));
+  if (!d.oidcClientId.trim() || /\s/.test(d.oidcClientId.trim())) problems.push(t('Die OIDC-Client-ID für Claude Desktop darf nicht leer sein und keine Leerzeichen enthalten.'));
+  if (d.bearerTokenType === 'access_token' && !d.scopes.trim()) problems.push(t('Mit Access-Token braucht Claude Desktop die Scopes des Gateways.'));
+  return problems;
+}
+
 function profileEditor(existing) {
   const s = {
     name: existing?.name ?? '', endpoint: existing?.endpoint ?? view.defaultEndpoint ?? '',
@@ -884,6 +966,16 @@ function profileEditor(existing) {
     environmentText: existing?.environmentText ?? '', key: '', authType: existing?.subscription ? 'subscription' : existing?.sso ? 'oidc' : 'apiKey',
     oidcIssuer: existing?.oidcIssuer ?? '', oidcClientId: existing?.oidcClientId ?? '', oidcScope: existing?.oidcScope ?? '',
     oidcTokenType: existing?.oidcTokenType ?? 'access', models: [], loading: false, saving: false,
+    office: {
+      enabled: existing?.office?.enabled ?? false, addinId: existing?.office?.addinId ?? '', gatewayUrl: existing?.office?.gatewayUrl ?? '',
+      entraClientId: existing?.office?.entraClientId ?? '', entraScope: existing?.office?.entraScope ?? '',
+      disabledFeatures: (existing?.office?.disabledFeatures ?? []).join(', '),
+    },
+    claudeDesktop: {
+      enabled: !!existing?.claudeDesktop, gatewayUrl: existing?.claudeDesktop?.gatewayUrl ?? '', oidcIssuer: existing?.claudeDesktop?.oidcIssuer ?? '',
+      oidcClientId: existing?.claudeDesktop?.oidcClientId ?? '', scopes: existing?.claudeDesktop?.scopes ?? '',
+      bearerTokenType: existing?.claudeDesktop?.bearerTokenType ?? 'id_token',
+    },
   };
   const managed = existing?.managed ?? false;
   const dlg = openDialog(existing ? t('Bearbeiten') : t('Neues Profil'), (close) => {
@@ -893,8 +985,13 @@ function profileEditor(existing) {
     const sso = s.authType === 'oidc';
     const subscription = s.authType === 'subscription';
     const issuerOk = !sso || /^https:\/\//i.test(s.oidcIssuer.trim()) || /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(s.oidcIssuer.trim());
+    const officeShown = !subscription && !(managed && !existing?.office);
+    const officeOn = officeShown && !managed && s.office.enabled;
+    const officeIssues = officeOn ? officeProblems(s.office) : [];
+    const desktopShown = !subscription && !(managed && !existing?.claudeDesktop);
+    const desktopIssues = desktopShown && !managed && s.claudeDesktop.enabled ? desktopSsoProblems(s.claudeDesktop) : [];
     const valid = s.name.trim() && (subscription || (host && allowed))
-      && (sso ? issuerOk && s.oidcClientId.trim() : subscription || existing || s.key) && !invalid.length;
+      && (sso ? issuerOk && s.oidcClientId.trim() : subscription || existing || s.key) && !invalid.length && !officeIssues.length && !desktopIssues.length;
     const update = (key) => (value) => { s[key] = value; dlg.render(); };
     const modelField = (label, key, id) => field(label, input({ value: s[key], placeholder: t('Claude-Standard'), list: 'gateway-models', disabled: managed }, update(key)), id);
     const loadModels = async () => {
@@ -911,7 +1008,7 @@ function profileEditor(existing) {
     };
     const save = async () => {
       s.saving = true; dlg.render();
-      const result = await call('save_profile', { input: { id: existing?.id ?? null, ...s } });
+      const result = await call('save_profile', { input: { id: existing?.id ?? null, ...s, office: subscription ? null : s.office, claudeDesktop: subscription ? null : s.claudeDesktop } });
       s.saving = false;
       if (result?.[0]) close(); else dlg.render();
     };
@@ -966,6 +1063,32 @@ function profileEditor(existing) {
             oninput: (e) => { s.environmentText = e.target.value; dlg.render(); } }),
           invalid.map((line) => h('div', { class: 'error-text' }, t('Ungültig oder nicht erlaubt: %@', line))),
           h('div', { class: 'section-note' }, t('Eine pro Zeile im Format NAME=Wert, z. B. CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 für Bedrock über LiteLLM. Key, Endpunkt und Modelle werden oben gesetzt.'))),
+        officeShown && h('fieldset', { disabled: managed }, h('legend', null, t('Claude in Office')),
+          h('label', { class: 'switch' },
+            h('input', { type: 'checkbox', role: 'switch', checked: s.office.enabled, onchange: (e) => { s.office.enabled = e.target.checked; dlg.render(); } }),
+            t('Claude in Excel, Word und PowerPoint einrichten')),
+          s.office.enabled && [
+            field(t('Gateway-URL'), input({ value: s.office.gatewayUrl, placeholder: 'https://ai.firma.example/api/x/desktop-gateway/office' }, (v) => { s.office.gatewayUrl = v; dlg.render(); }), 'p-office-gateway'),
+            field(t('Entra-Client-ID'), input({ value: s.office.entraClientId, placeholder: '00000000-0000-0000-0000-000000000000' }, (v) => { s.office.entraClientId = v; dlg.render(); }), 'p-office-client'),
+            field(t('Entra-Scope'), input({ value: s.office.entraScope, placeholder: 'api://<client-id>/access_as_user' }, (v) => { s.office.entraScope = v; dlg.render(); }), 'p-office-scope'),
+            field(t('Add-in-ID'), input({ value: s.office.addinId, placeholder: '00000000-0000-0000-0000-000000000000' }, (v) => { s.office.addinId = v; dlg.render(); }), 'p-office-addin'),
+            field(t('Abgeschaltete Funktionen'), input({ value: s.office.disabledFeatures, placeholder: 'web_search, thumbs' }, (v) => { s.office.disabledFeatures = v; dlg.render(); }), 'p-office-features'),
+            officeIssues.filter(([key]) => key === 'disabledFeatures' || s.office[key].trim()).map(([, message]) => h('div', { class: 'error-text' }, message))],
+          h('div', { class: 'section-note' }, t('Richtet Claude für Microsoft 365 als Add-in ein (Sideload) und meldet es per Entra-SSO am Gateway an; es wird kein Geheimnis gespeichert. Die Add-in-ID ist eine eigene GUID in Kleinbuchstaben, nicht die des Marketplace-Add-ins. Nach dem Einrichten Office einmal neu starten.'))),
+        desktopShown && h('fieldset', { disabled: managed }, h('legend', null, t('Claude Desktop (SSO)')),
+          h('label', { class: 'switch' },
+            h('input', { type: 'checkbox', role: 'switch', checked: s.claudeDesktop.enabled, onchange: (e) => { s.claudeDesktop.enabled = e.target.checked; dlg.render(); } }),
+            t('Claude Desktop meldet sich selbst per SSO am Gateway an')),
+          s.claudeDesktop.enabled && [
+            field(t('Gateway-URL'), input({ value: s.claudeDesktop.gatewayUrl, placeholder: s.endpoint || t('Wie der Endpunkt des Profils') }, (v) => { s.claudeDesktop.gatewayUrl = v; dlg.render(); }), 'p-desktop-gateway'),
+            field(t('OIDC-Issuer'), input({ value: s.claudeDesktop.oidcIssuer, placeholder: 'https://login.microsoftonline.com/<tenant-id>/v2.0' }, (v) => { s.claudeDesktop.oidcIssuer = v; dlg.render(); }), 'p-desktop-issuer'),
+            field(t('OIDC-Client-ID'), input({ value: s.claudeDesktop.oidcClientId, placeholder: '00000000-0000-0000-0000-000000000000' }, (v) => { s.claudeDesktop.oidcClientId = v; dlg.render(); }), 'p-desktop-client'),
+            field(t('Token-Art'), h('select', { onchange: (e) => { s.claudeDesktop.bearerTokenType = e.target.value; dlg.render(); } },
+              h('option', { value: 'id_token', selected: s.claudeDesktop.bearerTokenType === 'id_token' }, t('ID-Token')),
+              h('option', { value: 'access_token', selected: s.claudeDesktop.bearerTokenType === 'access_token' }, t('Access-Token'))), 'p-desktop-token'),
+            field(t('Scopes'), input({ value: s.claudeDesktop.scopes, placeholder: t('Standard von Claude Desktop') }, (v) => { s.claudeDesktop.scopes = v; dlg.render(); }), 'p-desktop-scopes'),
+            desktopIssues.map((message) => h('div', { class: 'error-text' }, message))],
+          h('div', { class: 'section-note' }, t('Mit diesem Profil meldet sich Claude Desktop im Browser selbst beim Identity Provider an und schickt sein Token an das Gateway; KeyZapper speichert dafür weder Key noch Token. Die Modelle listet das Gateway. Ohne diesen Schalter holt Claude Desktop Key oder Token über den Helper.'))),
       ],
       actions: [button(t('Abbrechen'), close), button(existing ? t('Sichern') : t('Anlegen'), save, { cls: 'primary', disabled: !valid || s.saving })],
     };
@@ -1220,14 +1343,15 @@ function mcpServerCard(server) {
   };
   const template = MCP_TEMPLATES().find((tpl) => tpl.name === server.name);
   const menu = () => [[t('Bearbeiten'), () => mcpServerEditor(server), { iconName: 'pencil' }], '-', [t('Löschen'), remove, { iconName: 'trash', danger: true }]];
-  return h('section', { class: 'card', 'aria-label': server.name, oncontextmenu: contextMenu(menu) },
+  return h('section', { class: 'card', 'aria-label': server.name, oncontextmenu: server.managed ? null : contextMenu(menu) },
     h('div', { class: 'card-head' },
       h('span', { class: 'avatar', style: `--profile: ${template?.color ?? 'var(--accent-fill)'}`, 'aria-hidden': 'true' }, (template?.title ?? server.name).slice(0, 1).toUpperCase()),
       h('div', { class: 'card-title' },
-        h('h2', null, server.name, h('span', { class: 'badge' }, transportLabel(server.transport)), server.oauthClientId && h('span', { class: 'badge' }, 'OAuth')),
+        h('h2', null, server.name, h('span', { class: 'badge' }, transportLabel(server.transport)), server.oauthClientId && h('span', { class: 'badge' }, 'OAuth'),
+          server.managed && h('span', { class: 'badge', title: t('Von der IT über die zentrale Liste bereitgestellt; hier nicht änderbar.') }, t('Von IT verwaltet'))),
         h('div', { class: 'mono muted selectable', title: mcpSummary(server) }, mcpSummary(server))),
-      button(t('Bearbeiten'), () => mcpServerEditor(server), { iconName: 'pencil', iconOnly: true }),
-      menuButton(t('Weitere Aktionen'), menu)),
+      !server.managed && button(t('Bearbeiten'), () => mcpServerEditor(server), { iconName: 'pencil', iconOnly: true }),
+      !server.managed && menuButton(t('Weitere Aktionen'), menu)),
     view.bindings.length
       ? h('div', { class: 'toggle-row' }, h('span', { class: 'muted small' }, t('Aktiv in')),
         view.bindings.map((b) => toggleChip(b.name, b.mcpServerIds.includes(server.id), (on) => setProjectServer(b, server.id, on),
@@ -1241,6 +1365,7 @@ function mcpPage() {
   return [
     pageHeader(t('MCP-Server'), t('Zusätzliche Werkzeuge für Claude Code, z. B. GitHub, Datenbanken oder ein Browser. Je Projekt einschalten – KeyZapper schreibt sie in die .mcp.json des Repositorys und schaltet sie frei.'),
       button(t('Neuer Server'), () => mcpServerEditor(null), { iconName: 'plus', cls: 'primary' })),
+    mcpCatalogCard(),
     view.mcpServers.map(mcpServerCard),
     templates.length > 0 && h('section', { class: 'templates' },
       h('h3', null, view.mcpServers.length ? t('Weitere Vorlagen') : t('Mit einer Vorlage starten')),
@@ -1249,6 +1374,26 @@ function mcpPage() {
         h('span', { class: 'template-text' }, h('strong', null, tpl.title), h('span', { class: 'muted small' }, tpl.description)),
         h('span', { class: 'badge' }, transportLabel(tpl.transport)))))),
   ];
+}
+
+/** State of the central MCP server list IT sets with `ManagedMcpServersURL`. */
+function mcpCatalogCard() {
+  const c = view.mcpCatalog;
+  if (!c) return null;
+  const fetched = c.fetchedAt ? dateTimeText(new Date(c.fetchedAt * 1000)) : null;
+  const status = c.problem ? h('div', { class: 'finding orange' }, icon('warning'), h('span', { class: 'selectable' }, c.problem))
+    : fetched ? h('div', { class: 'finding green' }, icon('check'), t('%@ Server, Stand %@.', c.count, fetched))
+      : h('div', { class: 'finding muted' }, icon('info'), c.loading ? t('Wird geladen …') : t('Noch nicht geladen.'));
+  return h('section', { class: 'card' },
+    h('div', { class: 'card-head' },
+      h('span', { class: 'tile-icon', 'aria-hidden': 'true' }, icon('server')),
+      h('div', { class: 'card-title' }, h('h2', null, t('Zentrale MCP-Liste der IT')), h('div', { class: 'mono muted small selectable', title: c.url }, c.url)),
+      button(t('Neu laden'), () => call('reload_mcp_catalog'), { iconName: 'refresh', iconOnly: true, disabled: c.loading })),
+    status,
+    fetched && c.problem && h('div', { class: 'muted small' }, t('Es gilt weiter die Liste vom %@.', fetched)),
+    c.skipped.length > 0 && h('div', { class: 'finding orange' }, icon('warning'), t('Unvollständig oder ungültig, daher ausgelassen: %@', c.skipped.join(', '))),
+    c.shadowed.length > 0 && h('div', { class: 'finding orange' }, icon('warning'), t('Ausgelassen, weil ein eigener Server so heißt: %@', c.shadowed.join(', '))),
+    h('div', { class: 'section-note' }, t('Diese Server stellt die IT bereit und pflegt sie zentral; KeyZapper lädt die Liste beim Start und alle 10 Minuten. Je Projekt einschalten wie eigene Server.')));
 }
 
 /** Lines that are not `NAME=value` (environment) or `Name: value` (headers). */
@@ -1332,7 +1477,7 @@ function projectMcpDialog(binding) {
         h('h2', null, t('MCP-Server für „%@“', binding.name)),
         !view.mcpServers.length ? h('div', { class: 'muted' }, t('Noch keine MCP-Server eingerichtet.'))
           : h('div', { class: 'switch-list' }, view.mcpServers.map((s) => h('label', { class: 'switch-row' },
-            h('span', { class: 'switch-text' }, h('strong', null, s.name, h('span', { class: 'badge' }, transportLabel(s.transport))),
+            h('span', { class: 'switch-text' }, h('strong', null, s.name, h('span', { class: 'badge' }, transportLabel(s.transport)), s.managed && h('span', { class: 'badge' }, t('Von IT verwaltet'))),
               h('span', { class: 'mono muted small' }, mcpSummary(s))),
             h('input', { type: 'checkbox', role: 'switch', checked: current.mcpServerIds.includes(s.id),
               onchange: (e) => setProjectServer(current, s.id, e.target.checked) })))),
@@ -1342,6 +1487,89 @@ function projectMcpDialog(binding) {
       actions: [button(t('MCP-Server verwalten …'), () => { close(); navigate('mcp'); }, { cls: 'left' }), button(t('Fertig'), close, { cls: 'primary' })],
     };
   }, { live: true });
+}
+
+// MARK: Claude tools
+
+const TOOLS = () => [
+  { tool: 'cli', title: 'Claude Code', subtitle: t('Für das Terminal, auch von IntelliJ IDEA genutzt'), symbol: 'terminal', color: '#d97757' },
+  { tool: 'vsCode', title: t('Claude Code für VS Code'), subtitle: t('Erweiterung aus dem VS Code Marketplace'), symbol: 'plug', color: '#0066b8',
+    missing: t('Visual Studio Code wurde nicht gefunden.') },
+  { tool: 'intellij', title: t('Claude Code für IntelliJ IDEA'), subtitle: t('Plugin aus dem JetBrains Marketplace'), symbol: 'plug', color: '#fe2857',
+    missing: t('IntelliJ IDEA wurde nicht gefunden.') },
+  { tool: 'desktop', title: 'Claude Desktop', subtitle: t('App für Chat, Cowork und Code'), symbol: 'bolt', color: '#c96442' },
+];
+
+let desktopSelection = null;
+
+function toolCard(info, status, ...extra) {
+  const installing = view.installingTool === info.tool;
+  const installed = status?.version != null;
+  const text = !status ? t('Wird geprüft …')
+    : installed ? (status.version ? t('Installiert · Version %@', status.version) : t('Installiert'))
+      : !status.hostFound ? info.missing : t('Nicht installiert');
+  return h('section', { class: 'card', 'aria-label': info.title },
+    h('div', { class: 'card-head' },
+      h('span', { class: 'avatar', style: `--profile: ${info.color}`, 'aria-hidden': 'true' }, icon(info.symbol)),
+      h('div', { class: 'card-title' }, h('h2', null, info.title), h('div', { class: 'muted small' }, info.subtitle)),
+      status && !installed && status.hostFound && button(installing ? t('Wird installiert …') : t('Installieren'),
+        () => call('install_tool', { tool: info.tool }), { iconName: 'download', cls: 'primary', disabled: !!view.installingTool })),
+    h('div', { class: `finding ${installed ? 'green' : 'muted'}` }, icon(installed ? 'check' : 'info'), text,
+      installing && h('span', { class: 'spinner', role: 'status', 'aria-label': t('Wird installiert …') })),
+    extra);
+}
+
+/** Claude Desktop's third-party mode with a KeyZapper profile, or its normal sign-in. */
+function claudeDesktopSettings() {
+  const current = view.claudeDesktop.profileId ?? '';
+  if (desktopSelection === null) desktopSelection = current;
+  const selected = desktopSelection;
+  const configured = view.profiles.find((p) => p.id === view.claudeDesktop.profileId);
+  return h('fieldset', null, h('legend', null, t('Anmeldung')),
+    field(t('Profil'), h('select', { onchange: (e) => { desktopSelection = e.target.value; renderMain(); } },
+      h('option', { value: '', selected: !selected }, t('Normale Anmeldung (claude.ai)')),
+      view.profiles.filter((p) => !p.subscription).map((p) => h('option', { value: p.id, selected: p.id === selected }, profileLabel(p)))), 't-desktop-profile'),
+    configured && view.claudeDesktop.applied && h('div', { class: 'finding green' }, icon('check'), t('Claude Desktop nutzt „%@“ über das Gateway.', configured.name)),
+    configured && !view.claudeDesktop.applied && h('div', { class: 'finding orange' }, icon('warning'),
+      t('Für „%@“ eingerichtet, in Claude Desktop ist aber eine andere Konfiguration ausgewählt.', configured.name)),
+    view.claudeDesktop.managed && h('div', { class: 'finding orange' }, icon('warning'),
+      t('Claude Desktop wird auf diesem Rechner von der IT konfiguriert; KeyZapper richtet es deshalb nicht ein.')),
+    h('div', { class: 'line' }, h('span', { class: 'spacer' }),
+      button(t('Übernehmen'), async () => {
+        const signsInItself = view.profiles.find((p) => p.id === selected)?.claudeDesktop;
+        if (!selected || signsInItself || await ensureLogin(selected)) call('set_claude_desktop_profile', { profileId: selected || null });
+      }, { cls: 'primary', disabled: (selected === current && (!selected || view.claudeDesktop.applied)) || (!!selected && view.claudeDesktop.managed) })),
+    h('div', { class: 'section-note' }, t('KeyZapper legt dafür eine Konfigurationsdatei für den Drittanbieter-Modus von Claude Desktop an: Anfragen gehen an das Gateway des Profils, Key oder SSO-Token holt Claude Desktop über den Helper – wie Claude Code –, oder es meldet sich selbst an, wenn das Profil „Claude Desktop (SSO)“ eingerichtet hat. Danach Claude Desktop beenden, neu öffnen und auf dem Anmeldebildschirm den Start mit dieser Konfiguration wählen.')));
+}
+
+function toolsPage() {
+  const status = (tool) => view.tools?.find((s) => s.tool === tool);
+  const [cli, vscode, intellij, desktop] = TOOLS();
+  const cliPath = status('cli')?.path;
+  const globalProfile = view.profiles.find((p) => p.id === view.globalProfileId);
+  return [
+    pageHeader(t('Claude-Tools'), t('Claude Code und Claude Desktop aus den offiziellen Quellen von Anthropic installieren – ohne Administratorrechte – und mit deinen Profilen verbinden.'),
+      button(t('Erneut prüfen'), () => call('load_tools'), { iconName: 'refresh', iconOnly: true })),
+    toolCard(cli, status('cli'),
+      cliPath && h('div', { class: 'mono muted small selectable' }, cliPath),
+      h('div', { class: 'section-note' }, t('Offizieller Installer von Anthropic: installiert in dein Benutzerverzeichnis und aktualisiert sich selbst.'))),
+    toolCard(vscode, status('vsCode'),
+      status('vsCode')?.version != null && h('div', { class: 'line' },
+        h('span', { class: 'section-note spacer' }, t('Für Key- und SSO-Profile in VS Code „Disable Login Prompt“ einschalten, damit die Erweiterung keine Claude-Anmeldung verlangt. Mit einem Claude-Abo ausgeschaltet lassen.')),
+        button(t('Einstellung öffnen'), () => call('open_vscode_setting')))),
+    toolCard(intellij, status('intellij'),
+      h('div', { class: 'section-note' }, t('Das Plugin startet claude im Terminal von IntelliJ – dafür zuerst Claude Code installieren. IntelliJ IDEA vor der Installation beenden.')),
+      cliPath && status('intellij')?.version != null && h('div', { class: 'section-note' },
+        t('Findet IntelliJ claude nicht, unter Settings › Tools › Claude Code [Beta] als „Claude command“ eintragen: %@', cliPath))),
+    toolCard(desktop, status('desktop'), claudeDesktopSettings()),
+    h('section', { class: 'card' },
+      h('h2', null, t('Anmeldung in Claude Code')),
+      h('p', { class: 'muted', style: 'margin:0' }, t('Claude Code im Terminal, in VS Code und in IntelliJ nutzt in zugeordneten Projekten deren Profil, in allen übrigen Ordnern das Standardprofil – mit Key, SSO oder Claude-Abo, ohne eigene Anmeldung.')),
+      h('div', { class: 'line' },
+        h('span', { class: `finding ${globalProfile ? 'green' : 'muted'} spacer` }, icon(globalProfile ? 'check' : 'info'),
+          globalProfile ? t('Standardprofil: %@', globalProfile.name) : t('Kein Standardprofil gesetzt.')),
+        button(t('Standardprofil festlegen …'), () => navigate('settings')))),
+  ];
 }
 
 /** Once after an update: the highlights of the releases since the version last seen. */
@@ -1408,22 +1636,25 @@ async function refreshPopover() {
   setTimeout(() => { popoverRefreshing = false; renderPopover(); }, 800);
 }
 
-/** A gateway profile in the popover: what is left of its budget, or why that is unknown. */
+/** A gateway profile in the popover: what is left of its budget (one row per tenant), or why that is unknown. */
 function popoverProfile(profile) {
-  const name = h('span', { class: 'popover-name' }, h('span', { class: 'dot', style: `background: ${colorOf(profile.id)}` }), profile.name);
-  const status = (cls, text) => h('div', { class: 'budget-text' }, name, h('span', { class: 'spacer' }), h('span', { class: `small ${cls}` }, text));
-  const budget = profile.budget;
+  const name = (label) => h('span', { class: 'popover-name' }, h('span', { class: 'dot', style: `background: ${colorOf(profile.id)}` }), profile.name,
+    label && h('span', { class: 'muted small' }, `· ${label}`));
+  const status = (cls, text, label) => h('div', { class: 'budget-text' }, name(label), h('span', { class: 'spacer' }), h('span', { class: `small ${cls}` }, text));
   if (!credentialOk(profile)) return status('red', profile.sso ? ssoStateText(profile) : t('Kein Key'));
-  if (!budget) return profile.sso ? status('green', t('Angemeldet')) : status('muted', t('Budget nicht verfügbar'));
-  if (budget.maxBudget == null) return status('muted', t('%@ verbraucht', money(budget.spend)));
-  const used = budget.maxBudget > 0 ? Math.min(1, Math.max(0, budget.spend / budget.maxBudget)) : 1;
-  const reset = budget.resetAt && parseResetDate(budget.resetAt);
-  const resetText = reset && relativeTime(reset);
-  return h('div', { class: 'popover-row' },
-    h('div', { class: 'budget-text' }, name, h('span', { class: 'spacer' }), h('strong', { class: usageTone(used) }, t('%@ übrig', money(budget.remaining ?? 0)))),
-    meterBar(used, t('Budget verbraucht'), 1 - used),
-    h('div', { class: 'budget-text muted small' }, t('%@ % von %@ verbraucht', Math.round(used * 100), money(budget.maxBudget)),
-      h('span', { class: 'spacer' }), resetText && h('span', { title: dateTimeText(reset) }, t('Reset %@', resetText))));
+  if (profile.budgets.length === 0) return profile.sso ? status('green', t('Angemeldet')) : status('muted', t('Budget nicht verfügbar'));
+  return profile.budgets.map((budget) => {
+    const label = budgetLabel(budget, profile.budgets.length);
+    if (budget.maxBudget == null) return status('muted', t('%@ verbraucht', money(budget.spend)), label);
+    const used = budget.maxBudget > 0 ? Math.min(1, Math.max(0, budget.spend / budget.maxBudget)) : 1;
+    const reset = budget.resetAt && parseResetDate(budget.resetAt);
+    const resetText = reset && relativeTime(reset);
+    return h('div', { class: 'popover-row' },
+      h('div', { class: 'budget-text' }, name(label), h('span', { class: 'spacer' }), h('strong', { class: usageTone(used) }, t('%@ übrig', money(budget.remaining ?? 0)))),
+      meterBar(used, t('Budget verbraucht'), 1 - used),
+      h('div', { class: 'budget-text muted small' }, t('%@ % von %@ verbraucht', Math.round(used * 100), money(budget.maxBudget)),
+        h('span', { class: 'spacer' }), resetText && h('span', { title: dateTimeText(reset) }, t('Reset %@', resetText))));
+  });
 }
 
 /** Usage at a glance from the tray icon: the Claude subscription's limits and every key's budget. */
@@ -1564,6 +1795,7 @@ async function start() {
   document.body.append(tooltip);
   english = await invoke('translations');
   setView(await invoke('get_view'));
+  if (page === 'tools') call('load_tools');
   await listen('changed', async () => setView(await invoke('get_view')));
   await listen('navigate', (e) => navigate(e.payload));
   await listen('tauri://drag-enter', (e) => markDrop(e.payload.position));

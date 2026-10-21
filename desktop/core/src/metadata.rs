@@ -70,10 +70,18 @@ impl MetadataStore {
     }
 }
 
-/// Copies fields an older app version dropped (model tiers, environment, global profile, deactivation).
+/// Copies fields an older app version dropped (model tiers, environment, global profile, deactivation, Claude in Office:
+/// the profiles' settings and the record of the manifests written into the Office folders, the projects' tenant choice).
 pub fn restoring_dropped_fields(state: AppState, mirror: &AppState) -> AppState {
     let mut result = state;
     for profile in result.profiles.iter_mut() {
+        // Independent of the model check below: without the record of what was written, the manifests could never be removed.
+        if profile.office.is_none() {
+            profile.office = mirror.profile(&profile.id).and_then(|saved| saved.office.clone());
+        }
+        if profile.claude_desktop.is_none() {
+            profile.claude_desktop = mirror.profile(&profile.id).and_then(|saved| saved.claude_desktop.clone());
+        }
         if profile.opus_model.is_some() || profile.sonnet_model.is_some() || profile.haiku_model.is_some() || profile.environment.is_some() {
             continue;
         }
@@ -91,6 +99,25 @@ pub fn restoring_dropped_fields(state: AppState, mirror: &AppState) -> AppState 
     }
     if result.disabled.is_none() {
         result.disabled = mirror.disabled;
+    }
+    if result.beta_updates.is_none() {
+        result.beta_updates = mirror.beta_updates;
+    }
+    if result.office_applied.is_none() {
+        result.office_applied = mirror.office_applied.clone();
+    }
+    if result.office_error.is_none() {
+        result.office_error = mirror.office_error.clone();
+    }
+    if result.claude_desktop_profile_id.is_none() {
+        result.claude_desktop_profile_id = mirror.claude_desktop_profile_id.clone();
+    }
+    // A project's tenant choice, independent of the MCP fields below (an older build that knows those still drops this).
+    // Only for a project that still uses the same profile; a re-assignment made by the older build is not undone.
+    for binding in result.bindings.iter_mut().filter(|b| b.models.is_none()) {
+        if let Some(saved) = mirror.bindings.iter().find(|s| s.path == binding.path && s.profile_id == binding.profile_id) {
+            binding.models = saved.models.clone();
+        }
     }
     if result.mcp_servers.is_empty() {
         result.mcp_servers = mirror.mcp_servers.clone();

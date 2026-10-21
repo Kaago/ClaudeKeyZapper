@@ -17,6 +17,17 @@ pub struct Release {
 fn notes() -> Vec<(&'static str, Vec<String>)> {
     vec![
         (
+            "1.5.0",
+            vec![
+                l!("MCP-Server zentral verwalten: Die IT verteilt per Intune nur die Adresse einer Liste auf ihrem Server; KeyZapper lädt sie mit deiner SSO-Anmeldung und bietet die Server für jedes Projekt an."),
+                l!("Neue Seite Claude-Tools: Claude Code, die Erweiterung für VS Code, das Plugin für IntelliJ IDEA und Claude Desktop mit einem Klick installieren – ohne Administratorrechte."),
+                l!("Claude Desktop mit einem Key- oder SSO-Profil nutzen: KeyZapper richtet das Gateway ein; Key oder SSO-Token holt Claude Desktop über den Helper, oder es meldet sich mit dem OIDC-Client des Gateways selbst per SSO an."),
+                l!("Claude in Excel, Word und PowerPoint: Ein Profil richtet Claude für Microsoft 365 als Add-in ein, das sich per Entra-SSO am Firmen-Gateway anmeldet – ohne gespeichertes Geheimnis."),
+                l!("Tenant pro Projekt: Bei SSO-Gateways mit mehreren Tenants wählt jedes Projekt die Modelle seines Tenants, und das Budget wird pro Tenant angezeigt."),
+                l!("Neuer Schalter „Beta-Versionen“ in der Seitenleiste: Ist er an, bietet die Update-Suche auch Beta-Versionen an."),
+            ],
+        ),
+        (
             "1.4.3",
             vec![
                 l!("Budgetbalken zeigen jetzt, was übrig ist, und werden mit dem Verbrauch kürzer."),

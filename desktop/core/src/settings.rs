@@ -3,7 +3,7 @@
 
 use crate::errors::{Error, Result, SettingsConflict};
 use crate::json::{self, Object};
-use crate::models::{Profile, WorkspaceBinding};
+use crate::models::{ModelSelection, Profile, WorkspaceBinding};
 use crate::{git, l, paths};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -145,7 +145,9 @@ impl SettingsBinder {
     /// The values the app owns for a profile. `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` are set to "" to
     /// neutralise values inherited from the IDE/shell environment (otherwise headers get mixed, spike T6/T7/T12).
     /// In pool mode the helper is asked every minute, so an exhausted key is replaced quickly.
-    pub fn desired_values(&self, profile: &Profile, pooled: bool) -> BTreeMap<String, String> {
+    /// A `selection` (models of one tenant) replaces the profile's model values; helper and endpoint stay the same.
+    /// Subscription profiles have no gateway models, so a selection does not apply to them.
+    pub fn desired_values(&self, profile: &Profile, pooled: bool, selection: Option<&ModelSelection>) -> BTreeMap<String, String> {
         if profile.is_subscription() {
             return subscription_values(profile);
         }
@@ -158,7 +160,7 @@ impl SettingsBinder {
             ("env.ANTHROPIC_API_KEY".to_string(), String::new()),
             ("env.ANTHROPIC_AUTH_TOKEN".to_string(), String::new()),
         ]);
-        for (name, value) in profile.model_environment() {
+        for (name, value) in profile.model_environment_for(selection) {
             values.insert(format!("env.{name}"), value);
         }
         if pooled {
@@ -174,7 +176,9 @@ impl SettingsBinder {
 
     // MARK: Apply / revert
 
-    pub fn apply(&self, profile: &Profile, folder: &str, previous: Option<&WorkspaceBinding>, pooled: bool) -> Result<ApplyResult> {
+    /// `selection` is the binding's tenant model set (None = as in the profile); callers re-applying a binding pass
+    /// its stored one (`previous.and_then(|p| p.models.as_ref())`) so the choice survives.
+    pub fn apply(&self, profile: &Profile, folder: &str, previous: Option<&WorkspaceBinding>, pooled: bool, selection: Option<&ModelSelection>) -> Result<ApplyResult> {
         let pooled = pooled && !profile.is_sso() && !profile.is_subscription();
         let root = paths::canonical_path(folder);
         if !is_directory(&root) {
@@ -184,7 +188,7 @@ impl SettingsBinder {
         if expected != root {
             return Err(Error::NotSettingsRoot { folder: root, root: expected });
         }
-        let desired = self.desired_values(profile, pooled);
+        let desired = self.desired_values(profile, pooled, selection);
         let previous_values = previous.map(|p| p.managed_values.clone()).unwrap_or_default();
         let outer = self.environment_conflicts(&root, &BTreeMap::new());
         let blocking: Vec<_> = outer.iter().filter(|c| c.blocking).cloned().collect();
@@ -212,6 +216,7 @@ impl SettingsBinder {
             mcp_server_ids: previous.map(|p| p.mcp_server_ids.clone()).unwrap_or_default(),
             mcp_managed: previous.map(|p| p.mcp_managed.clone()).unwrap_or_default(),
             mcp_git_exclude_entry: previous.and_then(|p| p.mcp_git_exclude_entry.clone()),
+            models: selection.filter(|_| !profile.is_subscription()).cloned(),
         };
         Ok(ApplyResult { binding, changed, warnings: outer })
     }
@@ -243,7 +248,7 @@ impl SettingsBinder {
         if !blocking.is_empty() {
             return Err(Error::SettingsConflicts(blocking));
         }
-        let desired = self.desired_values(profile, false);
+        let desired = self.desired_values(profile, false, None);
         let previous_values = previous.map(|p| p.managed_values.clone()).unwrap_or_default();
         let changed = with_lock(|| {
             mutate_settings(Path::new(&self.user_settings_path), |settings| {
@@ -279,7 +284,7 @@ impl SettingsBinder {
         }
         let Ok(Some(settings)) = read_json(&self.user_settings_path) else { return BindingHealth::NotApplied };
         let _ = binding;
-        health(&settings, &self.desired_values(profile, false))
+        health(&settings, &self.desired_values(profile, false, None))
     }
 
     /// Copies the user settings to `settings.json.keyzapper-<timestamp>.bak` before KeyZapper changes them.
@@ -346,7 +351,7 @@ impl SettingsBinder {
                 return BindingStatus { health: BindingHealth::Drifted(vec![]), conflicts };
             }
         };
-        BindingStatus { health: health(&settings, &self.desired_values(profile, binding.is_pooled())), conflicts }
+        BindingStatus { health: health(&settings, &self.desired_values(profile, binding.is_pooled(), binding.models.as_ref())), conflicts }
     }
 
     // MARK: Conflicts

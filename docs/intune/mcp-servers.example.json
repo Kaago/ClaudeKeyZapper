@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "weave": {
+      "type": "http",
+      "url": "https://weave.firma.example/mcp",
+      "oauth": { "clientId": "c1abe1234567890abcdef", "callbackPort": 8976, "scopes": "api://c1abe1234567890abcdef/mcp.read" }
+    },
+    "wiki": {
+      "type": "http",
+      "url": "https://wiki.firma.example/mcp",
+      "headers": { "X-Tenant": "firma" }
+    },
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": { "Authorization": "Bearer ${GITHUB_PAT}" }
+    },
+    "fetch": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    }
+  }
+}

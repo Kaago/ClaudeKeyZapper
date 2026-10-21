@@ -36,16 +36,19 @@ richtigen Projekt.
 * Status je Projekt: aktiv, abweichend, Ordner fehlt, Key fehlt, Konflikte mit anderen Einstellungen. Eine Zusammenfassung zeigt, was Aufmerksamkeit braucht; *Alle reparieren* schreibt die Einstellungen aller betroffenen Projekte neu.
 * Projektordner aus Finder oder Explorer auf ein Profil ziehen, um sie zuzuordnen.
 * MCP-Server (stdio, HTTP oder SSE) einmal definieren – oder aus Vorlagen wie GitHub, Notion oder Sentry – und je Projekt einschalten. Die App schreibt sie in die `.mcp.json` des Repositorys (von Git ausgeschlossen) und schaltet sie in `.claude/settings.local.json` frei, damit Claude Code sie dort automatisch lädt. Remote-Server mit OAuth (z. B. Weave-MCP über Entra ID oder Keycloak) bekommen Client-ID, Callback-Port und Scopes; den Browser-Login übernimmt Claude Code.
+* Zentrale MCP-Liste: Die IT veröffentlicht die MCP-Server als eine JSON-Datei auf ihrem eigenen Server (z. B. dem SSO-Server); KeyZapper lädt sie und bietet die Server schreibgeschützt für jedes Projekt an (siehe [Zentrale MCP-Liste](#zentrale-mcp-liste)).
+* Seite *Claude-Tools*: installiert Claude Code (CLI), die VS Code-Erweiterung, das IntelliJ-Plugin und Claude Desktop aus den offiziellen Quellen von Anthropic und verbindet Claude Desktop mit einem Key- oder SSO-Profil (siehe [Claude-Tools](#claude-tools)).
 * Verbindungstest gegen LiteLLM (ungültiger oder gesperrter Key, Rate-Limit, Budget, Gateway nicht erreichbar).
 * Verbleibendes Budget je Key laut LiteLLM (`/key/info`): ein Balken, der ab 70 % Verbrauch orange und ab 90 % rot wird, Rest vom Limit und nächster Reset, bei Keys ohne Limit die bisherigen Ausgaben.
 * Claude-Abo-Profile: Projekte nutzen dein Claude Pro, Max, Team oder Enterprise über die Anmeldung von Claude Code statt eines Gateway-Keys (siehe unten).
+* Claude in Microsoft 365: Ein Profil kann das Claude-Add-in für Excel, Word und PowerPoint hinter dem Firmen-Gateway mit Entra-SSO einrichten (siehe unten).
 * Symbol in der Menüleiste (macOS) bzw. im Infobereich (Windows): Ein Klick zeigt den Verbrauch auf einen Blick – Limits des Claude-Abos (Sitzung, Woche, je Modell) und das Budget jedes Keys; per Rechtsklick wechselst du das Profil eines Projekts, ohne das Fenster zu öffnen. Nach dem Schließen des Fensters läuft KeyZapper dort weiter.
 * Rücknahme entfernt nur die Einträge, die die App selbst gesetzt hat.
 * Seitenleiste mit Profilen, Projekten, MCP-Servern, Claude-Einstellungen und Backup. Alles lässt sich direkt ändern – über das ⋯-Menü oder per Rechtsklick; Keys lassen sich kopieren und ersetzen.
 * Update-Prüfung gegen die GitHub-Releases mit Installation per Klick; die Version steht in der App und unter „Über KeyZapper“.
 * Oberfläche auf Deutsch und Englisch (folgt der Systemsprache).
 * Verschlüsseltes Backup und Wiederherstellen von Profilen, Zuordnungen und Keys (`.kzbackup`, passwortgeschützt).
-* Steuerbar per Intune: vorgegebene Profile, Gateway-Allowlist, Standardwerte, CLI-Mindestversion, OneDrive-Backup, Update-Prüfung.
+* Steuerbar per Intune: vorgegebene Profile (auch mit Claude in Microsoft 365), Gateway-Allowlist, Standardwerte, CLI-Mindestversion, OneDrive-Backup, Update-Prüfung, zentrale MCP-Liste, Seite Claude-Tools.
 
 ## Voraussetzungen
 
@@ -97,8 +100,25 @@ serialisiert sicher über parallele Sitzungen. Exit-Code 67 bedeutet abgelaufene
 setzen (z. B. 900000 für 60–90 Min. Tokens). Für lange Streams über ein Gateway auch `API_TIMEOUT_MS`,
 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`, `CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS` setzen.
 
-**Einschränkungen:** SSO-Profile unterstützen keinen Budget-Killer-Pool, keine Budget-Anzeige und kein Key-Kopieren.
-Modell-Laden und Verbindungstest verwenden das Access-Token.
+**Einschränkungen:** SSO-Profile unterstützen keinen Budget-Killer-Pool und kein Key-Kopieren. Modell-Laden, Verbindungstest und
+Budget-Anzeige (ein Budget je Tenant, siehe unten) verwenden das Access-Token.
+
+## Mehrere Tenants unter einem SSO-Profil
+
+Ein Gateway, das mehrere Tenants (Teams, Kostenstellen) bedient, führt seine Modelle als `<tenant>/<modell>`, zum Beispiel
+`acme/claude-sonnet-5-5` und `globex/claude-sonnet-5-5`. Wer in zwei Tenants Zugang hat, behält trotzdem **ein** Profil und
+**einen** Login: derselbe SSO-Token, derselbe Helper, dieselbe Base-URL. KeyZapper liest die Modellliste zusammen mit den Budgets
+vom Gateway (`/v1/models`); enthält sie zwei oder mehr Tenants, zeigt jede Projektzeile eine Auswahl **Tenant**.
+
+Die Wahl eines Tenants ersetzt nur die vier Modelleinstellungen dieses Projekts (`ANTHROPIC_MODEL` und
+`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`) durch die Modelle dieses Tenants: Jedes Modell des Profils wird zu
+`<tenant>/<name>`, wenn der Tenant es hat, sonst gilt das neueste Modell des Tenants für diese Stufe. Beim Standardmodell bleiben
+Stufen-Aliase wie `sonnet` oder `opusplan` erhalten; eine Modell-ID zieht mit oder fällt auf das Sonnet-Modell des Tenants zurück.
+Helper (`--profile <ID>`) und `ANTHROPIC_BASE_URL` bleiben gleich, Claude Code ruft im Projekt also nach einer Anmeldung den
+gewählten Tenant auf. *Wie im Profil* kehrt zu den eigenen Modellen des Profils zurück.
+
+Die Wahl wird mit der Projektzuordnung gespeichert und überlebt *Erneut anwenden*, Profiländerungen und Backups; wird das Projekt
+einem anderen Profil zugeordnet, entfällt sie. Claude-Abo-Profile haben keine Tenants.
 
 ## Claude-Abo-Profile
 
@@ -112,6 +132,57 @@ sonst `~/.claude/.credentials.json`) und fragt `api.anthropic.com/api/oauth/usag
 wird nie erneuert, gespeichert oder kopiert; ist es abgelaufen (Claude Code erneuert es, sobald es läuft), zeigt KeyZapper den
 letzten Stand. Der Endpunkt ist keine öffentliche API und kann sich ändern. Die Gateway-Allowlist gilt für diese Profile nicht,
 und die Repository-Analyse benötigt ein Gateway-Profil.
+
+## Claude in Microsoft 365 über das Profil
+
+Ein Profil kann auch **Claude für Microsoft 365** einrichten, das Claude-Add-in für Excel, Word und PowerPoint, hinter dem
+Firmen-Gateway. KeyZapper tut das für das Profil, bei dem *Claude in Office* eingeschaltet ist: im Profileditor oder über das
+Dict `Office` eines verwalteten Profils (siehe [Verteilung über Microsoft Intune](#verteilung-über-microsoft-intune)). Ist es bei
+mehreren Profilen eingeschaltet, haben die von der IT vorgegebenen Vorrang, danach gilt das erste eigene.
+
+**Was passiert:** KeyZapper lädt Anthropics Manifest-Vorlage (`https://pivot.claude.ai/manifest.xml`, nur solange Claude in Office
+eingeschaltet ist), setzt die Add-in-ID der Firma und hängt die Gateway- und Entra-Parameter an die beiden Seitenadressen des Add-ins: `gateway_url`,
+`gateway_api_format=anthropic`, `entra_sso=1`, `graph_client_id`, `entra_scope`, `gateway_auth_source=entra` und, falls gesetzt,
+`disabled_features`. Das Ergebnis wird per Sideload eingebunden:
+
+* **macOS:** `<Add-in-ID>.manifest.xml` im Ordner `wef` jeder installierten App unter `/Applications` (Excel, Word, PowerPoint),
+  also `~/Library/Containers/com.microsoft.<App>/Data/Documents/wef`.
+* **Windows:** die Datei in `%LOCALAPPDATA%\KeyZapper\office`, eingetragen als Wert mit dem Namen der Add-in-ID unter
+  `HKCU\SOFTWARE\Microsoft\Office\16.0\Wef\Developer`.
+
+**Nur Entra, kein Geheimnis:** Das Add-in meldet sich per Microsoft-Entra-SSO an. Das Manifest enthält kein Geheimnis, und
+KeyZapper liest oder schreibt nie den eigenen Speicher des Add-ins. App-Registrierung in Entra und Gateway-Route, die deren
+Tokens annimmt, gehören zur Gateway-Seite; KeyZapper reicht nur die IDs durch.
+
+**Felder:** Gateway-URL (https; der Host muss von `AllowedGatewayHosts` erlaubt sein), Entra-Client-ID, Entra-Scope
+(`api://<Client-ID>/access_as_user`), Add-in-ID und optional abzuschaltende Funktionen des Add-ins (kommagetrennt). Die Add-in-ID
+ist eine eigene GUID in Kleinbuchstaben; die ID des Marketplace-Add-ins wird abgelehnt, damit das Add-in per Sideload nie ihren
+Platz einnimmt.
+
+**Office einmal neu starten,** dann Claude über *Einfügen → Meine Add-ins* öffnen. Die Profilkarte zeigt, für welche Apps es
+eingerichtet ist, oder warum es nicht geklappt hat. Unter macOS fragt das System beim ersten Schreiben, ob KeyZapper auf Daten
+anderer Apps (die Office-Container) zugreifen darf; bitte erlauben. Wurde es abgelehnt, zeigt die Profilkarte den Fehler, und
+eine Änderung am Profil oder *Status aktualisieren* versucht es erneut.
+
+**Wann geschrieben wird:** nur bei einer Änderung: an den Office-Einstellungen des Profils, an Anthropics Vorlage oder an den
+installierten Office-Apps. KeyZapper führt dazu eine eigene Aufzeichnung in `state.json` und liest die Office-Ordner nie, um das
+herauszufinden. Ohne Verbindung gilt die zuletzt geladene Vorlage. Gibt es keine, oder sieht die Vorlage nicht nach Anthropics aus,
+wird nichts geschrieben, und ein vorhandenes Manifest bleibt.
+
+**Entfernen:** Ausschalten von *Claude in Office*, Löschen des Profils oder Deaktivieren von KeyZapper entfernt KeyZappers eigenes
+Manifest (unter Windows auch den Registrywert) aus Office. Dateien anderer Add-ins bleiben.
+
+**Beenden oder Deinstallieren von KeyZapper lässt das Manifest liegen,** denn nur KeyZapper entfernt es, und nur solange es läuft.
+Vor dem Deinstallieren *Claude in Office* im Profil ausschalten oder KeyZapper deaktivieren; dann wird das Manifest (unter
+Windows auch der Registrywert) vorher entfernt.
+
+**Office puffert seitlich geladene Manifeste möglicherweise im Cache.** Zeigt sich eine Änderung (anderes Gateway, andere
+Add-in-ID, ausgeschaltet) nach dem Neustart nicht, Office noch einmal neu starten oder, wenn das nicht hilft, den Add-in-Cache
+von Office leeren. Das ist ein Hinweis: KeyZapper prüft diesen Cache weder noch fasst es ihn an.
+
+**Sideload ist Microsofts Weg zum Entwickeln und Testen von Add-ins,** nicht für die Verteilung im Betrieb. Dafür unterstützt
+Microsoft die zentrale Bereitstellung des Manifests über das Microsoft 365 Admin Center. Dort dieselbe Add-in-ID verwenden, damit
+beide Wege dasselbe Add-in meinen.
 
 ## So funktioniert es
 
@@ -192,7 +263,9 @@ Verwaltete Einstellungen haben Vorrang vor Projekteinstellungen; KeyZapper brich
 
 | Schlüssel | Typ | Wirkung |
 |---|---|---|
-| `ManagedProfiles` | Array von Dicts: `Name`, `Endpoint`, optional `OpusModel`, `SonnetModel`, `HaikuModel`, `ModelAlias`, `Environment` (Dict), `ID`, `Type` (`apiKey` Standard oder `oidc`), `OIDCIssuer`, `OIDCClientID`, `OIDCScope`, `OIDCTokenType` | Profile werden automatisch angelegt und sind nicht editier- oder löschbar; Entwickler tragen nur den Key ein (oder melden sich für SSO an). Ohne `ID` wird die Profil-ID aus `Name` abgeleitet, eine Umbenennung erzeugt also ein neues Profil. Bei SSO (`oidc`) sind `OIDCIssuer` und `OIDCClientID` erforderlich; `OIDCScope` Standard `openid profile offline_access`; `OIDCTokenType` ist `access` (Standard) oder `id`, andere Werte verwerfen das Profil. |
+| `ManagedProfiles` | Array von Dicts: `Name`, `Endpoint`, optional `OpusModel`, `SonnetModel`, `HaikuModel`, `ModelAlias`, `Environment` (Dict), `ID`, `Type` (`apiKey` Standard oder `oidc`), `OIDCIssuer`, `OIDCClientID`, `OIDCScope`, `OIDCTokenType`, `Office`, `ClaudeDesktop` (Dicts, siehe unten) | Profile werden automatisch angelegt und sind nicht editier- oder löschbar; Entwickler tragen nur den Key ein (oder melden sich für SSO an). Ohne `ID` wird die Profil-ID aus `Name` abgeleitet, eine Umbenennung erzeugt also ein neues Profil. Bei SSO (`oidc`) sind `OIDCIssuer` und `OIDCClientID` erforderlich; `OIDCScope` Standard `openid profile offline_access`; `OIDCTokenType` ist `access` (Standard) oder `id`, andere Werte verwerfen das Profil. |
+| `ClaudeDesktop` (innerhalb eines `ManagedProfiles`-Eintrags) | Dict: `OIDCIssuer`, `OIDCClientID`, optional `GatewayURL` (Standard: `Endpoint` des Profils), `Scopes`, `BearerTokenType` (`id_token` Standard oder `access_token`) | Claude Desktop meldet sich selbst mit dem OIDC-Client des Gateways an, wenn dieses Profil dafür gewählt ist (siehe [Claude-Tools](#claude-tools)). Ein Block mit unbrauchbaren Werten bleibt erhalten; KeyZapper schreibt dann nichts für Claude Desktop. |
+| `Office` (innerhalb eines `ManagedProfiles`-Eintrags) | Dict: `Enabled` (Bool, Standard `true`), `AddinID`, `GatewayURL`, `EntraClientID`, `EntraScope`, `DisabledFeatures` (Array oder kommagetrennter String) | Richtet [Claude in Microsoft 365](#claude-in-microsoft-365-über-das-profil) aus diesem Profil ein. Werte werden getrimmt. Ein Block mit unbrauchbaren Werten bleibt erhalten und wird in der Profilkarte gemeldet; dann wird nichts geschrieben. |
 | `AllowedGatewayHosts` | Array von Strings (`host` oder `*.domain`) | Profile nur für diese Hosts. Der Helper gibt Keys für andere Hosts nicht heraus (Exit 78). Gilt nur für den Gateway-Host; der IdP-Host muss nicht gelistet sein. Leer bedeutet keine Einschränkung. |
 | `DefaultEndpoint`, `DefaultModelAlias` | String | Vorbelegung beim Anlegen eigener Profile |
 | `MinimumClaudeCodeVersion` | String | Schwelle für die Warnung vor veralteten Claude-CLIs (Standard 2.1.288) |
@@ -200,6 +273,8 @@ Verwaltete Einstellungen haben Vorrang vor Projekteinstellungen; KeyZapper brich
 | `BackupDirectory` | String, `~` erlaubt | Expliziter Backup-Ordner; aktiviert das Backup auch ohne `OneDriveBackup` |
 | `UpdateCheckEnabled` | Bool (Standard `true`) | In-App-Update-Prüfung. Bei Verteilung über Intune auf `false` setzen, sonst kann Intune eine selbst installierte neuere Version wieder überschreiben. |
 | `AllowKeyExport` | Bool (Standard `true`) | Ob Keys die App verlassen dürfen. `false`: kein Kopieren in die Zwischenablage; Backups enthalten nur Profile und Zuordnungen. |
+| `ManagedMcpServersURL` | String (https-URL) | Adresse der zentralen MCP-Liste (siehe [Zentrale MCP-Liste](#zentrale-mcp-liste)). |
+| `ClaudeToolsEnabled` | Bool (Standard `true`) | Zeigt die Seite *Claude-Tools* zum Installieren von Claude Code, den IDE-Plugins und Claude Desktop. |
 
 Lokal testen (Benutzerebene; per Intune verwaltete Werte haben Vorrang):
 
@@ -214,6 +289,37 @@ Ein Geschäftskonto hat Vorrang vor „OneDrive-Personal“. **Keys werden nie g
 an, das Backup wiederherzustellen oder zu verwerfen. Zuordnungen werden nur für vorhandene Ordner übernommen, die Keys
 trägt man neu ein. Solange ein gefundenes Backup nicht wiederhergestellt oder verworfen wurde, wird es nicht überschrieben.
 
+### Zentrale MCP-Liste
+
+Die IT pflegt die MCP-Server in einer JSON-Datei auf ihrem eigenen Server und verteilt per Intune nur deren Adresse
+(`ManagedMcpServersURL`). Die Datei hat das `.mcp.json`-Format von Claude Code; Vorlage:
+[docs/intune/mcp-servers.example.json](docs/intune/mcp-servers.example.json).
+
+```json
+{
+  "mcpServers": {
+    "weave": { "type": "http", "url": "https://weave.firma.example/mcp",
+               "oauth": { "clientId": "c1abe…", "callbackPort": 8976, "scopes": "api://weave/mcp.read" } },
+    "wiki":  { "type": "http", "url": "https://wiki.firma.example/mcp", "headers": { "X-Tenant": "firma" } },
+    "fetch": { "type": "stdio", "command": "uvx", "args": ["mcp-server-fetch"] }
+  }
+}
+```
+
+* KeyZapper lädt die Liste beim Start, alle 10 Minuten, nach einer SSO-Anmeldung und per *Neu laden* auf der Seite *MCP-Server*.
+  Der Server beantwortet `GET` mit `200` und dem JSON (höchstens 1 MB); `401`/`403` erscheint als „Anmeldung erforderlich“.
+* **Anmeldung:** Ist ein SSO-Profil angemeldet, dessen Gateway oder Identity Provider denselben Host wie die Liste hat, schickt
+  KeyZapper dessen Token als `Authorization: Bearer …` mit (Token-Art des Profils). So kann der Server je Nutzer oder Gruppe
+  antworten. Das Token geht nur an Hosts, die es ohnehin bekommen.
+* Die Server erscheinen mit dem Hinweis *Von IT verwaltet*: Entwickler schalten sie je Projekt ein, können sie aber nicht
+  bearbeiten oder löschen. Änderungen an der Liste werden in die nutzenden Projekte geschrieben; Server, die die IT aus der
+  Liste nimmt, verschwinden aus den Projekten.
+* Die zuletzt geladene Liste bleibt in `mcp-catalog.json` im App-Datenordner, damit die Server auch offline funktionieren;
+  ein fehlgeschlagener Abruf wird auf der Seite angezeigt, die bisherige Liste gilt weiter.
+* Nur `https`-Adressen (einfaches http nur für localhost), auch für Remote-Server in der Liste. Einträge mit ungültigem
+  Namen, ohne Befehl oder URL werden ausgelassen und auf der Seite genannt; ebenso ein Eintrag mit dem Namen eines eigenen Servers.
+* Secrets gehören nicht in die Datei; `${NAME}`-Verweise (Claude Code setzt sie aus der Umgebung ein) oder OAuth nutzen.
+
 ## Prüfung der Claude-Einstellungen und Standardprofil
 
 Die Seite *Claude-Einstellungen* in der Seitenleiste prüft `~/.claude/settings.json` auf Probleme, die Claude
@@ -226,11 +332,57 @@ LiteLLM vorbei, Modell-Variablen und feste Modell-IDs statt Alias. Probleme zeig
 * **Standardprofil** trägt ein Profil in `~/.claude/settings.json` ein. Claude Code nutzt es in allen Ordnern ohne eigene
   Zuordnung statt eines Klartext-Keys oder der normalen Anmeldung. Zugeordnete Projekte behalten ihr eigenes Profil.
 
+## Claude-Tools
+
+Die Seite *Claude-Tools* (ausgeblendet mit `ClaudeToolsEnabled = false`) zeigt, was installiert ist, und installiert ohne Administratorrechte:
+
+| Tool | Quelle | Installiert nach |
+|---|---|---|
+| Claude Code (CLI) | Nativer Installer von Anthropic (`curl -fsSL https://claude.ai/install.sh \| bash`, Windows `irm https://claude.ai/install.ps1 \| iex`) | `~/.local/bin/claude`, aktualisiert sich selbst |
+| Claude Code für VS Code | `code --install-extension anthropic.claude-code` (VS Code Marketplace) | VS Code des Nutzers |
+| Claude Code für IntelliJ IDEA | `idea installPlugins com.anthropic.code.plugin` (JetBrains Marketplace); IntelliJ muss geschlossen sein | jedes gefundene IntelliJ IDEA (auch aus der Toolbox) |
+| Claude Desktop | `.dmg` von `claude.ai/api/desktop/darwin/universal/dmg/latest/redirect` (macOS; prüft vor dem Kopieren nach `/Applications` bzw. `~/Applications` die Developer ID `Q6L2SF6YDW` von Anthropic), `.msix` über `Add-AppxPackage` (Windows) | Programme-Ordner / aktueller Nutzer |
+
+**Anmeldung:** Claude Code im Terminal, in VS Code und in IntelliJ nutzt in zugeordneten Projekten deren Profil, sonst das
+Standardprofil (Key, SSO oder Claude-Abo). Für Key- und SSO-Profile in VS Code *Disable Login Prompt*
+(`claudeCode.disableLoginPrompt`) einschalten; die Seite öffnet diese Einstellung. Findet IntelliJ `claude` nicht, den auf der
+Seite angezeigten Pfad unter *Settings › Tools › Claude Code [Beta] › Claude command* eintragen.
+
+**Claude Desktop mit Profil:** Key- oder SSO-Profil wählen und *Übernehmen*. KeyZapper legt eine Konfigurationsdatei für den
+Drittanbieter-Modus von Claude Desktop in dessen Konfigurationsbibliothek an (`~/Library/Application Support/Claude-3p/configLibrary`,
+`%LOCALAPPDATA%\Claude-3p\configLibrary`) und wählt sie in `_meta.json` aus:
+
+```json
+{
+  "inferenceProvider": "gateway",
+  "inferenceGatewayBaseUrl": "https://litellm.firma.example",
+  "inferenceCredentialKind": "helper-script",
+  "inferenceCredentialHelper": "/Applications/KeyZapper.app/Contents/MacOS/keyzapper-helper",
+  "inferenceCredentialHelperArgs": ["credential", "--profile", "<UUID>"],
+  "inferenceCredentialHelperTtlSec": 300,
+  "inferenceModels": [{ "name": "eu.anthropic.claude-sonnet-5-team", "anthropicFamilyTier": "sonnet" }]
+}
+```
+
+Claude Desktop holt Key oder SSO-Token so über `keyzapper-helper`, genau wie Claude Code; in der Datei steht kein Key. Die
+Helper-TTL folgt `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` des Profils (Standard 300 s). Danach Claude Desktop beenden, neu öffnen
+und auf dem Anmeldebildschirm den Start mit dieser Konfiguration wählen. *Normale Anmeldung (claude.ai)* entfernt den Eintrag
+wieder. Ändert sich das Profil, aktualisiert KeyZapper die Datei. Eine Claude-Desktop-Konfiguration, die die IT per MDM-Profil
+(`com.anthropic.claudefordesktop`) oder Registry (`HKLM\SOFTWARE\Policies\Claude`) verteilt, hat Vorrang; KeyZapper schreibt
+dann nichts, die Seite weist darauf hin. Beim Deaktivieren entfernt KeyZapper den Eintrag, beim Aktivieren schreibt es ihn wieder.
+
+**Claude Desktop mit eigener SSO-Anmeldung:** Hat das Gateway einen eigenen OIDC-Client für Claude Desktop (andere Client-ID
+oder Gateway-Route als Claude Code), im Profil *Claude Desktop (SSO)* einschalten und Issuer, Client-ID sowie optional
+Gateway-URL, Scopes und Token-Art angeben (`id_token` Standard, `access_token` braucht die Scopes des Gateways). KeyZapper
+schreibt dann statt des Helpers die interaktive Anmeldung (`inferenceCredentialKind: interactive`, `inferenceGatewayOidc`):
+Claude Desktop meldet sich im Browser an, verwahrt sein Token selbst und listet die Modelle des Gateways (`/v1/models`). Es
+wird weder Key noch Token geschrieben. Die IT setzt das mit einem `ClaudeDesktop`-Dict in `ManagedProfiles`.
+
 ## KeyZapper deaktivieren
 
 Der Schalter unten in der Seitenleiste deaktiviert KeyZapper: Die App entfernt ihre Einträge aus allen Projekten und aus
 `~/.claude/settings.json`, Claude Code nutzt dann überall die normale Anmeldung. Die Zuordnungen bleiben gespeichert und
-werden beim Aktivieren wieder geschrieben.
+werden beim Aktivieren wieder geschrieben. Claude in Microsoft 365 wird aus Office entfernt, solange KeyZapper deaktiviert ist, und beim Aktivieren wieder eingerichtet.
 
 ## Verschlüsseltes Backup und Wiederherstellen
 
@@ -303,7 +455,8 @@ Ein Tag im Format `X.Y.Z` startet [.github/workflows/release.yml](.github/workfl
 Tests aus, baut `KeyZapper-X.Y.Z.pkg` (macOS) und `KeyZapper-X.Y.Z.msi` (Windows), signiert beide mit minisign und veröffentlicht sie
 mit ihren `.minisig`-Dateien in einem GitHub-Release. Zum Signieren braucht es das Repository-Secret `MINISIGN_SECRET_KEY` (der geheime
 Schlüssel zu `desktop/update-key.pub`); ohne Secret bricht der Workflow ab, statt unsignierte Installer zu veröffentlichen.
-Ein Tag wie `X.Y.Z-beta.N` erzeugt ein Pre-Release, das nur installierten Betas und über „Beta-Version suchen“ angeboten wird.
+Ein Tag wie `X.Y.Z-beta.N` erzeugt ein Pre-Release, das nur mit dem Schalter *Beta-Versionen* in der Seitenleiste angeboten
+wird (Standard: an, solange eine Beta installiert ist).
 
 ```bash
 git tag 1.0.0

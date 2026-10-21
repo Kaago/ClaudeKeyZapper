@@ -2,15 +2,17 @@
 //! (read through CFPreferences, so `/Library/Managed Preferences` wins). Windows: registry policy values under
 //! `HKLM\SOFTWARE\Policies\KeyZapper` (or HKCU), same names; `ManagedProfiles` is a JSON string there.
 
+use crate::claude_desktop::{BearerTokenType, DesktopSso};
+use crate::claude_office::OfficeClient;
 use crate::models::{AuthType, OidcTokenType};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 pub const DOMAIN: &str = "io.github.bl0rb.keyzapper";
-pub const KEYS: [&str; 9] = [
+pub const KEYS: [&str; 11] = [
     "ManagedProfiles", "AllowedGatewayHosts", "DefaultEndpoint", "DefaultModelAlias", "MinimumClaudeCodeVersion",
-    "OneDriveBackup", "BackupDirectory", "UpdateCheckEnabled", "AllowKeyExport",
+    "OneDriveBackup", "BackupDirectory", "UpdateCheckEnabled", "AllowKeyExport", "ManagedMcpServersURL", "ClaudeToolsEnabled",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -28,13 +30,19 @@ pub struct ManagedProfile {
     pub oidc_client_id: Option<String>,
     pub oidc_scope: Option<String>,
     pub oidc_token_type: OidcTokenType,
+    pub office: Option<OfficeClient>,
+    pub claude_desktop: Option<DesktopSso>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ManagedConfig {
     /// `ManagedProfiles`: dicts with `Name`, `Endpoint`, optional `ModelAlias`, `OpusModel`, `SonnetModel`,
     /// `HaikuModel`, `Environment` (dict) and `ID` (UUID); `Type` (`apiKey` default | `oidc`) with
-    /// `OIDCIssuer`, `OIDCClientID` (both required for `oidc`), `OIDCScope` and `OIDCTokenType` (`access` default | `id`).
+    /// `OIDCIssuer`, `OIDCClientID` (both required for `oidc`), `OIDCScope` and `OIDCTokenType` (`access` default | `id`),
+    /// and an optional `Office` dict (Claude in Microsoft 365): `Enabled` (default on), `AddinID`, `GatewayURL`,
+    /// `EntraClientID`, `EntraScope`, `DisabledFeatures` (array or comma separated string); an optional `ClaudeDesktop`
+    /// dict (Claude Desktop signs in itself): `OIDCIssuer`, `OIDCClientID`, optional `GatewayURL`, `Scopes` and
+    /// `BearerTokenType` (`id_token` default | `access_token`).
     pub profiles: Vec<ManagedProfile>,
     /// `AllowedGatewayHosts`: exact hosts or `*.domain`; empty = no restriction.
     pub allowed_gateway_hosts: Vec<String>,
@@ -51,6 +59,10 @@ pub struct ManagedConfig {
     pub update_check_enabled: bool,
     /// `AllowKeyExport`: whether keys may be copied and put into encrypted backups (default on).
     pub allow_key_export: bool,
+    /// `ManagedMcpServersURL`: https address of the central MCP server list (`.mcp.json` format), see `mcp_catalog`.
+    pub managed_mcp_servers_url: Option<String>,
+    /// `ClaudeToolsEnabled`: page for installing Claude Code, its IDE plugins and Claude Desktop (default on).
+    pub claude_tools_enabled: bool,
 }
 
 impl Default for ManagedConfig {
@@ -98,6 +110,8 @@ impl ManagedConfig {
             backup_directory: as_string(values.get("BackupDirectory")),
             update_check_enabled: as_bool(values.get("UpdateCheckEnabled")).unwrap_or(true),
             allow_key_export: as_bool(values.get("AllowKeyExport")).unwrap_or(true),
+            managed_mcp_servers_url: as_string(values.get("ManagedMcpServersURL")).map(|u| u.trim().to_string()).filter(|u| !u.is_empty()),
+            claude_tools_enabled: as_bool(values.get("ClaudeToolsEnabled")).unwrap_or(true),
         }
     }
 
@@ -179,13 +193,58 @@ fn managed_profile(dict: &Map<String, Value>) -> Option<ManagedProfile> {
         oidc_client_id,
         oidc_scope,
         oidc_token_type,
+        office: dict.get("Office").and_then(Value::as_object).map(office_client),
+        claude_desktop: dict.get("ClaudeDesktop").and_then(Value::as_object).map(desktop_sso),
     })
+}
+
+/// The `ClaudeDesktop` dict of a managed profile. Like `Office`, a broken block is kept and reported by `problems()`.
+fn desktop_sso(dict: &Map<String, Value>) -> DesktopSso {
+    let text = |key: &str| as_string(dict.get(key)).map(|v| v.trim().to_string()).unwrap_or_default();
+    DesktopSso {
+        gateway_url: text("GatewayURL"),
+        oidc_issuer: text("OIDCIssuer"),
+        oidc_client_id: text("OIDCClientID"),
+        scopes: text("Scopes"),
+        bearer_token_type: match text("BearerTokenType").to_lowercase().as_str() {
+            "access_token" | "access" => BearerTokenType::AccessToken,
+            _ => BearerTokenType::IdToken,
+        },
+    }
+}
+
+/// The `Office` dict of a managed profile. Missing or malformed values stay as they are (empty), so a broken block is kept
+/// and the sync reports `problems()` instead of the profile silently losing its Office setup.
+fn office_client(dict: &Map<String, Value>) -> OfficeClient {
+    let text = |key: &str| as_string(dict.get(key)).map(|v| v.trim().to_string()).unwrap_or_default();
+    let disabled_features = match dict.get("DisabledFeatures") {
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).map(String::from).collect(),
+        Some(Value::String(list)) => list.split(',').map(String::from).collect(),
+        _ => Vec::<String>::new(),
+    };
+    OfficeClient {
+        enabled: as_bool(dict.get("Enabled")).unwrap_or(true),
+        addin_id: text("AddinID"),
+        gateway_url: text("GatewayURL"),
+        entra_client_id: text("EntraClientID"),
+        entra_scope: text("EntraScope"),
+        disabled_features: disabled_features.into_iter().map(|f| f.trim().to_string()).filter(|f| !f.is_empty()).collect(),
+    }
 }
 
 /// Stable profile ID for a managed profile without explicit `ID`, so bindings survive app restarts
 /// (same derivation as the macOS app).
 pub fn derived_id(name: &str) -> String {
-    let digest = Sha256::digest(format!("keyzapper-managed-profile:{name}").as_bytes());
+    uuid_from(&format!("keyzapper-managed-profile:{name}"))
+}
+
+/// Stable ID for an MCP server of the central list, derived from its name, so project choices survive reloads.
+pub fn derived_mcp_id(name: &str) -> String {
+    uuid_from(&format!("keyzapper-managed-mcp:{name}"))
+}
+
+fn uuid_from(seed: &str) -> String {
+    let digest = Sha256::digest(seed.as_bytes());
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0F) | 0x50; // version 5 style
@@ -346,7 +405,12 @@ mod tests {
         assert!(!config.is_endpoint_allowed("https://evil.example"));
         assert!(!config.is_endpoint_allowed("http://litellm.firma.example/v1"));
         assert!(!config.allow_key_export && config.update_check_enabled);
-        assert!(ManagedConfig::default().allow_key_export);
+        assert!(ManagedConfig::default().allow_key_export && ManagedConfig::default().claude_tools_enabled);
+        assert_eq!(ManagedConfig::default().managed_mcp_servers_url, None);
+        let values = json!({"ManagedMcpServersURL": " https://sso.firma.example/keyzapper/mcp.json ", "ClaudeToolsEnabled": 0});
+        let config = ManagedConfig::from_values(values.as_object().unwrap());
+        assert_eq!(config.managed_mcp_servers_url.as_deref(), Some("https://sso.firma.example/keyzapper/mcp.json"));
+        assert!(!config.claude_tools_enabled);
     }
 
     #[test]
@@ -355,5 +419,7 @@ mod tests {
         assert_eq!(id.len(), 36);
         assert_eq!(&id[14..15], "5");
         assert_eq!(id, id.to_uppercase());
+        assert_ne!(derived_mcp_id("Projekt Alpha"), id);
+        assert_eq!(derived_mcp_id("github"), derived_mcp_id("github"));
     }
 }
