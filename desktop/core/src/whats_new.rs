@@ -17,6 +17,14 @@ pub struct Release {
 fn notes() -> Vec<(&'static str, Vec<String>)> {
     vec![
         (
+            "1.5.0",
+            vec![
+                l!("MCP-Server zentral verwalten: Die IT verteilt per Intune nur die Adresse einer Liste auf ihrem Server; KeyZapper lädt sie mit deiner SSO-Anmeldung und bietet die Server für jedes Projekt an."),
+                l!("Neue Seite Claude-Tools: Claude Code, die Erweiterung für VS Code, das Plugin für IntelliJ IDEA und Claude Desktop mit einem Klick installieren – ohne Administratorrechte."),
+                l!("Claude Desktop mit einem Key- oder SSO-Profil nutzen: KeyZapper richtet das Gateway ein, den Key oder das SSO-Token holt Claude Desktop über den Helper."),
+            ],
+        ),
+        (
             "1.4.3",
             vec![
                 l!("Budgetbalken zeigen jetzt, was übrig ist, und werden mit dem Verbrauch kürzer."),
