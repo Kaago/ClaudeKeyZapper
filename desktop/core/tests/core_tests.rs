@@ -1339,6 +1339,31 @@ fn the_office_block_of_a_managed_profile_is_optional_and_a_broken_one_is_kept() 
 }
 
 #[test]
+fn the_claude_desktop_block_of_a_managed_profile_is_optional_and_a_broken_one_is_kept() {
+    use keyzapper_core::claude_desktop::BearerTokenType;
+    use keyzapper_core::managed::ManagedConfig;
+    let parse = |block: Value| {
+        let values = json!({"ManagedProfiles": [{"Name": "P", "Endpoint": "https://llm-gateway.example/code", "ClaudeDesktop": block}]});
+        ManagedConfig::from_values(values.as_object().unwrap()).profiles.remove(0).claude_desktop
+    };
+    assert!(parse(json!("not a dict")).is_none());
+    let sso = parse(json!({
+        "GatewayURL": " https://llm-gateway.example/desktop ",
+        "OIDCIssuer": "https://login.example.test/t/v2.0",
+        "OIDCClientID": "c1",
+        "BearerTokenType": "access_token",
+        "Scopes": "api://gateway/.default",
+    }))
+    .unwrap();
+    assert_eq!((sso.gateway_url.as_str(), sso.bearer_token_type), ("https://llm-gateway.example/desktop", BearerTokenType::AccessToken));
+    assert!(sso.problems().is_empty());
+    // `id_token` is the default; a block with missing values stays and reports what is wrong.
+    let broken = parse(json!({})).unwrap();
+    assert_eq!(broken.bearer_token_type, BearerTokenType::IdToken);
+    assert!(!broken.problems().is_empty());
+}
+
+#[test]
 fn office_settings_are_stored_only_when_present() {
     use keyzapper_core::claude_office::OfficeApplied;
     let plain = serde_json::to_value(sample()).unwrap();

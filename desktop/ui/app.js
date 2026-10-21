@@ -942,6 +942,19 @@ function officeProblems(o) {
   return problems;
 }
 
+/** What keeps Claude Desktop's own sign-in from being used, as messages; the same checks as the app's Rust side. */
+function desktopSsoProblems(d) {
+  const problems = [];
+  const https = (text) => { try { const u = new URL(text); return u.protocol === 'https:' && !!u.hostname && !u.username && !u.password; } catch { return false; } };
+  const gateway = d.gatewayUrl.trim();
+  if (gateway && !https(gateway)) problems.push(t('Die Gateway-URL für Claude Desktop muss eine https-URL mit Host sein.'));
+  else if (gateway && !isHostAllowed(new URL(gateway).hostname.toLowerCase())) problems.push(t('Host nicht freigegeben. Erlaubt: %@', view.allowedHosts.join(', ')));
+  if (!https(d.oidcIssuer.trim()) || d.oidcIssuer.includes('/.well-known/')) problems.push(t('Der OIDC-Issuer für Claude Desktop muss eine https-URL ohne /.well-known/… sein.'));
+  if (!d.oidcClientId.trim() || /\s/.test(d.oidcClientId.trim())) problems.push(t('Die OIDC-Client-ID für Claude Desktop darf nicht leer sein und keine Leerzeichen enthalten.'));
+  if (d.bearerTokenType === 'access_token' && !d.scopes.trim()) problems.push(t('Mit Access-Token braucht Claude Desktop die Scopes des Gateways.'));
+  return problems;
+}
+
 function profileEditor(existing) {
   const s = {
     name: existing?.name ?? '', endpoint: existing?.endpoint ?? view.defaultEndpoint ?? '',
@@ -955,6 +968,11 @@ function profileEditor(existing) {
       entraClientId: existing?.office?.entraClientId ?? '', entraScope: existing?.office?.entraScope ?? '',
       disabledFeatures: (existing?.office?.disabledFeatures ?? []).join(', '),
     },
+    claudeDesktop: {
+      enabled: !!existing?.claudeDesktop, gatewayUrl: existing?.claudeDesktop?.gatewayUrl ?? '', oidcIssuer: existing?.claudeDesktop?.oidcIssuer ?? '',
+      oidcClientId: existing?.claudeDesktop?.oidcClientId ?? '', scopes: existing?.claudeDesktop?.scopes ?? '',
+      bearerTokenType: existing?.claudeDesktop?.bearerTokenType ?? 'id_token',
+    },
   };
   const managed = existing?.managed ?? false;
   const dlg = openDialog(existing ? t('Bearbeiten') : t('Neues Profil'), (close) => {
@@ -967,8 +985,10 @@ function profileEditor(existing) {
     const officeShown = !subscription && !(managed && !existing?.office);
     const officeOn = officeShown && !managed && s.office.enabled;
     const officeIssues = officeOn ? officeProblems(s.office) : [];
+    const desktopShown = !subscription && !(managed && !existing?.claudeDesktop);
+    const desktopIssues = desktopShown && !managed && s.claudeDesktop.enabled ? desktopSsoProblems(s.claudeDesktop) : [];
     const valid = s.name.trim() && (subscription || (host && allowed))
-      && (sso ? issuerOk && s.oidcClientId.trim() : subscription || existing || s.key) && !invalid.length && !officeIssues.length;
+      && (sso ? issuerOk && s.oidcClientId.trim() : subscription || existing || s.key) && !invalid.length && !officeIssues.length && !desktopIssues.length;
     const update = (key) => (value) => { s[key] = value; dlg.render(); };
     const modelField = (label, key, id) => field(label, input({ value: s[key], placeholder: t('Claude-Standard'), list: 'gateway-models', disabled: managed }, update(key)), id);
     const loadModels = async () => {
@@ -985,7 +1005,7 @@ function profileEditor(existing) {
     };
     const save = async () => {
       s.saving = true; dlg.render();
-      const result = await call('save_profile', { input: { id: existing?.id ?? null, ...s, office: subscription ? null : s.office } });
+      const result = await call('save_profile', { input: { id: existing?.id ?? null, ...s, office: subscription ? null : s.office, claudeDesktop: subscription ? null : s.claudeDesktop } });
       s.saving = false;
       if (result?.[0]) close(); else dlg.render();
     };
@@ -1052,6 +1072,20 @@ function profileEditor(existing) {
             field(t('Abgeschaltete Funktionen'), input({ value: s.office.disabledFeatures, placeholder: 'web_search, thumbs' }, (v) => { s.office.disabledFeatures = v; dlg.render(); }), 'p-office-features'),
             officeIssues.filter(([key]) => key === 'disabledFeatures' || s.office[key].trim()).map(([, message]) => h('div', { class: 'error-text' }, message))],
           h('div', { class: 'section-note' }, t('Richtet Claude für Microsoft 365 als Add-in ein (Sideload) und meldet es per Entra-SSO am Gateway an; es wird kein Geheimnis gespeichert. Die Add-in-ID ist eine eigene GUID in Kleinbuchstaben, nicht die des Marketplace-Add-ins. Nach dem Einrichten Office einmal neu starten.'))),
+        desktopShown && h('fieldset', { disabled: managed }, h('legend', null, t('Claude Desktop (SSO)')),
+          h('label', { class: 'switch' },
+            h('input', { type: 'checkbox', role: 'switch', checked: s.claudeDesktop.enabled, onchange: (e) => { s.claudeDesktop.enabled = e.target.checked; dlg.render(); } }),
+            t('Claude Desktop meldet sich selbst per SSO am Gateway an')),
+          s.claudeDesktop.enabled && [
+            field(t('Gateway-URL'), input({ value: s.claudeDesktop.gatewayUrl, placeholder: s.endpoint || t('Wie der Endpunkt des Profils') }, (v) => { s.claudeDesktop.gatewayUrl = v; dlg.render(); }), 'p-desktop-gateway'),
+            field(t('OIDC-Issuer'), input({ value: s.claudeDesktop.oidcIssuer, placeholder: 'https://login.microsoftonline.com/<tenant-id>/v2.0' }, (v) => { s.claudeDesktop.oidcIssuer = v; dlg.render(); }), 'p-desktop-issuer'),
+            field(t('OIDC-Client-ID'), input({ value: s.claudeDesktop.oidcClientId, placeholder: '00000000-0000-0000-0000-000000000000' }, (v) => { s.claudeDesktop.oidcClientId = v; dlg.render(); }), 'p-desktop-client'),
+            field(t('Token-Art'), h('select', { onchange: (e) => { s.claudeDesktop.bearerTokenType = e.target.value; dlg.render(); } },
+              h('option', { value: 'id_token', selected: s.claudeDesktop.bearerTokenType === 'id_token' }, t('ID-Token')),
+              h('option', { value: 'access_token', selected: s.claudeDesktop.bearerTokenType === 'access_token' }, t('Access-Token'))), 'p-desktop-token'),
+            field(t('Scopes'), input({ value: s.claudeDesktop.scopes, placeholder: t('Standard von Claude Desktop') }, (v) => { s.claudeDesktop.scopes = v; dlg.render(); }), 'p-desktop-scopes'),
+            desktopIssues.map((message) => h('div', { class: 'error-text' }, message))],
+          h('div', { class: 'section-note' }, t('Mit diesem Profil meldet sich Claude Desktop im Browser selbst beim Identity Provider an und schickt sein Token an das Gateway; KeyZapper speichert dafür weder Key noch Token. Die Modelle listet das Gateway. Ohne diesen Schalter holt Claude Desktop Key oder Token über den Helper.'))),
       ],
       actions: [button(t('Abbrechen'), close), button(existing ? t('Sichern') : t('Anlegen'), save, { cls: 'primary', disabled: !valid || s.saving })],
     };
@@ -1496,11 +1530,13 @@ function claudeDesktopSettings() {
     configured && !view.claudeDesktop.applied && h('div', { class: 'finding orange' }, icon('warning'),
       t('Für „%@“ eingerichtet, in Claude Desktop ist aber eine andere Konfiguration ausgewählt.', configured.name)),
     view.claudeDesktop.managed && h('div', { class: 'finding orange' }, icon('warning'),
-      t('Claude Desktop wird auf diesem Rechner von der IT konfiguriert; deren Einstellungen haben Vorrang.')),
+      t('Claude Desktop wird auf diesem Rechner von der IT konfiguriert; KeyZapper richtet es deshalb nicht ein.')),
     h('div', { class: 'line' }, h('span', { class: 'spacer' }),
-      button(t('Übernehmen'), async () => { if (!selected || await ensureLogin(selected)) call('set_claude_desktop_profile', { profileId: selected || null }); },
-        { cls: 'primary', disabled: selected === current && (!selected || view.claudeDesktop.applied) })),
-    h('div', { class: 'section-note' }, t('KeyZapper legt dafür eine Konfigurationsdatei für den Drittanbieter-Modus von Claude Desktop an: Anfragen gehen an das Gateway des Profils, Key oder SSO-Token holt Claude Desktop über den Helper – wie Claude Code. Danach Claude Desktop beenden, neu öffnen und auf dem Anmeldebildschirm den Start mit dieser Konfiguration wählen.')));
+      button(t('Übernehmen'), async () => {
+        const signsInItself = view.profiles.find((p) => p.id === selected)?.claudeDesktop;
+        if (!selected || signsInItself || await ensureLogin(selected)) call('set_claude_desktop_profile', { profileId: selected || null });
+      }, { cls: 'primary', disabled: (selected === current && (!selected || view.claudeDesktop.applied)) || (!!selected && view.claudeDesktop.managed) })),
+    h('div', { class: 'section-note' }, t('KeyZapper legt dafür eine Konfigurationsdatei für den Drittanbieter-Modus von Claude Desktop an: Anfragen gehen an das Gateway des Profils, Key oder SSO-Token holt Claude Desktop über den Helper – wie Claude Code –, oder es meldet sich selbst an, wenn das Profil „Claude Desktop (SSO)“ eingerichtet hat. Danach Claude Desktop beenden, neu öffnen und auf dem Anmeldebildschirm den Start mit dieser Konfiguration wählen.')));
 }
 
 function toolsPage() {

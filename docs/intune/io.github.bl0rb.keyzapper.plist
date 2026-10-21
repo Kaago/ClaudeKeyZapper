@@ -35,6 +35,17 @@
       <key>CLAUDE_CODE_API_KEY_HELPER_TTL_MS</key>
       <string>900000</string>
     </dict>
+    <key>ClaudeDesktop</key>
+    <dict>
+      <key>GatewayURL</key>
+      <string>https://litellm.firma.example/api/x/desktop-gateway/desktop</string>
+      <key>OIDCIssuer</key>
+      <string>https://login.microsoftonline.com/00000000-0000-4000-8000-000000000000/v2.0</string>
+      <key>OIDCClientID</key>
+      <string>22222222-3333-4444-8555-666666666666</string>
+      <key>BearerTokenType</key>
+      <string>id_token</string>
+    </dict>
     <key>Office</key>
     <dict>
       <key>Enabled</key>

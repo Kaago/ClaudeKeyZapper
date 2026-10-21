@@ -79,6 +79,9 @@ pub fn restoring_dropped_fields(state: AppState, mirror: &AppState) -> AppState 
         if profile.office.is_none() {
             profile.office = mirror.profile(&profile.id).and_then(|saved| saved.office.clone());
         }
+        if profile.claude_desktop.is_none() {
+            profile.claude_desktop = mirror.profile(&profile.id).and_then(|saved| saved.claude_desktop.clone());
+        }
         if profile.opus_model.is_some() || profile.sonnet_model.is_some() || profile.haiku_model.is_some() || profile.environment.is_some() {
             continue;
         }
@@ -102,6 +105,9 @@ pub fn restoring_dropped_fields(state: AppState, mirror: &AppState) -> AppState 
     }
     if result.office_error.is_none() {
         result.office_error = mirror.office_error.clone();
+    }
+    if result.claude_desktop_profile_id.is_none() {
+        result.claude_desktop_profile_id = mirror.claude_desktop_profile_id.clone();
     }
     // A project's tenant choice, independent of the MCP fields below (an older build that knows those still drops this).
     // Only for a project that still uses the same profile; a re-assignment made by the older build is not undone.

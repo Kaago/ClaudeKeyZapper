@@ -208,7 +208,8 @@ fn refresh_mcp_catalog(app: &AppHandle) {
 /// Which Claude tools are installed and what Claude Desktop is set to.
 fn refresh_tools(app: &AppHandle) {
     let status = tools::status();
-    let desktop = claude_desktop::status(&claude_desktop::library_dir());
+    let recorded = with_model(app, |m| m.state.claude_desktop_profile_id.clone());
+    let desktop = claude_desktop::status(&claude_desktop::library_dir(), recorded.as_deref());
     with_model(app, |m| {
         m.tools = Some(status);
         m.claude_desktop = desktop;

@@ -260,7 +260,8 @@ outrank project settings; KeyZapper aborts binding on conflict.
 
 | Key | Type | Effect |
 |---|---|---|
-| `ManagedProfiles` | Array of dicts: `Name`, `Endpoint`, optional `OpusModel`, `SonnetModel`, `HaikuModel`, `ModelAlias`, `Environment` (dict), `ID`, `Type` (`apiKey` default or `oidc`), `OIDCIssuer`, `OIDCClientID`, `OIDCScope`, `OIDCTokenType`, `Office` (dict, see below) | Profiles are created automatically and cannot be edited or deleted; developers only enter the key (or sign in for SSO). Without `ID` the profile ID is derived from `Name`, so renaming creates a new profile. For SSO (`oidc` type), `OIDCIssuer` and `OIDCClientID` are required; `OIDCScope` defaults to `openid profile offline_access`; `OIDCTokenType` is `access` (default) or `id`, other values discard the profile. |
+| `ManagedProfiles` | Array of dicts: `Name`, `Endpoint`, optional `OpusModel`, `SonnetModel`, `HaikuModel`, `ModelAlias`, `Environment` (dict), `ID`, `Type` (`apiKey` default or `oidc`), `OIDCIssuer`, `OIDCClientID`, `OIDCScope`, `OIDCTokenType`, `Office`, `ClaudeDesktop` (dicts, see below) | Profiles are created automatically and cannot be edited or deleted; developers only enter the key (or sign in for SSO). Without `ID` the profile ID is derived from `Name`, so renaming creates a new profile. For SSO (`oidc` type), `OIDCIssuer` and `OIDCClientID` are required; `OIDCScope` defaults to `openid profile offline_access`; `OIDCTokenType` is `access` (default) or `id`, other values discard the profile. |
+| `ClaudeDesktop` (inside a `ManagedProfiles` entry) | Dict: `OIDCIssuer`, `OIDCClientID`, optional `GatewayURL` (default: the profile's `Endpoint`), `Scopes`, `BearerTokenType` (`id_token` default or `access_token`) | Claude Desktop signs in itself with the gateway's OIDC client when this profile is chosen for it (see [Claude tools](#claude-tools)). A block with unusable values is kept; KeyZapper then writes nothing for Claude Desktop. |
 | `Office` (inside a `ManagedProfiles` entry) | Dict: `Enabled` (Bool, default `true`), `AddinID`, `GatewayURL`, `EntraClientID`, `EntraScope`, `DisabledFeatures` (array or comma-separated string) | Sets up [Claude in Microsoft 365](#claude-in-microsoft-365-through-the-profile) from this profile. Values are trimmed. A block with unusable values is kept and reported on the profile card; nothing is written then. |
 | `AllowedGatewayHosts` | Array of strings (`host` or `*.domain`) | Profiles only for these hosts. The helper does not release keys for other hosts (exit 78). Applies to the gateway host only; the IdP host need not be listed. Empty means no restriction. |
 | `DefaultEndpoint`, `DefaultModelAlias` | String | Prefill when creating your own profiles |
@@ -363,7 +364,15 @@ Claude Desktop thus gets the key or SSO token from `keyzapper-helper`, like Clau
 helper TTL follows `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` of the profile (default 300 s). Then quit and reopen Claude Desktop
 and choose to start with this configuration on the sign-in screen. *Normal sign-in (claude.ai)* removes the entry again.
 If the profile changes, KeyZapper updates the file. A Claude Desktop configuration IT deploys via MDM profile
-(`com.anthropic.claudefordesktop`) or registry (`HKLM\SOFTWARE\Policies\Claude`) takes precedence; the page points this out.
+(`com.anthropic.claudefordesktop`) or registry (`HKLM\SOFTWARE\Policies\Claude`) takes precedence; KeyZapper then writes
+nothing and the page points this out. Deactivating KeyZapper removes the entry and activating writes it again.
+
+**Claude Desktop with its own SSO sign-in:** If the gateway has its own OIDC client for Claude Desktop (another client ID or
+gateway route than Claude Code), switch on *Claude Desktop (SSO)* in the profile and enter the issuer, the client ID and
+optionally the gateway URL, the scopes and the token type (`id_token` default, `access_token` needs the gateway's scopes).
+KeyZapper then writes the interactive sign-in instead of the helper (`inferenceCredentialKind: interactive`,
+`inferenceGatewayOidc`): Claude Desktop signs in in the browser, keeps its token itself and lists the gateway's models
+(`/v1/models`). No key or token is written. IT sets this with a `ClaudeDesktop` dict in `ManagedProfiles`.
 
 ## Deactivating KeyZapper
 

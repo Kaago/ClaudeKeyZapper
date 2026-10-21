@@ -1,3 +1,4 @@
+use crate::claude_desktop::DesktopSso;
 use crate::claude_office::{OfficeApplied, OfficeClient};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -89,6 +90,9 @@ pub struct Profile {
     /// Claude for Microsoft 365 behind this profile's company gateway (sideloaded add-in); None = not configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub office: Option<OfficeClient>,
+    /// Claude Desktop signs in itself with the gateway's OIDC client instead of using the helper; None = helper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_desktop: Option<DesktopSso>,
 }
 
 fn placeholder_credential() -> CredentialReference {
@@ -130,7 +134,7 @@ impl Profile {
         let credential = CredentialReference::for_id(&id);
         Self { id, name, endpoint, model_alias, opus_model: None, sonnet_model: None, haiku_model: None, environment: None, credential,
                auth_type: AuthType::ApiKey, oidc_issuer: None, oidc_client_id: None, oidc_scope: None,
-               oidc_token_type: OidcTokenType::Access, office: None }
+               oidc_token_type: OidcTokenType::Access, office: None, claude_desktop: None }
     }
 
     pub fn is_sso(&self) -> bool {
@@ -599,6 +603,10 @@ pub struct AppState {
     /// request (settings change, refresh) tries the registration again, not every start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub office_error: Option<String>,
+    /// The profile KeyZapper last set up Claude Desktop with. Kept while KeyZapper is deactivated (the entry is removed
+    /// then and written again on activation); the sign-in variant's entry does not name its profile itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_desktop_profile_id: Option<String>,
 }
 
 impl Default for AppState {
@@ -612,6 +620,7 @@ impl Default for AppState {
             mcp_servers: vec![],
             office_applied: None,
             office_error: None,
+            claude_desktop_profile_id: None,
         }
     }
 }

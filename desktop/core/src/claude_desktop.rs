@@ -1,11 +1,14 @@
 //! Claude Desktop with a KeyZapper profile. Claude Desktop's third-party mode reads one configuration file from its
 //! configuration library (`Claude-3p/configLibrary/<id>.json`, `_meta.json` names the applied one). KeyZapper keeps
 //! one entry there: requests go to the profile's gateway, and Claude Desktop gets the key or SSO token from
-//! `keyzapper-helper` (`inferenceCredentialHelper`), just like Claude Code. A configuration IT deploys via MDM profile
-//! or registry policy takes precedence over the library.
+//! `keyzapper-helper` (`inferenceCredentialHelper`), just like Claude Code. A profile with a `DesktopSso` block instead
+//! lets Claude Desktop sign in itself with the gateway's own OIDC client (`inferenceCredentialKind: interactive`); then no
+//! key or token is involved at all. A configuration IT deploys via MDM profile or registry policy takes precedence over
+//! the library, so KeyZapper does not write one then.
 
 use crate::models::Profile;
-use crate::{json, paths};
+use crate::{json, l, paths};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -26,6 +29,62 @@ pub struct Status {
     pub managed: bool,
 }
 
+/// The token Claude Desktop sends to the gateway as bearer (`inferenceGatewayOidc.bearerTokenType`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BearerTokenType {
+    #[default]
+    IdToken,
+    AccessToken,
+}
+
+/// Claude Desktop signs in itself with the gateway's OIDC client, which may differ from the one Claude Code uses
+/// (another client ID, another gateway route). A field missing in a stored object takes its empty default;
+/// `problems()` then reports the block as unusable.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DesktopSso {
+    /// Gateway route for Claude Desktop; empty = the profile's endpoint.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub gateway_url: String,
+    pub oidc_issuer: String,
+    pub oidc_client_id: String,
+    /// Space-separated; empty = Claude Desktop's default (`openid profile email offline_access`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub scopes: String,
+    pub bearer_token_type: BearerTokenType,
+}
+
+/// An https URL with host and without credentials.
+fn is_https_url(text: &str) -> bool {
+    url::Url::parse(text).is_ok_and(|u| u.scheme() == "https" && u.host().is_some() && u.username().is_empty() && u.password().is_none())
+}
+
+impl DesktopSso {
+    /// The gateway Claude Desktop talks to.
+    pub fn gateway<'a>(&'a self, profile: &'a Profile) -> &'a str {
+        if self.gateway_url.is_empty() { &profile.endpoint } else { &self.gateway_url }
+    }
+
+    /// What keeps this block from being used; empty means usable.
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if !self.gateway_url.is_empty() && !is_https_url(&self.gateway_url) {
+            problems.push(l!("Die Gateway-URL für Claude Desktop muss eine https-URL mit Host sein."));
+        }
+        if !is_https_url(&self.oidc_issuer) || self.oidc_issuer.contains("/.well-known/") {
+            problems.push(l!("Der OIDC-Issuer für Claude Desktop muss eine https-URL ohne /.well-known/… sein."));
+        }
+        if self.oidc_client_id.is_empty() || self.oidc_client_id.chars().any(char::is_whitespace) {
+            problems.push(l!("Die OIDC-Client-ID für Claude Desktop darf nicht leer sein und keine Leerzeichen enthalten."));
+        }
+        if self.bearer_token_type == BearerTokenType::AccessToken && self.scopes.trim().is_empty() {
+            problems.push(l!("Mit Access-Token braucht Claude Desktop die Scopes des Gateways."));
+        }
+        problems
+    }
+}
+
 /// `~/Library/Application Support/Claude-3p/configLibrary` (macOS), `%LOCALAPPDATA%\Claude-3p\configLibrary` (Windows).
 pub fn library_dir() -> PathBuf {
     #[cfg(windows)]
@@ -39,8 +98,12 @@ pub fn library_dir() -> PathBuf {
 }
 
 /// Gateway provider with `keyzapper-helper` as credential helper; the profile's model tiers become the model list
-/// (Sonnet first, the default), else Claude Desktop asks the gateway (`/v1/models`).
+/// (Sonnet first, the default), else Claude Desktop asks the gateway (`/v1/models`). With a `DesktopSso` block, the
+/// interactive sign-in instead.
 pub fn configuration(profile: &Profile, helper: &str) -> Value {
+    if let Some(sso) = &profile.claude_desktop {
+        return sso_configuration(profile, sso);
+    }
     let ttl = profile
         .environment
         .as_ref()
@@ -65,6 +128,26 @@ pub fn configuration(profile: &Profile, helper: &str) -> Value {
         config["inferenceModels"] = Value::Array(models);
     }
     config
+}
+
+/// Interactive sign-in with the gateway's OIDC client (`inferenceGatewayOidc`): Claude Desktop signs in in the browser,
+/// keeps the refresh token itself and lists the gateway's models (`/v1/models`), which follow the user's access.
+fn sso_configuration(profile: &Profile, sso: &DesktopSso) -> Value {
+    let mut oidc = json!({
+        "issuer": sso.oidc_issuer,
+        "clientId": sso.oidc_client_id,
+        "bearerTokenType": sso.bearer_token_type,
+        "appendOfflineAccess": true,
+    });
+    if !sso.scopes.trim().is_empty() {
+        oidc["scopes"] = sso.scopes.trim().into();
+    }
+    json!({
+        "inferenceProvider": "gateway",
+        "inferenceGatewayBaseUrl": sso.gateway(profile),
+        "inferenceCredentialKind": "interactive",
+        "inferenceGatewayOidc": oidc,
+    })
 }
 
 fn read(path: &Path) -> Option<json::Object> {
@@ -106,12 +189,16 @@ pub fn remove(dir: &Path) -> std::io::Result<()> {
     write(&meta_path, &Value::Object(meta))
 }
 
-pub fn status(dir: &Path) -> Status {
-    let profile_id = read(&dir.join(format!("{ENTRY_ID}.json"))).and_then(|config| {
+/// `recorded` is the profile KeyZapper last wrote its entry for: the sign-in variant has no helper arguments that name it.
+pub fn status(dir: &Path, recorded: Option<&str>) -> Status {
+    let config = read(&dir.join(format!("{ENTRY_ID}.json")));
+    let from_helper = config.as_ref().and_then(|config| {
         let args = config.get("inferenceCredentialHelperArgs")?.as_array()?;
         let at = args.iter().position(|a| a == "--profile")?;
         args.get(at + 1)?.as_str().map(str::to_string)
     });
+    let signed_in = config.as_ref().filter(|config| config.contains_key("inferenceGatewayOidc")).and(recorded).map(str::to_string);
+    let profile_id = from_helper.or(signed_in);
     let applied = profile_id.is_some() && read(&dir.join(META_FILE)).and_then(|m| m.get("appliedId")?.as_str().map(str::to_string)).as_deref() == Some(ENTRY_ID);
     Status { profile_id, applied, managed: managed_by_it() }
 }
@@ -160,23 +247,77 @@ mod tests {
     }
 
     #[test]
+    fn a_desktop_sso_block_writes_the_interactive_sign_in_without_any_secret() {
+        let mut profile = Profile::new("A1B2C3D4-0000-4000-8000-000000000001".into(), "Team".into(), "https://llm.firma.example/code".into(), String::new());
+        profile.sonnet_model = Some("eu.sonnet".into());
+        let mut sso = DesktopSso {
+            oidc_issuer: "https://login.microsoftonline.com/00000000-0000-4000-8000-000000000000/v2.0".into(),
+            oidc_client_id: "11111111-2222-4333-8444-555555555555".into(),
+            ..DesktopSso::default()
+        };
+        assert!(sso.problems().is_empty());
+        profile.claude_desktop = Some(sso.clone());
+        let config = configuration(&profile, "helper");
+        assert_eq!(
+            config,
+            json!({
+                "inferenceProvider": "gateway",
+                "inferenceGatewayBaseUrl": "https://llm.firma.example/code",
+                "inferenceCredentialKind": "interactive",
+                "inferenceGatewayOidc": {
+                    "issuer": "https://login.microsoftonline.com/00000000-0000-4000-8000-000000000000/v2.0",
+                    "clientId": "11111111-2222-4333-8444-555555555555",
+                    "bearerTokenType": "id_token",
+                    "appendOfflineAccess": true,
+                },
+            })
+        );
+        // Own gateway route and access tokens with the gateway's scope.
+        sso.gateway_url = "https://llm.firma.example/desktop".into();
+        sso.bearer_token_type = BearerTokenType::AccessToken;
+        assert_eq!(sso.problems().len(), 1, "access tokens need scopes");
+        sso.scopes = " api://gateway/.default ".into();
+        assert!(sso.problems().is_empty());
+        profile.claude_desktop = Some(sso.clone());
+        let config = configuration(&profile, "helper");
+        assert_eq!(config["inferenceGatewayBaseUrl"], "https://llm.firma.example/desktop");
+        assert_eq!(config["inferenceGatewayOidc"]["bearerTokenType"], "access_token");
+        assert_eq!(config["inferenceGatewayOidc"]["scopes"], "api://gateway/.default");
+        // No helper, no key, no token; the gateway lists the models itself.
+        let text = config.to_string();
+        assert!(!text.contains("helper") && !text.contains("inferenceModels") && !text.contains("eu.sonnet"));
+        // Unusable values are reported, the metadata URI instead of the issuer too.
+        let broken = DesktopSso { gateway_url: "http://x".into(), oidc_issuer: "https://login.example/.well-known/openid-configuration".into(), ..DesktopSso::default() };
+        assert_eq!(broken.problems().len(), 3);
+
+        // The entry names no profile: the recorded one is shown, as long as the entry is there.
+        let dir = std::env::temp_dir().join(format!("keyzapper-claude-desktop-sso-{}", uuid::Uuid::new_v4()));
+        apply(&dir, &profile, "helper").unwrap();
+        assert_eq!(status(&dir, Some(profile.id.as_str())).profile_id.as_deref(), Some(profile.id.as_str()));
+        assert_eq!(status(&dir, None).profile_id, None);
+        remove(&dir).unwrap();
+        assert_eq!(status(&dir, Some(profile.id.as_str())).profile_id, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn apply_and_remove_keep_other_entries() {
         let dir = std::env::temp_dir().join(format!("keyzapper-claude-desktop-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(META_FILE), r#"{"appliedId": "other", "entries": [{"id": "other", "name": "Eigene"}]}"#).unwrap();
-        assert_eq!(status(&dir).profile_id, None);
+        assert_eq!(status(&dir, None).profile_id, None);
         let profile = Profile::new("A1B2C3D4-0000-4000-8000-000000000001".into(), "Team".into(), "https://litellm.firma.example".into(), String::new());
         apply(&dir, &profile, "helper").unwrap();
         apply(&dir, &profile, "helper").unwrap();
         let meta = read(&dir.join(META_FILE)).unwrap();
         assert_eq!(meta["appliedId"], ENTRY_ID);
         assert_eq!(meta["entries"], json!([{"id": "other", "name": "Eigene"}, {"id": ENTRY_ID, "name": "KeyZapper – Team"}]));
-        let current = status(&dir);
+        let current = status(&dir, None);
         assert_eq!((current.profile_id.as_deref(), current.applied), (Some(profile.id.as_str()), true));
         remove(&dir).unwrap();
         let meta = read(&dir.join(META_FILE)).unwrap();
         assert_eq!((&meta["appliedId"], &meta["entries"]), (&Value::Null, &json!([{"id": "other", "name": "Eigene"}])));
-        assert_eq!(status(&dir), Status { managed: status(&dir).managed, ..Status::default() });
+        assert_eq!(status(&dir, None), Status { managed: status(&dir, None).managed, ..Status::default() });
         remove(&dir).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

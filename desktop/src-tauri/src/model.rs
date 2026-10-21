@@ -4,6 +4,7 @@
 use keyzapper_core::audit::Finding;
 use keyzapper_core::backup::BackupPayload;
 use keyzapper_core::backup_store::BackupStore;
+use keyzapper_core::claude_desktop::{BearerTokenType, DesktopSso};
 use keyzapper_core::claude_office::{self, office_profile, plan_retry, plan_sync, DesiredOffice, OfficeClient, OfficeStatus, Outcome, Sideload, SyncAction, SyncJob};
 use keyzapper_core::gateway::KeyBudget;
 use keyzapper_core::keys::{masked_hint, KeyStore};
@@ -117,6 +118,34 @@ pub struct ProfileInput {
     /// Claude in Office of the profile; None leaves it as it is (the editor sends none for subscription profiles).
     #[serde(default)]
     pub office: Option<OfficeInput>,
+    /// Claude Desktop's own sign-in for the profile; None leaves it as it is (the editor sends none for subscriptions).
+    #[serde(default)]
+    pub claude_desktop: Option<DesktopSsoInput>,
+}
+
+/// Editor input for Claude Desktop's own sign-in with the gateway's OIDC client.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopSsoInput {
+    pub enabled: bool,
+    pub gateway_url: String,
+    pub oidc_issuer: String,
+    pub oidc_client_id: String,
+    pub scopes: String,
+    pub bearer_token_type: BearerTokenType,
+}
+
+impl DesktopSsoInput {
+    /// The profile's block; None when the switch is off (Claude Desktop then uses the helper).
+    fn into_sso(self) -> Option<DesktopSso> {
+        self.enabled.then(|| DesktopSso {
+            gateway_url: self.gateway_url.trim().to_string(),
+            oidc_issuer: self.oidc_issuer.trim().to_string(),
+            oidc_client_id: self.oidc_client_id.trim().to_string(),
+            scopes: self.scopes.trim().to_string(),
+            bearer_token_type: self.bearer_token_type,
+        })
+    }
 }
 
 /// Editor input for the Claude in Office part of a profile.
@@ -352,6 +381,7 @@ impl Model {
             profile.oidc_scope = managed.oidc_scope.clone();
             profile.oidc_token_type = managed.oidc_token_type;
             profile.office = managed.office.clone();
+            profile.claude_desktop = managed.claude_desktop.clone();
             if self.state.profile(&managed.id) != Some(&profile) {
                 self.save_profile(profile, None);
             }
@@ -411,6 +441,17 @@ impl Model {
                 return false;
             }
         }
+        let desktop: Option<Option<DesktopSso>> = if subscription { Some(None) } else { input.claude_desktop.map(DesktopSsoInput::into_sso) };
+        if let Some(Some(desktop)) = desktop.as_ref().filter(|_| !managed) {
+            let mut problems = desktop.problems();
+            if problems.is_empty() && !desktop.gateway_url.is_empty() && !self.config.is_endpoint_allowed(&desktop.gateway_url) {
+                problems.push(self.not_allowed_message(&desktop.gateway_url));
+            }
+            if !problems.is_empty() {
+                self.error = Some(problems.join(" "));
+                return false;
+            }
+        }
         if sso {
             if let Err(e) = oidc::validate_url(&input.oidc_issuer) {
                 self.error = Some(e.to_string());
@@ -437,6 +478,9 @@ impl Model {
             }
             if let Some(office) = office {
                 profile.office = office;
+            }
+            if let Some(desktop) = desktop {
+                profile.claude_desktop = desktop;
             }
             if sso {
                 profile.auth_type = AuthType::Oidc;
@@ -482,7 +526,7 @@ impl Model {
                     self.apply_global(&profile, Some(&global));
                 }
             }
-            if claude_desktop::status(&claude_desktop::library_dir()).profile_id.as_deref() == Some(profile.id.as_str()) {
+            if self.desktop_status().profile_id.as_deref() == Some(profile.id.as_str()) {
                 self.apply_claude_desktop(&profile);
             }
         }
@@ -529,10 +573,13 @@ impl Model {
             }
             self.state.global_binding = None;
         }
-        if claude_desktop::status(&claude_desktop::library_dir()).profile_id.as_deref() == Some(id) {
+        if self.desktop_status().profile_id.as_deref() == Some(id) {
             let _ = claude_desktop::remove(&claude_desktop::library_dir());
-            self.claude_desktop = claude_desktop::status(&claude_desktop::library_dir());
         }
+        if self.state.claude_desktop_profile_id.as_deref() == Some(id) {
+            self.state.claude_desktop_profile_id = None;
+        }
+        self.claude_desktop = self.desktop_status();
         self.state.profiles.retain(|p| p.id != id);
         self.budgets.remove(id);
         self.gateway_models.remove(id);
@@ -1138,8 +1185,13 @@ impl Model {
         }
     }
 
-    /// Lets Claude Desktop use a profile's gateway (key or SSO via the helper); None restores its normal sign-in.
+    /// Lets Claude Desktop use a profile's gateway (key or SSO via the helper, or its own sign-in with the profile's
+    /// `DesktopSso` block); None restores its normal sign-in.
     pub fn set_claude_desktop_profile(&mut self, profile_id: Option<String>) {
+        if self.is_disabled() {
+            self.error = Some(l!("KeyZapper ist deaktiviert. Bitte zuerst wieder aktivieren."));
+            return;
+        }
         let profile = match profile_id {
             Some(id) => match self.profile(&id) {
                 Some(profile) => Some(profile),
@@ -1161,17 +1213,48 @@ impl Model {
                 }
             }
             None => match claude_desktop::remove(&claude_desktop::library_dir()) {
-                Ok(()) => self.notice = Some(l!("KeyZapper-Konfiguration aus Claude Desktop entfernt. Nach einem Neustart meldet sich Claude Desktop wieder normal an.")),
+                Ok(()) => {
+                    self.state.claude_desktop_profile_id = None;
+                    self.persist();
+                    self.notice = Some(l!("KeyZapper-Konfiguration aus Claude Desktop entfernt. Nach einem Neustart meldet sich Claude Desktop wieder normal an."));
+                }
                 Err(e) => self.error = Some(l!("Claude Desktop konnte nicht eingerichtet werden: %@", e)),
             },
         }
-        self.claude_desktop = claude_desktop::status(&claude_desktop::library_dir());
+        self.claude_desktop = self.desktop_status();
     }
 
+    /// What Claude Desktop is set to; the record names the profile of the sign-in variant, whose entry does not.
+    fn desktop_status(&self) -> claude_desktop::Status {
+        claude_desktop::status(&claude_desktop::library_dir(), self.state.claude_desktop_profile_id.as_deref())
+    }
+
+    /// Writes KeyZapper's entry for `profile` and records it. Not while IT configures Claude Desktop: its settings win,
+    /// and an entry of KeyZapper would only mislead.
     fn apply_claude_desktop(&mut self, profile: &Profile) -> bool {
         let Some(helper) = self.binder.as_ref().map(|b| b.helper_path.clone()) else { return false };
+        if self.desktop_status().managed {
+            self.error = Some(l!("Claude Desktop wird auf diesem Rechner von der IT konfiguriert; KeyZapper richtet es deshalb nicht ein."));
+            return false;
+        }
+        if let Some(sso) = &profile.claude_desktop {
+            let mut problems = sso.problems();
+            if problems.is_empty() && !self.config.is_endpoint_allowed(sso.gateway(profile)) {
+                problems.push(self.not_allowed_message(sso.gateway(profile)));
+            }
+            if !problems.is_empty() {
+                self.error = Some(l!("Claude Desktop konnte nicht eingerichtet werden: %@", problems.join(" ")));
+                return false;
+            }
+        }
         match claude_desktop::apply(&claude_desktop::library_dir(), profile, &helper) {
-            Ok(()) => true,
+            Ok(()) => {
+                if self.state.claude_desktop_profile_id.as_deref() != Some(profile.id.as_str()) {
+                    self.state.claude_desktop_profile_id = Some(profile.id.clone());
+                    self.persist();
+                }
+                true
+            }
             Err(e) => {
                 self.error = Some(l!("Claude Desktop konnte nicht eingerichtet werden: %@", e));
                 false
@@ -1404,8 +1487,15 @@ impl Model {
             if let Some(global) = &self.state.global_binding {
                 let _ = binder.revert_global(global);
             }
+            // Claude Desktop goes back to its normal sign-in too; the record stays for the activation.
+            if self.state.claude_desktop_profile_id.is_some() {
+                if let Err(e) = claude_desktop::remove(&claude_desktop::library_dir()) {
+                    self.error = Some(l!("Claude Desktop konnte nicht eingerichtet werden: %@", e));
+                }
+            }
             self.state.disabled = Some(true);
             self.persist();
+            self.claude_desktop = self.desktop_status();
             self.notice = Some(l!("KeyZapper ist deaktiviert. Claude Code nutzt jetzt überall die normale Anmeldung; laufende Sitzungen bitte neu starten."));
             if !failed.is_empty() {
                 self.error = Some(l!("Diese Projekte konnten nicht zurückgesetzt werden: %@", failed.join(", ")));
@@ -1422,6 +1512,10 @@ impl Model {
                 if let Some(profile) = self.profile(&global.profile_id) {
                     self.apply_global(&profile, Some(&global));
                 }
+            }
+            if let Some(profile) = self.state.claude_desktop_profile_id.clone().and_then(|id| self.profile(&id)) {
+                self.apply_claude_desktop(&profile);
+                self.claude_desktop = self.desktop_status();
             }
             self.notice = Some(l!("KeyZapper ist wieder aktiv. Laufende Claude-Sitzungen bitte neu starten."));
         }
@@ -1621,6 +1715,7 @@ impl Model {
                         // `<x>/<model>` IDs are providers of one gateway, not accounts to choose from.
                         tenants: self.gateway_models.get(&p.id).filter(|_| p.is_sso()).map(|m| tenants_of(m)).unwrap_or_default(),
                         office: p.office.clone(),
+                        claude_desktop: p.claude_desktop.clone(),
                     }
                 })
                 .collect(),
@@ -1862,6 +1957,8 @@ struct ProfileView {
     tenants: Vec<String>,
     /// Claude in Office settings of the profile, None if never configured.
     office: Option<OfficeClient>,
+    /// Claude Desktop's own sign-in, None = via the helper.
+    claude_desktop: Option<DesktopSso>,
 }
 
 /// Claude in Office on this machine: `state` is `off`, `applied` or `error`; `apps` are the Office apps it is registered

@@ -2,6 +2,7 @@
 //! (read through CFPreferences, so `/Library/Managed Preferences` wins). Windows: registry policy values under
 //! `HKLM\SOFTWARE\Policies\KeyZapper` (or HKCU), same names; `ManagedProfiles` is a JSON string there.
 
+use crate::claude_desktop::{BearerTokenType, DesktopSso};
 use crate::claude_office::OfficeClient;
 use crate::models::{AuthType, OidcTokenType};
 use serde_json::{Map, Value};
@@ -30,6 +31,7 @@ pub struct ManagedProfile {
     pub oidc_scope: Option<String>,
     pub oidc_token_type: OidcTokenType,
     pub office: Option<OfficeClient>,
+    pub claude_desktop: Option<DesktopSso>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,7 +40,9 @@ pub struct ManagedConfig {
     /// `HaikuModel`, `Environment` (dict) and `ID` (UUID); `Type` (`apiKey` default | `oidc`) with
     /// `OIDCIssuer`, `OIDCClientID` (both required for `oidc`), `OIDCScope` and `OIDCTokenType` (`access` default | `id`),
     /// and an optional `Office` dict (Claude in Microsoft 365): `Enabled` (default on), `AddinID`, `GatewayURL`,
-    /// `EntraClientID`, `EntraScope`, `DisabledFeatures` (array or comma separated string).
+    /// `EntraClientID`, `EntraScope`, `DisabledFeatures` (array or comma separated string); an optional `ClaudeDesktop`
+    /// dict (Claude Desktop signs in itself): `OIDCIssuer`, `OIDCClientID`, optional `GatewayURL`, `Scopes` and
+    /// `BearerTokenType` (`id_token` default | `access_token`).
     pub profiles: Vec<ManagedProfile>,
     /// `AllowedGatewayHosts`: exact hosts or `*.domain`; empty = no restriction.
     pub allowed_gateway_hosts: Vec<String>,
@@ -190,7 +194,23 @@ fn managed_profile(dict: &Map<String, Value>) -> Option<ManagedProfile> {
         oidc_scope,
         oidc_token_type,
         office: dict.get("Office").and_then(Value::as_object).map(office_client),
+        claude_desktop: dict.get("ClaudeDesktop").and_then(Value::as_object).map(desktop_sso),
     })
+}
+
+/// The `ClaudeDesktop` dict of a managed profile. Like `Office`, a broken block is kept and reported by `problems()`.
+fn desktop_sso(dict: &Map<String, Value>) -> DesktopSso {
+    let text = |key: &str| as_string(dict.get(key)).map(|v| v.trim().to_string()).unwrap_or_default();
+    DesktopSso {
+        gateway_url: text("GatewayURL"),
+        oidc_issuer: text("OIDCIssuer"),
+        oidc_client_id: text("OIDCClientID"),
+        scopes: text("Scopes"),
+        bearer_token_type: match text("BearerTokenType").to_lowercase().as_str() {
+            "access_token" | "access" => BearerTokenType::AccessToken,
+            _ => BearerTokenType::IdToken,
+        },
+    }
 }
 
 /// The `Office` dict of a managed profile. Missing or malformed values stay as they are (empty), so a broken block is kept
